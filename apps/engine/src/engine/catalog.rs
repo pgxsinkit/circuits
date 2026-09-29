@@ -1509,7 +1509,7 @@ pub(crate) mod testing {
                                 st.heads.fetch_add(1, Ordering::SeqCst);
                                 if st
                                     .fail_heads
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
                                     return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1537,7 +1537,7 @@ pub(crate) mod testing {
                                 }
                                 if st
                                     .fail_appends
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
                                     return axum::http::StatusCode::SERVICE_UNAVAILABLE;
@@ -1565,7 +1565,7 @@ pub(crate) mod testing {
                                 // from a write that never happened, and retries.
                                 if st
                                     .lose_responses
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
                                     return axum::http::StatusCode::SERVICE_UNAVAILABLE;
@@ -1598,7 +1598,7 @@ pub(crate) mod testing {
                                 }
                                 if st
                                     .fail_deletes
-                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                                     .is_ok()
                                 {
                                     return axum::http::StatusCode::SERVICE_UNAVAILABLE;
