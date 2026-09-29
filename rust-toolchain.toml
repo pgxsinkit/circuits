@@ -1,13 +1,19 @@
-# Pinned: rustc stable 1.97.0 ICEs (rustc_next_trait_solver panic in
-# structural_traits.rs) while compiling dbsp 0.318.0 (edition 2024, backend-mode).
-# Re-checked 2026-08-21: 1.97.1 and 1.98.0 still ICE at the same site.
-# Re-checked 2026-09-05: 1.98.1 (2026-09-01) still ICEs; 1.99.0-beta.3 (2026-08-28)
-# and nightly 1.100.0-nightly (2026-09-04) both check dbsp clean, so the fix ships in
-# stable 1.99 — unpin then (full build + test, and re-run `cargo fmt --check`:
-# rustfmt changes across releases). A dbsp bump is NOT an escape hatch: 0.344.0
-# ICEs on 1.98.1 at the same site (tried 2026-09-05) — the bug is purely rustc's.
-# 1.96.0 is the last known-good stable. Do NOT float back to "stable" until the
-# upstream ICE is fixed. See PR #24.
+# The Rust 1.99 beta, standing in for 1.99.0 until that is released (expected 2026-10-01).
+#
+# Why a pin at all: every stable rustc from 1.97.0 to 1.98.1 hits an internal compiler error (a
+# rustc_next_trait_solver panic in structural_traits.rs) while compiling dbsp (edition 2024,
+# backend-mode), so this was pinned to 1.96.0, the last stable that builds it. A dbsp bump is no
+# way around it: 0.344.0 hits the same panic on 1.98.1 (tried 2026-09-05). The bug is rustc's, and
+# the fix ships in 1.99: the 1.99 betas build dbsp clean (1.99.0-beta.6 builds dbsp 0.318.0, the
+# version the 1.96.0 pin held, checked 2026-09-29).
+#
+# `beta-2026-09-18` is 1.99.0-beta.6. It is a dated toolchain, so every machine and CI gets the
+# same compiler, and it lets the dependency updates the old pin held back be made and tested ahead
+# of the release.
+#
+# On release day the channel line below becomes "1.99.0" (and the `FROM rust:` line of each
+# container/Containerfile.* build stage becomes `rust:1.99.0-bookworm`). Then run the full gate,
+# `cargo fmt --check` included: rustfmt changes across releases.
 #
 # The pin covers the whole workspace, the log server (apps/durable-streams) included. The log
 # server is not what holds it back: it has no dbsp, its declared MSRV is 1.75, and it builds on
@@ -18,4 +24,4 @@
 # mise.toml turns on `idiomatic_version_file_enable_tools` for rust, so mise takes the
 # version from this file instead.
 [toolchain]
-channel = "1.96.0"
+channel = "beta-2026-09-18"

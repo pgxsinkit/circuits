@@ -6,9 +6,10 @@
 # With mise on PATH the command runs under `mise exec`, which resolves the pins for this repository
 # whatever the calling environment carries. That matters: a shell, editor or git client that
 # activated mise somewhere else exports that place's RUSTUP_TOOLCHAIN, rustup ranks it above
-# rust-toolchain.toml, and the newer rustc it selects crashes while compiling dbsp. Without mise
-# (CI, where actions-rust-lang/setup-rust-toolchain installs the toolchain rust-toolchain.toml
-# names) the command runs as it is, and rustup reads the pin itself.
+# rust-toolchain.toml, and the rustc it selects can be one that crashes while compiling dbsp (every
+# stable from 1.97.0 to 1.98.1 does). Without mise (CI, where actions-rust-lang/setup-rust-toolchain
+# installs the toolchain rust-toolchain.toml names) the command runs as it is, and rustup reads the
+# pin itself.
 #
 # Usage: bash scripts/with-toolchain.sh <command> [args...]
 set -euo pipefail

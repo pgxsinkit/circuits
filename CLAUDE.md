@@ -8,10 +8,10 @@ handoff, report changed files, validation run, and suggested next commands.
 ## Tools
 
 bun (never npm, pnpm or yarn), podman (never docker), mise for tool versions. The pinned Rust is in
-`rust-toolchain.toml`, and a newer rustc crashes while compiling dbsp: the package scripts reach
-cargo through `scripts/with-toolchain.sh` (`mise exec` when mise is on `PATH`), so `bun run …` is
-safe from any shell, but run a bare cargo as `mise exec -- cargo …` when the shell has not
-activated mise.
+`rust-toolchain.toml`, and every stable rustc from 1.97.0 to 1.98.1 crashes while compiling dbsp:
+the package scripts reach cargo through `scripts/with-toolchain.sh` (`mise exec` when mise is on
+`PATH`), so `bun run …` is safe from any shell, but run a bare cargo as `mise exec -- cargo …` when
+the shell has not activated mise.
 
 ## Build & Test
 

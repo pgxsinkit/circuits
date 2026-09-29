@@ -82,12 +82,12 @@ The recipe for capturing an app's query set in one circuit:
 ## Build & test
 
 Tools: **bun** (never npm, pnpm or yarn), **podman** (never docker), **mise** for tool versions.
-Rust is pinned in `rust-toolchain.toml`; a newer rustc crashes while compiling dbsp. Every package
-script that reaches cargo runs it through `scripts/with-toolchain.sh` (`mise exec` when mise is on
-`PATH`, the bare command otherwise, which is what CI does), so `bun run …` gets the pinned
-toolchain from any shell; a bare `cargo …` in a shell that has not activated mise for this
-directory does not, so run it as `mise exec -- cargo …`. The integration suites boot their own
-ephemeral Postgres and need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
+Rust is pinned in `rust-toolchain.toml`; every stable rustc from 1.97.0 to 1.98.1 crashes while
+compiling dbsp. Every package script that reaches cargo runs it through `scripts/with-toolchain.sh`
+(`mise exec` when mise is on `PATH`, the bare command otherwise, which is what CI does), so
+`bun run …` gets the pinned toolchain from any shell; a bare `cargo …` in a shell that has not
+activated mise for this directory does not, so run it as `mise exec -- cargo …`. The integration
+suites boot their own ephemeral Postgres and need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
 (`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
 
 The scripts are check-default: a bare verb never changes a file.
