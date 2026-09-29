@@ -29,8 +29,7 @@ const H_FORKED_FROM: &str = "stream-forked-from";
 const H_FORK_OFFSET: &str = "stream-fork-offset";
 const H_FORK_SUB_OFFSET: &str = "stream-fork-sub-offset";
 
-static LONG_POLL_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(30_000);
+static LONG_POLL_TIMEOUT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(30_000);
 
 pub fn set_long_poll_timeout(ms: u64) {
     LONG_POLL_TIMEOUT_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
@@ -44,8 +43,7 @@ pub fn set_long_poll_timeout(ms: u64) {
 /// and parses the body scales its memory with the stream, not with the request.
 pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
-static MAX_CHUNK_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(DEFAULT_MAX_CHUNK_BYTES);
+static MAX_CHUNK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(DEFAULT_MAX_CHUNK_BYTES);
 
 /// Set the maximum bytes one read response may carry; `0` = unlimited.
 pub fn set_max_chunk_bytes(bytes: u64) {
@@ -59,8 +57,7 @@ pub fn max_chunk_bytes() -> u64 {
 /// Bytes read by the JSON boundary scan (test-only observability: a boundary
 /// scan that re-reads the same bytes is the regression this counts).
 #[cfg(test)]
-pub(crate) static BOUNDARY_SCAN_BYTES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static BOUNDARY_SCAN_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // ---------- durability mode ----------
 
@@ -151,10 +148,7 @@ pub(crate) mod test_support {
     /// suffix also makes two concurrent `cargo test` processes safe (the
     /// hand-rolled names this replaces were pid + nanos).
     pub(crate) fn temp_dir(tag: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(&format!("ds-test-{tag}-"))
-            .tempdir()
-            .expect("create test temp dir")
+        tempfile::Builder::new().prefix(&format!("ds-test-{tag}-")).tempdir().expect("create test temp dir")
     }
 }
 
@@ -192,9 +186,7 @@ struct ResponseBuilder {
 
 impl ResponseBuilder {
     fn new(status: u16) -> Self {
-        ResponseBuilder {
-            resp: Resp::new(status),
-        }
+        ResponseBuilder { resp: Resp::new(status) }
     }
     fn h(mut self, k: &'static str, v: String) -> Self {
         self.resp.headers.push((k, v));
@@ -219,17 +211,11 @@ struct Query {
 }
 
 fn parse_query(q: Option<&str>) -> Result<Query, &'static str> {
-    let mut out = Query {
-        offset: None,
-        live: None,
-        cursor: None,
-    };
+    let mut out = Query { offset: None, live: None, cursor: None };
     if let Some(q) = q {
         for pair in q.split('&') {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-            let v = percent_encoding::percent_decode_str(v)
-                .decode_utf8_lossy()
-                .to_string();
+            let v = percent_encoding::percent_decode_str(v).decode_utf8_lossy().to_string();
             match k {
                 // A duplicate `offset` is rejected (matches the Go/TS reference
                 // servers), not silently last-wins coalesced. `live`/`cursor`
@@ -307,12 +293,8 @@ pub async fn handle(store: Arc<Store>, req: Req) -> Resp {
     // full Req (bodies/Bytes), and the raw path — only bounded attributes are
     // recorded. The span is always compiled; it is exported only when the
     // `telemetry` feature is on and a subscriber is installed.
-    let span = tracing::info_span!(
-        "ds.request",
-        http.method = method,
-        route = route,
-        status_class = tracing::field::Empty
-    );
+    let span =
+        tracing::info_span!("ds.request", http.method = method, route = route, status_class = tracing::field::Empty);
     let resp = dispatch(store, req).instrument(span.clone()).await;
     span.record("status_class", status_class(resp.status));
     crate::telemetry::record_request(method, status_class(resp.status));
@@ -369,18 +351,10 @@ mod cors_policy_tests {
     fn preflight_advertises_headers_without_granting_cross_origin_reads() {
         let response = cors_preflight();
         assert_eq!(response.status, 204);
-        assert!(response
-            .headers
-            .iter()
-            .any(|(name, value)| *name == "access-control-allow-headers"
-                && value.to_ascii_lowercase().contains("if-none-match")));
-        assert!(!response
-            .headers
-            .iter()
-            .any(|(name, _)| *name == "access-control-allow-origin"));
-        assert!(!crate::api::SECURITY_HEADERS
-            .iter()
-            .any(|(name, _)| *name == "access-control-allow-origin"));
+        assert!(response.headers.iter().any(|(name, value)| *name == "access-control-allow-headers"
+            && value.to_ascii_lowercase().contains("if-none-match")));
+        assert!(!response.headers.iter().any(|(name, _)| *name == "access-control-allow-origin"));
+        assert!(!crate::api::SECURITY_HEADERS.iter().any(|(name, _)| *name == "access-control-allow-origin"));
     }
 }
 
@@ -409,12 +383,7 @@ fn parse_rfc3339(s: &str) -> Result<SystemTime, ()> {
         }
         part.parse().map_err(|_| ())
     };
-    if b[4] != b'-'
-        || b[7] != b'-'
-        || (b[10] != b'T' && b[10] != b't')
-        || b[13] != b':'
-        || b[16] != b':'
-    {
+    if b[4] != b'-' || b[7] != b'-' || (b[10] != b'T' && b[10] != b't') || b[13] != b':' || b[16] != b':' {
         return Err(());
     }
     let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
@@ -478,10 +447,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     // inheritance / match below); `content_type` is the resolved value with the
     // octet-stream default.
     let content_type_hdr = header_str(&req, "content-type").map(|s| s.to_string());
-    let content_type = content_type_hdr
-        .as_deref()
-        .unwrap_or("application/octet-stream")
-        .to_string();
+    let content_type = content_type_hdr.as_deref().unwrap_or("application/octet-stream").to_string();
     let ttl_raw = header_str(&req, H_TTL).map(|s| s.to_string());
     let exp_raw = header_str(&req, H_EXPIRES_AT).map(|s| s.to_string());
     if ttl_raw.is_some() && exp_raw.is_some() {
@@ -645,9 +611,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
     // fsync concurrently and the async workers stay free to dispatch.
     let result = {
         let store = store.clone();
-        match tokio::task::spawn_blocking(move || store.create(&path, config, parent, base_offset))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || store.create(&path, config, parent, base_offset)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => return text_response(500, &e.to_string()),
             Err(_) => return text_response(500, "create task failed"),
@@ -709,14 +673,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
-                .h(
-                    "location",
-                    format!(
-                        "http://{}{}",
-                        host.as_deref().unwrap_or("localhost"),
-                        st.path
-                    ),
-                )
+                .h("location", format!("http://{}{}", host.as_deref().unwrap_or("localhost"), st.path))
                 .h("content-type", st.config.content_type.clone())
                 .h(H_NEXT_OFFSET, format_offset(t.bytes));
             if t.closed {
@@ -731,11 +688,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
 
 /// Convert a request body into the contiguous wire-byte representation.
 /// JSON: each message is the raw value followed by a `,`; arrays flatten one level.
-fn encode_wire(
-    body: &Bytes,
-    is_json: bool,
-    allow_empty_array: bool,
-) -> Result<Bytes, &'static str> {
+fn encode_wire(body: &Bytes, is_json: bool, allow_empty_array: bool) -> Result<Bytes, &'static str> {
     if !is_json {
         return Ok(body.clone());
     }
@@ -811,21 +764,13 @@ fn stage_for_durability(
     if durability() == DurabilityMode::Memory {
         return Ok(None);
     }
-    let wal = store
-        .wal
-        .get()
-        .expect("WAL must be attached before serving");
+    let wal = store.wal.get().expect("WAL must be attached before serving");
     let shard = wal.shard_for(st.id);
     // Register the touched per-stream file into the shard's dirty set
     // (spec §7) BEFORE staging the WAL record — see the full ordering note in
     // the WAL spec. Registering first closes the recycle-before-fsync window.
     shard.register_dirty(st.id, Arc::clone(st));
-    let lsn = shard.reserve_and_stage(
-        crate::wal::codec::RecordKind::Append,
-        st.id,
-        stream_offset,
-        wire,
-    )?;
+    let lsn = shard.reserve_and_stage(crate::wal::codec::RecordKind::Append, st.id, stream_offset, wire)?;
     Ok(Some(lsn))
 }
 
@@ -833,10 +778,7 @@ fn stage_for_durability(
 /// appender lock — only the LSN reservation (`stage_for_durability`) needs the
 /// lock; the fsync wait must not serialize same-stream appenders.
 async fn wait_durable_lsn(store: &Arc<Store>, st: &Arc<StreamState>, lsn: u64) {
-    let wal = store
-        .wal
-        .get()
-        .expect("WAL must be attached before serving");
+    let wal = store.wal.get().expect("WAL must be attached before serving");
     let shard = wal.shard_for(st.id);
     shard.wait_durable(lsn).await;
 }
@@ -897,10 +839,7 @@ fn publish_durable_tail(st: &StreamState, tail: u64, wire: &Bytes) {
     // instead of racing ahead and falling back to a file read. The chunk spans
     // [tail - wire.len(), tail).
     st.set_last_chunk(tail - wire.len() as u64, wire.clone());
-    st.tail_tx.send_replace(Tail {
-        bytes: tail,
-        closed,
-    });
+    st.tail_tx.send_replace(Tail { bytes: tail, closed });
     // Wake any reactor-served subscribers of this stream (no-op when none).
     #[cfg(target_os = "linux")]
     crate::sse_reactor::wake_stream(st);
@@ -934,11 +873,7 @@ fn parse_producer_headers(req: &Req) -> Result<Option<ProducerHeaders>, &'static
                 }
                 Ok(n)
             };
-            Ok(Some(ProducerHeaders {
-                id: id.to_string(),
-                epoch: parse_int(e)?,
-                seq: parse_int(s)?,
-            }))
+            Ok(Some(ProducerHeaders { id: id.to_string(), epoch: parse_int(e)?, seq: parse_int(s)? }))
         }
         _ => Err("producer headers must all be provided together"),
     }
@@ -963,9 +898,7 @@ fn validate_producer(shared: &Shared, p: &ProducerHeaders) -> ProducerOutcome {
         }
         Some(state) => {
             if p.epoch < state.epoch {
-                ProducerOutcome::StaleEpoch {
-                    current: state.epoch,
-                }
+                ProducerOutcome::StaleEpoch { current: state.epoch }
             } else if p.epoch > state.epoch {
                 if p.seq == 0 {
                     ProducerOutcome::Accept
@@ -973,15 +906,11 @@ fn validate_producer(shared: &Shared, p: &ProducerHeaders) -> ProducerOutcome {
                     ProducerOutcome::BadEpochStart
                 }
             } else if p.seq <= state.last_seq {
-                ProducerOutcome::Duplicate {
-                    last_seq: state.last_seq,
-                }
+                ProducerOutcome::Duplicate { last_seq: state.last_seq }
             } else if p.seq == state.last_seq + 1 {
                 ProducerOutcome::Accept
             } else {
-                ProducerOutcome::Gap {
-                    expected: state.last_seq + 1,
-                }
+                ProducerOutcome::Gap { expected: state.last_seq + 1 }
             }
         }
     }
@@ -1021,11 +950,7 @@ async fn handle_append(store: Arc<Store>, req: Req, path: String) -> Resp {
     resp
 }
 
-async fn handle_append_inner(
-    store: Arc<Store>,
-    req: Req,
-    path: String,
-) -> (Resp, AppendOutcome, bool) {
+async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp, AppendOutcome, bool) {
     use AppendOutcome::*;
     // Load-telemetry probe: bumps the in-flight gauge and records service time on
     // drop (covers every return path). No-op unless `--server-stats` is on.
@@ -1181,10 +1106,7 @@ async fn handle_append_inner(
                 );
             }
             ProducerOutcome::BadEpochStart => {
-                ret!(
-                    text_response(400, "new producer epoch must start at seq 0"),
-                    Conflict
-                );
+                ret!(text_response(400, "new producer epoch must start at seq 0"), Conflict);
             }
         }
     }
@@ -1200,9 +1122,7 @@ async fn handle_append_inner(
                 // server: clients classify a 409 as a sequence conflict by the
                 // word "sequence" in the message (see @durable-streams/client).
                 ret!(
-                    ResponseBuilder::new(409)
-                        .h(H_NEXT_OFFSET, format_offset(tail))
-                        .body(full("Sequence conflict")),
+                    ResponseBuilder::new(409).h(H_NEXT_OFFSET, format_offset(tail)).body(full("Sequence conflict")),
                     Conflict
                 );
             }
@@ -1220,12 +1140,7 @@ async fn handle_append_inner(
     // client's retry as a duplicate: silent loss from the client's view).
     let (prev_producer, prev_seq_header) = {
         let sh = st.shared.read().unwrap();
-        (
-            producer
-                .as_ref()
-                .map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())),
-            sh.last_seq_header.clone(),
-        )
+        (producer.as_ref().map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())), sh.last_seq_header.clone())
     };
     if !wire.is_empty() {
         match write_wire(&st, &mut ap, &wire) {
@@ -1241,8 +1156,7 @@ async fn handle_append_inner(
     // elsewhere (memory: re-derived from the data-file length on restart; wal: the
     // checkpoint's per-shard `tails` map), and `last_access` only gates TTL — so a
     // plain non-TTL append needs no sidecar flush at all (cardinality-cliff #1).
-    let meta_persist_needed =
-        producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
+    let meta_persist_needed = producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
     {
         let mut s = st.shared.write().unwrap();
         // A body append refreshes last_access in write_wire. A close-only POST
@@ -1252,13 +1166,7 @@ async fn handle_append_inner(
             s.last_access = SystemTime::now();
         }
         if let Some(p) = &producer {
-            s.producers.insert(
-                p.id.clone(),
-                ProducerState {
-                    epoch: p.epoch,
-                    last_seq: p.seq,
-                },
-            );
+            s.producers.insert(p.id.clone(), ProducerState { epoch: p.epoch, last_seq: p.seq });
         }
         if let Some(seq) = seq_header {
             s.last_seq_header = Some(seq);
@@ -1354,10 +1262,7 @@ async fn handle_append_inner(
             s.closed_durable = true;
             s.durable_tail
         };
-        st.tail_tx.send_replace(Tail {
-            bytes: tail,
-            closed: true,
-        });
+        st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
         #[cfg(target_os = "linux")]
         crate::sse_reactor::wake_stream(&st);
     } else if staged_lsn.is_some() {
@@ -1380,8 +1285,7 @@ async fn handle_append_inner(
         // rewrite here — dropping it removes the O(touched) `write_meta_sync` calls
         // that dominate the checkpoint's meta phase at high stream cardinality.
         if meta_persist_needed {
-            st.meta_dirty
-                .store(true, std::sync::atomic::Ordering::Release);
+            st.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
         }
     } else if meta_persist_needed {
         // No WAL record staged (memory durability): no checkpoint will flush
@@ -1404,16 +1308,10 @@ async fn handle_append_inner(
     }
 
     let tail = st.tail();
-    let status = if producer.is_some() && !body.is_empty() {
-        200
-    } else {
-        204
-    };
+    let status = if producer.is_some() && !body.is_empty() { 200 } else { 204 };
     let mut b = ResponseBuilder::new(status).h(H_NEXT_OFFSET, format_offset(tail.bytes));
     if let Some(p) = &producer {
-        b = b
-            .h(H_PRODUCER_EPOCH, p.epoch.to_string())
-            .h(H_PRODUCER_SEQ, p.seq.to_string());
+        b = b.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
     }
     if tail.closed {
         b = b.hs(H_CLOSED, "true");
@@ -1422,10 +1320,7 @@ async fn handle_append_inner(
 }
 
 fn closed_conflict(tail: u64) -> Resp {
-    ResponseBuilder::new(409)
-        .hs(H_CLOSED, "true")
-        .h(H_NEXT_OFFSET, format_offset(tail))
-        .body(full("stream is closed"))
+    ResponseBuilder::new(409).hs(H_CLOSED, "true").h(H_NEXT_OFFSET, format_offset(tail)).body(full("stream is closed"))
 }
 
 // ---------- reading bodies from the data file ----------
@@ -1478,12 +1373,7 @@ async fn read_range_body(
     let mut slices = Vec::new();
     crate::store::resolve_range(st, data_start, data_end, &mut slices);
     match crate::store::into_local_segments(slices) {
-        Ok(segments) => Body::FileRange {
-            segments,
-            prefix,
-            suffix,
-            hot,
-        },
+        Ok(segments) => Body::FileRange { segments, prefix, suffix, hot },
         Err(slices) => stream_resolved_body(st, slices, prefix, suffix),
     }
 }
@@ -1534,16 +1424,10 @@ enum ChunkEnd {
 async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> ChunkEnd {
     let cap = max_chunk_bytes();
     if cap == 0 || tail.saturating_sub(start) <= cap {
-        return ChunkEnd::At {
-            end: tail,
-            body: None,
-        };
+        return ChunkEnd::At { end: tail, body: None };
     }
     if !st.is_json {
-        return ChunkEnd::At {
-            end: start + cap,
-            body: None,
-        };
+        return ChunkEnd::At { end: start + cap, body: None };
     }
     let mut scan = crate::tier::JsonValueBoundaryScan::new();
     let mut buffered = BytesMut::new();
@@ -1574,11 +1458,7 @@ async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> Chunk
             break;
         }
     }
-    let cut = if last_in_cap > 0 {
-        last_in_cap
-    } else {
-        first_past_cap
-    };
+    let cut = if last_in_cap > 0 { last_in_cap } else { first_past_cap };
     if cut == 0 {
         // The whole remainder holds no top-level value separator, but the tail
         // always sits just past one — so `start` is not a boundary.
@@ -1592,10 +1472,7 @@ async fn chunk_capped_end(st: &Arc<StreamState>, start: u64, tail: u64) -> Chunk
     }
     let mut body = buffered.freeze();
     body.truncate(cut as usize);
-    ChunkEnd::At {
-        end: start + cut,
-        body: Some(body),
-    }
+    ChunkEnd::At { end: start + cut, body: Some(body) }
 }
 
 /// Frame already-materialized wire bytes as a response body: JSON drops the
@@ -1617,10 +1494,9 @@ fn framed_body(st: &StreamState, bytes: Bytes) -> Body {
 fn chunk_end_error(outcome: ChunkEnd) -> Resp {
     match outcome {
         ChunkEnd::At { .. } => unreachable!("only failures reach here"),
-        ChunkEnd::NotAValueBoundary => text_response(
-            400,
-            "offset is not a JSON message boundary; re-read from a server-issued offset",
-        ),
+        ChunkEnd::NotAValueBoundary => {
+            text_response(400, "offset is not a JSON message boundary; re-read from a server-issued offset")
+        }
         ChunkEnd::ReadFailed => text_response(503, "stream read failed"),
     }
 }
@@ -1674,15 +1550,9 @@ fn stream_resolved_body(
                     let mut off = 0u64;
                     while off < seg.len {
                         let n = (seg.len - off).min(COLD_LOCAL_WINDOW as u64);
-                        let win = Segment {
-                            file: seg.file.clone(),
-                            file_start: seg.file_start + off,
-                            len: n,
-                        };
+                        let win = Segment { file: seg.file.clone(), file_start: seg.file_start + off, len: n };
                         let bytes =
-                            tokio::task::spawn_blocking(move || materialize_segments(&[win]))
-                                .await
-                                .unwrap_or_default();
+                            tokio::task::spawn_blocking(move || materialize_segments(&[win])).await.unwrap_or_default();
                         // A short read means we cannot honour the content — abort
                         // (set the flag) so the engine drops the connection rather
                         // than emitting a clean-but-truncated response.
@@ -1740,17 +1610,13 @@ async fn materialize_resolved(
     for sl in slices {
         match sl {
             ResolvedSlice::Missing => {
-                return Err(Error::new(
-                    ErrorKind::NotFound,
-                    "sealed chunk unreadable (poison slice)",
-                ));
+                return Err(Error::new(ErrorKind::NotFound, "sealed chunk unreadable (poison slice)"));
             }
             ResolvedSlice::Local(seg) => {
                 let want = seg.len;
-                let bytes =
-                    tokio::task::spawn_blocking(move || crate::store::materialize_segments(&[seg]))
-                        .await
-                        .unwrap_or_default();
+                let bytes = tokio::task::spawn_blocking(move || crate::store::materialize_segments(&[seg]))
+                    .await
+                    .unwrap_or_default();
                 // A short local read must not be forwarded as complete.
                 if bytes.len() as u64 != want {
                     return Err(Error::new(ErrorKind::UnexpectedEof, "short local read"));
@@ -1765,12 +1631,7 @@ async fn materialize_resolved(
                     // Validate full length — a truncated object must not be
                     // forwarded as if complete.
                     Ok(b) if b.len() as u64 == len => out.put_slice(&b),
-                    Ok(_) => {
-                        return Err(Error::new(
-                            ErrorKind::UnexpectedEof,
-                            "truncated cold object",
-                        ))
-                    }
+                    Ok(_) => return Err(Error::new(ErrorKind::UnexpectedEof, "truncated cold object")),
                     Err(e) => return Err(e),
                 }
             }
@@ -1811,18 +1672,12 @@ async fn handle_read(store: Arc<Store>, req: Req, path: String) -> Resp {
     let t0 = crate::telemetry::Timer::start();
     let mut cache_hit = false;
     let (resp, live_label) = match live {
-        Some("long-poll") => (
-            handle_long_poll(st, offset, q.cursor, &mut cache_hit).await,
-            "long-poll",
-        ),
+        Some("long-poll") => (handle_long_poll(st, offset, q.cursor, &mut cache_hit).await, "long-poll"),
         // SSE records its own read metric per emitted batch (streaming, no single
         // dispatch latency); the dispatch here just sets up the channel.
         Some("sse") => return handle_sse(st, offset, q.cursor),
         Some(_) => return text_response(400, "invalid live mode"),
-        None => (
-            handle_catchup(st, offset, &req, &mut cache_hit).await,
-            "catchup",
-        ),
+        None => (handle_catchup(st, offset, &req, &mut cache_hit).await, "catchup"),
     };
     crate::telemetry::record_read(t0.elapsed_secs(), live_label, cache_hit);
     resp
@@ -1848,48 +1703,23 @@ struct StartResolution {
 
 fn resolve_start(offset: ParsedOffset, tail: u64) -> StartResolution {
     match offset {
-        ParsedOffset::Start => StartResolution {
-            start: 0,
-            now_mode: false,
-            next_offset: tail,
-        },
-        ParsedOffset::Now => StartResolution {
-            start: tail,
-            now_mode: true,
-            next_offset: tail,
-        },
+        ParsedOffset::Start => StartResolution { start: 0, now_mode: false, next_offset: tail },
+        ParsedOffset::Now => StartResolution { start: tail, now_mode: true, next_offset: tail },
         ParsedOffset::At(b) => {
             if b > tail {
                 // Beyond-tail numeric offset: caught up at the tail. Read from
                 // the tail (empty range) but report the requested offset.
-                StartResolution {
-                    start: tail,
-                    now_mode: true,
-                    next_offset: b,
-                }
+                StartResolution { start: tail, now_mode: true, next_offset: b }
             } else {
-                StartResolution {
-                    start: b,
-                    now_mode: false,
-                    next_offset: b,
-                }
+                StartResolution { start: b, now_mode: false, next_offset: b }
             }
         }
     }
 }
 
-async fn handle_catchup(
-    st: Arc<StreamState>,
-    offset: ParsedOffset,
-    req: &Req,
-    cache_hit: &mut bool,
-) -> Resp {
+async fn handle_catchup(st: Arc<StreamState>, offset: ParsedOffset, req: &Req, cache_hit: &mut bool) -> Resp {
     let t = st.tail();
-    let StartResolution {
-        start,
-        now_mode,
-        next_offset,
-    } = resolve_start(offset, t.bytes);
+    let StartResolution { start, now_mode, next_offset } = resolve_start(offset, t.bytes);
     // A catch-up read returns bytes from `start` up to the server-defined
     // maximum chunk size (PROTOCOL.md §5.6); `Stream-Next-Offset` is the cursor
     // for the client's next request. In sentinel mode the range is empty, so the
@@ -1917,9 +1747,7 @@ async fn handle_catchup(
     let etag = (!now_mode).then(|| st.etag(start, end, closed));
     if let Some(etag) = &etag {
         if header_str(req, "if-none-match") == Some(etag.as_str()) {
-            let mut b = ResponseBuilder::new(304)
-                .h("etag", etag.clone())
-                .h(H_NEXT_OFFSET, format_offset(reported));
+            let mut b = ResponseBuilder::new(304).h("etag", etag.clone()).h(H_NEXT_OFFSET, format_offset(reported));
             if up_to_date {
                 b = b.hs(H_UP_TO_DATE, "true");
             }
@@ -1945,14 +1773,7 @@ async fn handle_catchup(
     let mut b = ResponseBuilder::new(200)
         .h("content-type", st.config.content_type.clone())
         .h(H_NEXT_OFFSET, format_offset(reported))
-        .h(
-            "cache-control",
-            if now_mode {
-                "no-store".into()
-            } else {
-                CACHEABLE.to_string()
-            },
-        );
+        .h("cache-control", if now_mode { "no-store".into() } else { CACHEABLE.to_string() });
     if up_to_date {
         b = b.hs(H_UP_TO_DATE, "true");
     }
@@ -2131,10 +1952,7 @@ pub(crate) fn sse_encode_data(out: &mut String, data: &[u8], encoding: SseEncodi
             sse_data_event(out, &payload);
         }
         SseEncoding::Text => sse_data_event(out, &String::from_utf8_lossy(data)),
-        SseEncoding::Base64 => sse_data_event(
-            out,
-            &crate::api::base64_encode(data, crate::api::BASE64_STD, true),
-        ),
+        SseEncoding::Base64 => sse_data_event(out, &crate::api::base64_encode(data, crate::api::BASE64_STD, true)),
     }
 }
 
@@ -2165,13 +1983,7 @@ pub(crate) fn sse_data_event(out: &mut String, payload: &str) {
     out.push('\n');
 }
 
-pub(crate) fn sse_control_event(
-    out: &mut String,
-    next: u64,
-    cursor: u64,
-    up_to_date: bool,
-    closed: bool,
-) {
+pub(crate) fn sse_control_event(out: &mut String, next: u64, cursor: u64, up_to_date: bool, closed: bool) {
     out.push_str("event: control\n");
     out.push_str("data:{\"streamNextOffset\":\"");
     out.push_str(&format_offset(next));
@@ -2292,13 +2104,7 @@ impl SseSource {
                 // event — the reference server / TS client expect the close signal
                 // on the control immediately after the final data.
                 let closed_now = t.closed && self.pos >= t.bytes;
-                sse_control_event(
-                    &mut ev,
-                    self.pos,
-                    compute_cursor(self.client_cursor),
-                    up_to_date,
-                    closed_now,
-                );
+                sse_control_event(&mut ev, self.pos, compute_cursor(self.client_cursor), up_to_date, closed_now);
                 if closed_now {
                     self.done = true;
                 }
@@ -2306,13 +2112,7 @@ impl SseSource {
             }
             if t.closed && self.pos >= t.bytes {
                 let mut ev = String::new();
-                sse_control_event(
-                    &mut ev,
-                    self.pos,
-                    compute_cursor(self.client_cursor),
-                    true,
-                    true,
-                );
+                sse_control_event(&mut ev, self.pos, compute_cursor(self.client_cursor), true, true);
                 self.done = true;
                 return Some(Bytes::from(ev));
             }
@@ -2324,13 +2124,7 @@ impl SseSource {
                 && self.pos == self.st.tail().bytes
             {
                 let mut ev = String::new();
-                sse_control_event(
-                    &mut ev,
-                    self.pos,
-                    compute_cursor(self.client_cursor),
-                    true,
-                    false,
-                );
+                sse_control_event(&mut ev, self.pos, compute_cursor(self.client_cursor), true, false);
                 self.sent_initial = true;
                 return Some(Bytes::from(ev));
             }
@@ -2363,9 +2157,7 @@ impl SseSource {
 }
 
 impl crate::api::EventSource for SseSource {
-    fn next_chunk(
-        &mut self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
+    fn next_chunk(&mut self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Bytes>> + Send + '_>> {
         Box::pin(self.next())
     }
 
@@ -2440,16 +2232,11 @@ async fn read_range_bytes(st: &Arc<StreamState>, start: u64, end: u64) -> std::i
     let out = match crate::store::into_local_segments(slices) {
         // Local-only fast path (always the case with tiering off): one blocking
         // read across all local segments.
-        Ok(segs) => tokio::task::spawn_blocking(move || materialize_segments(&segs))
-            .await
-            .unwrap_or_default(),
+        Ok(segs) => tokio::task::spawn_blocking(move || materialize_segments(&segs)).await.unwrap_or_default(),
         Err(slices) => materialize_resolved(st, slices, b"", b"").await?,
     };
     if out.len() != want {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "short read while materializing range",
-        ));
+        return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read while materializing range"));
     }
     Ok(out)
 }
@@ -2530,21 +2317,13 @@ mod bug1_tests {
         fn put<'a>(&'a self, _k: &'a str, _b: bytes::Bytes) -> BoxFuture<'a, std::io::Result<()>> {
             Box::pin(async { Ok(()) })
         }
-        fn get_range<'a>(
-            &'a self,
-            _k: &'a str,
-            _s: u64,
-            len: u64,
-        ) -> BoxFuture<'a, std::io::Result<bytes::Bytes>> {
+        fn get_range<'a>(&'a self, _k: &'a str, _s: u64, len: u64) -> BoxFuture<'a, std::io::Result<bytes::Bytes>> {
             let mode = self.0;
             Box::pin(async move {
                 match mode {
                     Mode::Full => Ok(bytes::Bytes::from(vec![b'x'; len as usize])),
                     // one byte short of the requested length
-                    Mode::Truncate => Ok(bytes::Bytes::from(vec![
-                        b'x';
-                        len.saturating_sub(1) as usize
-                    ])),
+                    Mode::Truncate => Ok(bytes::Bytes::from(vec![b'x'; len.saturating_sub(1) as usize])),
                     Mode::Error => Err(std::io::Error::other("cold backend boom")),
                 }
             })
@@ -2574,19 +2353,14 @@ mod bug1_tests {
     /// a `TestBlob` in `mode`; return (bytes delivered, failed-flag).
     async fn run(mode: Mode) -> (usize, bool) {
         let dir = test_support::temp_dir("bug1");
-        let mut store =
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let mut store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.blobstore = Some(Arc::new(TestBlob(mode)));
         let store = Arc::new(store);
         let st = match store.create("s", stream_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
-        let slices = vec![ResolvedSlice::Remote {
-            key: "k".into(),
-            offset: 0,
-            len: 100,
-        }];
+        let slices = vec![ResolvedSlice::Remote { key: "k".into(), offset: 0, len: 100 }];
         let body = stream_resolved_body(&st, slices, b"", b"");
         let (n, failed) = match body {
             Body::Channel(sb) => {
@@ -2605,29 +2379,20 @@ mod bug1_tests {
     #[tokio::test]
     async fn cold_read_full_is_not_flagged() {
         let (n, failed) = run(Mode::Full).await;
-        assert!(
-            !failed,
-            "a full-length cold read must not be flagged failed"
-        );
+        assert!(!failed, "a full-length cold read must not be flagged failed");
         assert_eq!(n, 100, "the full body is delivered");
     }
 
     #[tokio::test]
     async fn cold_read_truncated_aborts() {
         let (_n, failed) = run(Mode::Truncate).await;
-        assert!(
-            failed,
-            "a truncated cold read must set the abort flag (BUG-1)"
-        );
+        assert!(failed, "a truncated cold read must set the abort flag (BUG-1)");
     }
 
     #[tokio::test]
     async fn cold_read_error_aborts() {
         let (_n, failed) = run(Mode::Error).await;
-        assert!(
-            failed,
-            "a cold-read backend error must set the abort flag (BUG-1)"
-        );
+        assert!(failed, "a cold-read backend error must set the abort flag (BUG-1)");
     }
 
     /// H4: the buffered cold-read path (`materialize_resolved` via
@@ -2636,19 +2401,14 @@ mod bug1_tests {
     /// that a caller would treat as a complete (advanced) read.
     async fn run_buffered(mode: Mode) -> std::io::Result<bytes::Bytes> {
         let dir = test_support::temp_dir("h4");
-        let mut store =
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let mut store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         store.blobstore = Some(Arc::new(TestBlob(mode)));
         let store = Arc::new(store);
         let st = match store.create("s", stream_cfg(), None, 0).unwrap() {
             CreateResult::Created(s) => s,
             _ => panic!("create failed"),
         };
-        let slices = vec![ResolvedSlice::Remote {
-            key: "k".into(),
-            offset: 0,
-            len: 100,
-        }];
+        let slices = vec![ResolvedSlice::Remote { key: "k".into(), offset: 0, len: 100 }];
         let res = materialize_resolved(&st, slices, b"", b"").await;
         res
     }
@@ -2661,18 +2421,12 @@ mod bug1_tests {
 
     #[tokio::test]
     async fn buffered_cold_read_truncated_errors() {
-        assert!(
-            run_buffered(Mode::Truncate).await.is_err(),
-            "a truncated cold object must surface as Err (H4)"
-        );
+        assert!(run_buffered(Mode::Truncate).await.is_err(), "a truncated cold object must surface as Err (H4)");
     }
 
     #[tokio::test]
     async fn buffered_cold_read_backend_error_errors() {
-        assert!(
-            run_buffered(Mode::Error).await.is_err(),
-            "a cold-read backend error must surface as Err (H4)"
-        );
+        assert!(run_buffered(Mode::Error).await.is_err(), "a cold-read backend error must surface as Err (H4)");
     }
 }
 
@@ -2709,34 +2463,16 @@ mod memory_mode_tests {
     async fn memory_mode_append_acks_without_wal() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("mem-append");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         // NOTE: no WAL attached (store.wal not set) — memory mode must not touch it.
 
         // Create the stream (PUT).
-        let resp = handle(
-            Arc::clone(&store),
-            put_req("m/s", "application/octet-stream"),
-        )
-        .await;
-        assert!(
-            (200..300).contains(&resp.status),
-            "create stream expected 2xx, got {}",
-            resp.status
-        );
+        let resp = handle(Arc::clone(&store), put_req("m/s", "application/octet-stream")).await;
+        assert!((200..300).contains(&resp.status), "create stream expected 2xx, got {}", resp.status);
 
         // Append a record (POST) — must ack without WAL.
-        let resp = handle(
-            Arc::clone(&store),
-            post_req("m/s", "application/octet-stream", b"hello-memory"),
-        )
-        .await;
-        assert!(
-            (200..300).contains(&resp.status),
-            "memory append should ack, got {}",
-            resp.status
-        );
+        let resp = handle(Arc::clone(&store), post_req("m/s", "application/octet-stream", b"hello-memory")).await;
+        assert!((200..300).contains(&resp.status), "memory append should ack, got {}", resp.status);
 
         // Verify the bytes landed in the per-stream file.
         let st = store.get("m/s").unwrap();
@@ -2756,15 +2492,9 @@ mod memory_mode_tests {
     async fn memory_append_defers_sidecar_to_store_sweep() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("mem-sweep");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
 
-        let resp = handle(
-            Arc::clone(&store),
-            put_req("m/s", "application/octet-stream"),
-        )
-        .await;
+        let resp = handle(Arc::clone(&store), put_req("m/s", "application/octet-stream")).await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
 
         // Append with a producer so the pending sidecar change is observable.
@@ -2780,12 +2510,8 @@ mod memory_mode_tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let st = store.get("m/s").unwrap();
         let meta: crate::store::Meta =
-            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap())
-                .unwrap();
-        assert!(
-            !meta.producers.contains_key("p1"),
-            "sidecar was flushed per-append (debounce timer still active)"
-        );
+            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap()).unwrap();
+        assert!(!meta.producers.contains_key("p1"), "sidecar was flushed per-append (debounce timer still active)");
 
         // The batched store sweep is what persists it.
         let flushed = tokio::task::spawn_blocking({
@@ -2796,12 +2522,8 @@ mod memory_mode_tests {
         .unwrap();
         assert_eq!(flushed, 1, "the appended stream is swept");
         let meta: crate::store::Meta =
-            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap())
-                .unwrap();
-        assert!(
-            meta.producers.contains_key("p1"),
-            "sweep must persist the pending producer state"
-        );
+            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&st.file_path)).unwrap()).unwrap();
+        assert!(meta.producers.contains_key("p1"), "sweep must persist the pending producer state");
     }
 
     /// Cardinality-cliff fix (#1): a PLAIN append (no producer/seq, non-TTL
@@ -2815,28 +2537,16 @@ mod memory_mode_tests {
     async fn memory_plain_append_skips_sidecar_flush() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("mem-plain-noflush");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
 
-        let resp = handle(
-            Arc::clone(&store),
-            put_req("m/p", "application/octet-stream"),
-        )
-        .await;
+        let resp = handle(Arc::clone(&store), put_req("m/p", "application/octet-stream")).await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
         // Drain anything the create queued so we measure only the append's effect.
         let store2 = Arc::clone(&store);
-        let _ = tokio::task::spawn_blocking(move || store2.sweep_meta_once())
-            .await
-            .unwrap();
+        let _ = tokio::task::spawn_blocking(move || store2.sweep_meta_once()).await.unwrap();
 
         // Plain append: no producer headers, non-TTL stream.
-        let resp = handle(
-            Arc::clone(&store),
-            post_req("m/p", "application/octet-stream", b"payload"),
-        )
-        .await;
+        let resp = handle(Arc::clone(&store), post_req("m/p", "application/octet-stream", b"payload")).await;
         assert!((200..300).contains(&resp.status), "append: {}", resp.status);
 
         let flushed = tokio::task::spawn_blocking({
@@ -2845,10 +2555,7 @@ mod memory_mode_tests {
         })
         .await
         .unwrap();
-        assert_eq!(
-            flushed, 0,
-            "a plain non-TTL memory-mode append must not queue a sidecar flush"
-        );
+        assert_eq!(flushed, 0, "a plain non-TTL memory-mode append must not queue a sidecar flush");
     }
 
     /// Long-poll deadline/data race (conformance flake root cause): a long-poll
@@ -2864,15 +2571,9 @@ mod memory_mode_tests {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         crate::handlers::set_long_poll_timeout(20);
         let dir = test_support::temp_dir("lp-race");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
 
-        let resp = handle(
-            Arc::clone(&store),
-            put_req("lp/r", "application/octet-stream"),
-        )
-        .await;
+        let resp = handle(Arc::clone(&store), put_req("lp/r", "application/octet-stream")).await;
         assert!((200..300).contains(&resp.status), "create: {}", resp.status);
 
         let next_offset = |r: &crate::api::Resp| -> u64 {
@@ -2897,11 +2598,7 @@ mod memory_mode_tests {
             ));
             // ...and race an append onto the deadline (spread over the window).
             tokio::time::sleep(std::time::Duration::from_millis(15 + (i % 10) as u64)).await;
-            let ar = handle(
-                Arc::clone(&store),
-                post_req("lp/r", "application/octet-stream", b"x"),
-            )
-            .await;
+            let ar = handle(Arc::clone(&store), post_req("lp/r", "application/octet-stream", b"x")).await;
             assert!((200..300).contains(&ar.status), "append: {}", ar.status);
             let r = lp.await.unwrap();
             let next = next_offset(&r);
@@ -2943,9 +2640,7 @@ mod memory_mode_tests {
     async fn close_only_post_slides_the_ttl() {
         let _guard = crate::handlers::test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("ttl-close");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
 
         let mut req = put_req("m/ttl", "application/octet-stream");
         req.headers.push(("stream-ttl".into(), "3600".into()));
@@ -2963,14 +2658,9 @@ mod memory_mode_tests {
         assert!((200..300).contains(&resp.status), "close: {}", resp.status);
 
         let last_access = st.shared.read().unwrap().last_access;
+        assert!(last_access > stale, "a close-only POST is a successful write and must slide the TTL");
         assert!(
-            last_access > stale,
-            "a close-only POST is a successful write and must slide the TTL"
-        );
-        assert!(
-            SystemTime::now()
-                .duration_since(last_access)
-                .expect("last_access is in the past")
+            SystemTime::now().duration_since(last_access).expect("last_access is in the past")
                 < Duration::from_secs(60),
             "the TTL window must restart from the close, not from the last body append"
         );
@@ -3030,10 +2720,7 @@ mod chunk_cap_tests {
     }
 
     fn header<'a>(resp: &'a Resp, name: &str) -> Option<&'a str> {
-        resp.headers
-            .iter()
-            .find(|(k, _)| *k == name)
-            .map(|(_, v)| v.as_str())
+        resp.headers.iter().find(|(k, _)| *k == name).map(|(_, v)| v.as_str())
     }
 
     fn next_offset(resp: &Resp) -> u64 {
@@ -3054,12 +2741,7 @@ mod chunk_cap_tests {
         match body {
             Body::Empty => Vec::new(),
             Body::Full(b) => b.to_vec(),
-            Body::FileRange {
-                segments,
-                prefix,
-                suffix,
-                ..
-            } => {
+            Body::FileRange { segments, prefix, suffix, .. } => {
                 let mut out = prefix.to_vec();
                 out.extend_from_slice(&crate::store::materialize_segments(&segments));
                 out.extend_from_slice(suffix);
@@ -3072,10 +2754,7 @@ mod chunk_cap_tests {
                 while let Some(chunk) = rx.recv().await {
                     out.extend_from_slice(&chunk);
                 }
-                assert!(
-                    !stream.failed.load(std::sync::atomic::Ordering::Acquire),
-                    "the streamed body must not abort"
-                );
+                assert!(!stream.failed.load(std::sync::atomic::Ordering::Acquire), "the streamed body must not abort");
                 out
             }
             _ => panic!("unexpected streaming body for a catch-up read"),
@@ -3089,11 +2768,7 @@ mod chunk_cap_tests {
 
     async fn append(store: &Arc<Store>, path: &str, content_type: &str, body: &[u8]) {
         let resp = handle(Arc::clone(store), post_req(path, content_type, body)).await;
-        assert!(
-            (200..300).contains(&resp.status),
-            "append to {path}: {}",
-            resp.status
-        );
+        assert!((200..300).contains(&resp.status), "append to {path}: {}", resp.status);
     }
 
     async fn read(store: &Arc<Store>, path: &str, offset: Option<u64>) -> Resp {
@@ -3111,32 +2786,18 @@ mod chunk_cap_tests {
     async fn json_pages_are_valid_arrays_and_resume_from_next_offset() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = test_support::temp_dir("json-pages");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/json", "application/json").await;
         for i in 0..40 {
-            append(
-                &store,
-                "c/json",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "c/json", "application/json", json_item(i, 60).as_bytes()).await;
         }
         let tail = store.streams.get("c/json").unwrap().tail().bytes;
 
         let first = read(&store, "c/json", None).await;
         assert_eq!(first.status, 200);
-        assert!(
-            !up_to_date(&first),
-            "a chunk-capped page must not claim Stream-Up-To-Date (§5.6)"
-        );
+        assert!(!up_to_date(&first), "a chunk-capped page must not claim Stream-Up-To-Date (§5.6)");
         let cut = next_offset(&first);
-        assert!(
-            cut > 0 && cut < tail,
-            "partial next offset: {cut} of {tail}"
-        );
+        assert!(cut > 0 && cut < tail, "partial next offset: {cut} of {tail}");
         assert!(cut <= 512, "the page must respect the cap, got {cut} bytes");
 
         let mut seen: Vec<serde_json::Value> = Vec::new();
@@ -3150,8 +2811,8 @@ mod chunk_cap_tests {
             let done = up_to_date(&resp);
             let at = next_offset(&resp);
             let body = body_bytes(resp.body).await;
-            let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body)
-                .unwrap_or_else(|e| panic!("page must be a valid JSON array: {e}"));
+            let parsed: Vec<serde_json::Value> =
+                serde_json::from_slice(&body).unwrap_or_else(|e| panic!("page must be a valid JSON array: {e}"));
             seen.extend(parsed);
             if done {
                 assert_eq!(at, tail, "the final page reports the tail");
@@ -3162,11 +2823,7 @@ mod chunk_cap_tests {
         assert!(pages > 1, "the stream must have been split into pages");
         assert_eq!(seen.len(), 40, "every appended value is delivered once");
         for (i, value) in seen.iter().enumerate() {
-            assert_eq!(
-                value["i"],
-                serde_json::json!(i as i64),
-                "values stay ordered"
-            );
+            assert_eq!(value["i"], serde_json::json!(i as i64), "values stay ordered");
         }
     }
 
@@ -3175,9 +2832,7 @@ mod chunk_cap_tests {
     async fn byte_stream_is_cut_at_the_cap() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = test_support::temp_dir("bytes-cut");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/bytes", "application/octet-stream").await;
         let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
         append(&store, "c/bytes", "application/octet-stream", &payload).await;
@@ -3207,9 +2862,7 @@ mod chunk_cap_tests {
     async fn cap_zero_is_unlimited() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(0);
         let dir = test_support::temp_dir("cap-zero");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/unlimited", "application/octet-stream").await;
         let payload = vec![b'x'; 100_000];
         append(&store, "c/unlimited", "application/octet-stream", &payload).await;
@@ -3226,30 +2879,17 @@ mod chunk_cap_tests {
     async fn oversize_json_value_is_served_whole() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(64);
         let dir = test_support::temp_dir("oversize-json");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/big", "application/json").await;
         let big = json_item(0, 4000);
         append(&store, "c/big", "application/json", big.as_bytes()).await;
-        append(
-            &store,
-            "c/big",
-            "application/json",
-            json_item(1, 8).as_bytes(),
-        )
-        .await;
+        append(&store, "c/big", "application/json", json_item(1, 8).as_bytes()).await;
 
         let resp = read(&store, "c/big", None).await;
         assert_eq!(resp.status, 200);
         assert!(!up_to_date(&resp), "more values remain after the big one");
-        assert_eq!(
-            next_offset(&resp),
-            big.len() as u64 + 1,
-            "the cut lands just past the oversize value's separator"
-        );
-        let parsed: Vec<serde_json::Value> =
-            serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
+        assert_eq!(next_offset(&resp), big.len() as u64 + 1, "the cut lands just past the oversize value's separator");
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
         assert_eq!(parsed.len(), 1, "exactly the oversize value is returned");
         assert_eq!(parsed[0]["i"], serde_json::json!(0));
     }
@@ -3260,28 +2900,13 @@ mod chunk_cap_tests {
     async fn closed_is_reported_only_on_the_final_page() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
         let dir = test_support::temp_dir("closed-pages");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/closed", "application/octet-stream").await;
-        append(
-            &store,
-            "c/closed",
-            "application/octet-stream",
-            &vec![b'y'; 500],
-        )
-        .await;
-        assert!((200..300).contains(
-            &handle(Arc::clone(&store), close_req("c/closed"))
-                .await
-                .status
-        ));
+        append(&store, "c/closed", "application/octet-stream", &vec![b'y'; 500]).await;
+        assert!((200..300).contains(&handle(Arc::clone(&store), close_req("c/closed")).await.status));
 
         let first = read(&store, "c/closed", None).await;
-        assert!(
-            header(&first, H_CLOSED).is_none(),
-            "a partial page of a closed stream must not report Stream-Closed"
-        );
+        assert!(header(&first, H_CLOSED).is_none(), "a partial page of a closed stream must not report Stream-Closed");
         assert!(!up_to_date(&first));
 
         let mut offset = next_offset(&first);
@@ -3291,11 +2916,7 @@ mod chunk_cap_tests {
             offset = next_offset(&last);
         }
         assert_eq!(offset, 500);
-        assert_eq!(
-            header(&last, H_CLOSED),
-            Some("true"),
-            "the page that reaches the tail reports closure"
-        );
+        assert_eq!(header(&last, H_CLOSED), Some("true"), "the page that reaches the tail reports closure");
     }
 
     /// The ETag covers the range actually returned, and a conditional request
@@ -3304,33 +2925,18 @@ mod chunk_cap_tests {
     async fn conditional_request_matches_the_partial_page() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(128);
         let dir = test_support::temp_dir("partial-etag");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/etag", "application/octet-stream").await;
-        append(
-            &store,
-            "c/etag",
-            "application/octet-stream",
-            &vec![b'z'; 400],
-        )
-        .await;
+        append(&store, "c/etag", "application/octet-stream", &vec![b'z'; 400]).await;
 
         let first = read(&store, "c/etag", None).await;
-        let etag = header(&first, "etag")
-            .expect("a range read is cacheable")
-            .to_string();
+        let etag = header(&first, "etag").expect("a range read is cacheable").to_string();
         let mut conditional = get_req("c/etag", None);
-        conditional
-            .headers
-            .push(("if-none-match".into(), etag.clone()));
+        conditional.headers.push(("if-none-match".into(), etag.clone()));
         let resp = handle(Arc::clone(&store), conditional).await;
         assert_eq!(resp.status, 304);
         assert_eq!(next_offset(&resp), 128);
-        assert!(
-            !up_to_date(&resp),
-            "the 304 for a partial page must not claim up-to-date either"
-        );
+        assert!(!up_to_date(&resp), "the 304 for a partial page must not claim up-to-date either");
     }
 
     fn fork_req(path: &str, source: &str, offset: u64, sub_offset: u64) -> Req {
@@ -3377,9 +2983,7 @@ mod chunk_cap_tests {
     async fn fork_sub_offset_counts_top_level_values_not_raw_commas() {
         let _durability = test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("fork-sub-offset");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "f/parent", "application/json").await;
         let first = r#"{"a":[1,2],"b":"x,y"}"#;
         append(&store, "f/parent", "application/json", first.as_bytes()).await;
@@ -3395,10 +2999,7 @@ mod chunk_cap_tests {
         );
 
         let values = drain_json(&store, "f/child").await;
-        assert_eq!(
-            values,
-            vec![serde_json::from_str::<serde_json::Value>(first).unwrap()]
-        );
+        assert_eq!(values, vec![serde_json::from_str::<serde_json::Value>(first).unwrap()]);
     }
 
     /// A fork read that crosses both the fork point and the chunk cap still pages
@@ -3408,37 +3009,19 @@ mod chunk_cap_tests {
     async fn fork_reads_page_across_the_cap() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = test_support::temp_dir("fork-cap");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "f/src", "application/json").await;
         for i in 0..20 {
-            append(
-                &store,
-                "f/src",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "f/src", "application/json", json_item(i, 60).as_bytes()).await;
         }
         let resp = handle(Arc::clone(&store), fork_req("f/fork", "f/src", 0, 20)).await;
         assert_eq!(resp.status, 201, "fork create");
         for i in 20..40 {
-            append(
-                &store,
-                "f/fork",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "f/fork", "application/json", json_item(i, 60).as_bytes()).await;
         }
 
         let values = drain_json(&store, "f/fork").await;
-        assert_eq!(
-            values.len(),
-            40,
-            "inherited + own values, each exactly once"
-        );
+        assert_eq!(values.len(), 40, "inherited + own values, each exactly once");
         for (i, value) in values.iter().enumerate() {
             assert_eq!(value["i"], serde_json::json!(i as i64));
         }
@@ -3460,20 +3043,11 @@ mod chunk_cap_tests {
         let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), tier).unwrap());
         create(&store, "cold/json", "application/json").await;
         for i in 0..60 {
-            append(
-                &store,
-                "cold/json",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "cold/json", "application/json", json_item(i, 60).as_bytes()).await;
         }
         let st = store.streams.get("cold/json").unwrap().clone();
         store.maybe_seal(&st).await;
-        assert!(
-            st.tier.manifest.lock().unwrap().sealed_offset > 0,
-            "the test must actually seal a cold prefix"
-        );
+        assert!(st.tier.manifest.lock().unwrap().sealed_offset > 0, "the test must actually seal a cold prefix");
 
         let values = drain_json(&store, "cold/json").await;
         assert_eq!(values.len(), 60);
@@ -3490,9 +3064,7 @@ mod chunk_cap_tests {
     async fn mid_value_offset_fails_closed_instead_of_serving_the_tail() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = test_support::temp_dir("mid-value");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/strings", "application/json").await;
         // Comma-free string values: a scan starting inside one never sees a
         // top-level separator, so the range is provably not value-aligned.
@@ -3501,10 +3073,7 @@ mod chunk_cap_tests {
             append(&store, "c/strings", "application/json", value.as_bytes()).await;
         }
         let resp = read(&store, "c/strings", Some(3)).await;
-        assert_eq!(
-            resp.status, 400,
-            "a mid-value offset must be refused, not served as a malformed page"
-        );
+        assert_eq!(resp.status, 400, "a mid-value offset must be refused, not served as a malformed page");
 
         // The same stream read from a server-issued offset still pages fine.
         let values = drain_json(&store, "c/strings").await;
@@ -3519,18 +3088,10 @@ mod chunk_cap_tests {
     async fn sse_catch_up_is_delivered_in_capped_frames() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = test_support::temp_dir("sse-cap");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "sse/json", "application/json").await;
         for i in 0..40 {
-            append(
-                &store,
-                "sse/json",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "sse/json", "application/json", json_item(i, 60).as_bytes()).await;
         }
 
         let resp = handle(
@@ -3544,17 +3105,12 @@ mod chunk_cap_tests {
             },
         )
         .await;
-        let Body::Sse(mut source) = resp.body else {
-            panic!("expected an inline SSE source")
-        };
+        let Body::Sse(mut source) = resp.body else { panic!("expected an inline SSE source") };
 
         let mut values: Vec<serde_json::Value> = Vec::new();
         let mut frames = 0;
         loop {
-            let chunk = source
-                .next_chunk()
-                .await
-                .expect("SSE must reach up-to-date");
+            let chunk = source.next_chunk().await.expect("SSE must reach up-to-date");
             let frame = String::from_utf8(chunk.to_vec()).unwrap();
             frames += 1;
             assert!(frames < 50, "SSE catch-up must terminate");
@@ -3562,10 +3118,7 @@ mod chunk_cap_tests {
                 if let Some(payload) = line.strip_prefix("data:[") {
                     let page: Vec<serde_json::Value> =
                         serde_json::from_str(&format!("[{payload}")).expect("valid JSON array");
-                    assert!(
-                        payload.len() < 512 + 64,
-                        "an SSE data frame must respect the cap"
-                    );
+                    assert!(payload.len() < 512 + 64, "an SSE data frame must respect the cap");
                     values.extend(page);
                 }
             }
@@ -3588,9 +3141,7 @@ mod chunk_cap_tests {
         // of the three-byte characters below.
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(100);
         let dir = test_support::temp_dir("sse-utf8");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "sse/text", "text/plain").await;
         let payload = "★".repeat(200);
         append(&store, "sse/text", "text/plain", payload.as_bytes()).await;
@@ -3606,17 +3157,12 @@ mod chunk_cap_tests {
             },
         )
         .await;
-        let Body::Sse(mut source) = resp.body else {
-            panic!("expected an inline SSE source")
-        };
+        let Body::Sse(mut source) = resp.body else { panic!("expected an inline SSE source") };
 
         let mut text = String::new();
         let mut frames = 0;
         for _ in 0..50 {
-            let chunk = source
-                .next_chunk()
-                .await
-                .expect("SSE must reach up-to-date");
+            let chunk = source.next_chunk().await.expect("SSE must reach up-to-date");
             let frame = String::from_utf8(chunk.to_vec()).unwrap();
             frames += 1;
             // One chunk carries a `data` event followed by its `control` event;
@@ -3636,10 +3182,7 @@ mod chunk_cap_tests {
             }
         }
         assert!(frames > 1, "the text backlog must be split across frames");
-        assert!(
-            !text.contains('\u{fffd}'),
-            "a capped text frame must not split a UTF-8 character"
-        );
+        assert!(!text.contains('\u{fffd}'), "a capped text frame must not split a UTF-8 character");
         assert_eq!(text, payload, "the text stream reassembles exactly");
     }
 
@@ -3650,18 +3193,10 @@ mod chunk_cap_tests {
     async fn capped_json_page_is_served_from_the_scanned_bytes() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(512);
         let dir = test_support::temp_dir("json-single-read");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/once", "application/json").await;
         for i in 0..40 {
-            append(
-                &store,
-                "c/once",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "c/once", "application/json", json_item(i, 60).as_bytes()).await;
         }
 
         let resp = read(&store, "c/once", None).await;
@@ -3671,8 +3206,7 @@ mod chunk_cap_tests {
             "a capped JSON page must be served from the bytes the boundary scan \
              already read, not resolved and read a second time"
         );
-        let values: Vec<serde_json::Value> =
-            serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&body_bytes(resp.body).await).unwrap();
         assert_eq!(values[0]["i"], serde_json::json!(0));
     }
 
@@ -3685,30 +3219,18 @@ mod chunk_cap_tests {
         let cap = 1024;
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(cap);
         let dir = test_support::temp_dir("no-reread");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/reread", "application/json").await;
         let big = json_item(0, 20_000);
         append(&store, "c/reread", "application/json", big.as_bytes()).await;
         for i in 1..5 {
-            append(
-                &store,
-                "c/reread",
-                "application/json",
-                json_item(i, 60).as_bytes(),
-            )
-            .await;
+            append(&store, "c/reread", "application/json", json_item(i, 60).as_bytes()).await;
         }
 
         BOUNDARY_SCAN_BYTES.store(0, Ordering::Relaxed);
         let resp = read(&store, "c/reread", None).await;
         let page_wire = big.len() as u64 + 1;
-        assert_eq!(
-            next_offset(&resp),
-            page_wire,
-            "the oversize value is one page"
-        );
+        assert_eq!(next_offset(&resp), page_wire, "the oversize value is one page");
         let scanned = BOUNDARY_SCAN_BYTES.load(Ordering::Relaxed);
         assert!(
             scanned <= page_wire + cap,
@@ -3738,11 +3260,7 @@ mod chunk_cap_tests {
         );
         drop(held);
         worker.join().unwrap();
-        assert_eq!(
-            max_chunk_bytes(),
-            DEFAULT_MAX_CHUNK_BYTES,
-            "dropping the guard restores the default cap"
-        );
+        assert_eq!(max_chunk_bytes(), DEFAULT_MAX_CHUNK_BYTES, "dropping the guard restores the default cap");
     }
 
     /// A long-poll that returns a backlog is a read like any other: the same cap
@@ -3751,9 +3269,7 @@ mod chunk_cap_tests {
     async fn long_poll_backlog_is_capped() {
         let _durability = test_support::DurabilityGuard::memory_with_max_chunk(256);
         let dir = test_support::temp_dir("long-poll-cap");
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         create(&store, "c/lp", "application/octet-stream").await;
         append(&store, "c/lp", "application/octet-stream", &vec![b'q'; 900]).await;
 

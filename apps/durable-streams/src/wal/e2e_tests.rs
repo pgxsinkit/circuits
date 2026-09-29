@@ -63,27 +63,17 @@ impl Harness {
         segment_size: u64,
     ) -> io::Result<Harness> {
         let walset = WalSet::open_with_segment_size(dir, shards, default_n, segment_size)?;
-        let store = Arc::new(Store::new_with_tier(
-            dir.to_path_buf(),
-            TierConfig::default(),
-        )?);
+        let store = Arc::new(Store::new_with_tier(dir.to_path_buf(), TierConfig::default())?);
         crate::wal::recovery::recover(&store, &walset)?;
         walset.reset_after_recovery()?;
-        store
-            .wal
-            .set(Arc::clone(&walset))
-            .unwrap_or_else(|_| panic!("WAL already attached"));
+        store.wal.set(Arc::clone(&walset)).unwrap_or_else(|_| panic!("WAL already attached"));
         // Spawn committers ourselves (not `walset.spawn_committers()`) so we keep
         // the handles and can stop them to simulate a crash.
         let mut committers = Vec::new();
         for shard in walset.shards() {
             committers.push(shard.spawn_committer());
         }
-        Ok(Harness {
-            store,
-            walset,
-            committers,
-        })
+        Ok(Harness { store, walset, committers })
     }
 
     /// Stop + join every committer thread (so no further `durable_lsn` advance can
@@ -113,13 +103,7 @@ fn put_req(path: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) 
     for (k, v) in extra {
         headers.push((k.to_string(), v.to_string()));
     }
-    Req {
-        method: Method::Put,
-        path: path.to_string(),
-        query: None,
-        headers,
-        body: Bytes::copy_from_slice(body),
-    }
+    Req { method: Method::Put, path: path.to_string(), query: None, headers, body: Bytes::copy_from_slice(body) }
 }
 
 /// Build a `POST` (append) request for `path`.
@@ -136,11 +120,7 @@ fn post_req(path: &str, content_type: &str, body: &[u8]) -> Req {
 /// Create a stream over the REAL HTTP path; assert a 2xx.
 async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
     let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
-    assert!(
-        (200..300).contains(&resp.status),
-        "create {path} expected 2xx, got {}",
-        resp.status
-    );
+    assert!((200..300).contains(&resp.status), "create {path} expected 2xx, got {}", resp.status);
 }
 
 /// Append one record over the REAL HTTP path; assert a 2xx ack (which, in WAL
@@ -148,19 +128,13 @@ async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
 /// in `memory` mode it means the page-cache write completed — no WAL, no fsync).
 async fn append_acked(store: &Arc<Store>, path: &str, content_type: &str, body: &[u8]) {
     let resp = handlers::handle(Arc::clone(store), post_req(path, content_type, body)).await;
-    assert!(
-        (200..300).contains(&resp.status),
-        "append to {path} expected 2xx ack, got {}",
-        resp.status
-    );
+    assert!((200..300).contains(&resp.status), "append to {path} expected 2xx ack, got {}", resp.status);
 }
 
 /// The data-file path for a stream by name (the read surface; spec §8). Resolves
 /// the live `StreamState.file_path` so we read exactly what `sendfile` would.
 fn stream_file_bytes(store: &Arc<Store>, path: &str) -> Vec<u8> {
-    let st = store
-        .get(path)
-        .unwrap_or_else(|| panic!("stream {path} not found"));
+    let st = store.get(path).unwrap_or_else(|| panic!("stream {path} not found"));
     std::fs::read(&st.file_path).unwrap()
 }
 
@@ -169,11 +143,7 @@ fn stream_file_bytes(store: &Arc<Store>, path: &str) -> Vec<u8> {
 fn shard_index_of(store: &Arc<Store>, walset: &Arc<WalSet>, path: &str) -> usize {
     let st = store.get(path).unwrap();
     let target = walset.shard_for(st.id);
-    walset
-        .shards()
-        .iter()
-        .position(|s| Arc::ptr_eq(s, target))
-        .unwrap()
+    walset.shards().iter().position(|s| Arc::ptr_eq(s, target)).unwrap()
 }
 
 const OCTET: &str = "application/octet-stream";
@@ -213,10 +183,7 @@ async fn e2e_no_loss_two_shards_acked_records_survive_crash() {
     for n in names {
         used_shards.insert(shard_index_of(&h.store, &h.walset, n));
     }
-    assert!(
-        used_shards.len() >= 2,
-        "test needs streams on ≥2 shards; got shards {used_shards:?}"
-    );
+    assert!(used_shards.len() >= 2, "test needs streams on ≥2 shards; got shards {used_shards:?}");
 
     // Append K records to each stream; build the expected per-stream byte image.
     const K: usize = 5;
@@ -239,16 +206,9 @@ async fn e2e_no_loss_two_shards_acked_records_survive_crash() {
     // Every acked record survived byte-identical on each stream's read surface.
     for n in names {
         let got = stream_file_bytes(&h2.store, n);
-        assert_eq!(
-            got, expected[n],
-            "stream {n}: all {K} acked records recover byte-identical after crash"
-        );
+        assert_eq!(got, expected[n], "stream {n}: all {K} acked records recover byte-identical after crash");
         let st = h2.store.get(n).unwrap();
-        assert_eq!(
-            st.tail().bytes,
-            expected[n].len() as u64,
-            "stream {n}: recovered tail == total acked bytes"
-        );
+        assert_eq!(st.tail().bytes, expected[n].len() as u64, "stream {n}: recovered tail == total acked bytes");
     }
     h2.crash();
 }
@@ -288,10 +248,7 @@ async fn e2e_no_loss_unacked_tail_is_absent_after_crash() {
     let unacked: &[u8] = b"UNACKED-NEVER-DURABLE|";
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&st.file_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&st.file_path).unwrap();
         f.write_all(unacked).unwrap(); // (a) page-cache tail past the durable frontier
         f.sync_all().unwrap();
     }
@@ -303,10 +260,7 @@ async fn e2e_no_loss_unacked_tail_is_absent_after_crash() {
     let durable_wal_len = 2 * HEADER_LEN + b"acked-one|".len() + b"acked-two|".len();
     {
         use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&seg_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(&seg_path).unwrap();
         f.seek(SeekFrom::Start(durable_wal_len as u64)).unwrap();
         // A few non-zero bytes that cannot decode as a whole record (header CRC
         // will not validate / payload short) → torn end-of-log.
@@ -323,10 +277,7 @@ async fn e2e_no_loss_unacked_tail_is_absent_after_crash() {
 
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
     let got = stream_file_bytes(&h2.store, "s");
-    assert_eq!(
-        got, acked,
-        "only the two ACKED records recover; the torn, un-acked tail is truncated away"
-    );
+    assert_eq!(got, acked, "only the two ACKED records recover; the torn, un-acked tail is truncated away");
     h2.crash();
 }
 
@@ -353,10 +304,7 @@ async fn e2e_no_torn_json_tail_repaired_to_whole_records() {
     append_acked(&h.store, "j", JSON, br#"{"a":1}"#).await;
     append_acked(&h.store, "j", JSON, br#"{"b":2}"#).await;
     let durable = stream_file_bytes(&h.store, "j");
-    assert_eq!(
-        durable, br#"{"a":1},{"b":2},"#,
-        "two whole JSON wire records acked"
-    );
+    assert_eq!(durable, br#"{"a":1},{"b":2},"#, "two whole JSON wire records acked");
 
     // Now simulate a page-cache write that reached the FILE but never the durable
     // WAL: append a TORN trailing JSON value straight to the per-stream file
@@ -365,10 +313,7 @@ async fn e2e_no_torn_json_tail_repaired_to_whole_records() {
     let st = h.store.get("j").unwrap();
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&st.file_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&st.file_path).unwrap();
         f.write_all(br#"{"c":"#).unwrap(); // torn, un-acked JSON tail
         f.sync_all().unwrap();
     }
@@ -378,19 +323,12 @@ async fn e2e_no_torn_json_tail_repaired_to_whole_records() {
     // Reopen: recovery must truncate the torn tail back to the durable frontier.
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
     let got = stream_file_bytes(&h2.store, "j");
-    assert_eq!(
-        got, br#"{"a":1},{"b":2},"#,
-        "recovery repaired the file to whole records; torn `{{\"c\":` discarded"
-    );
+    assert_eq!(got, br#"{"a":1},{"b":2},"#, "recovery repaired the file to whole records; torn `{{\"c\":` discarded");
     // Every record reads back as valid JSON (the wire is value,value, — split on
     // the trailing commas and parse each).
     let text = String::from_utf8(got.clone()).unwrap();
     for v in text.trim_end_matches(',').split("},") {
-        let val = if v.ends_with('}') {
-            v.to_string()
-        } else {
-            format!("{v}}}")
-        };
+        let val = if v.ends_with('}') { v.to_string() } else { format!("{v}}}") };
         serde_json::from_str::<serde_json::Value>(&val)
             .unwrap_or_else(|e| panic!("recovered record {val:?} is not valid JSON: {e}"));
     }
@@ -417,19 +355,13 @@ async fn e2e_no_torn_tail_when_last_durable_record_below_checkpoint() {
     // Drive a REAL checkpoint: fdatasync the touched per-stream file + persist
     // checkpoint_lsn covering both acked records. (Single shard.)
     let ckpt = h.walset.shards()[0].checkpoint().await.unwrap();
-    assert!(
-        ckpt >= 2,
-        "checkpoint_lsn covers both acked records (got {ckpt})"
-    );
+    assert!(ckpt >= 2, "checkpoint_lsn covers both acked records (got {ckpt})");
 
     // Torn page-cache tail past the durable+checkpointed frontier, then crash.
     let st = h.store.get("s").unwrap();
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&st.file_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&st.file_path).unwrap();
         f.write_all(b"TORN-TAIL-PAST-CHECKPOINT").unwrap();
         f.sync_all().unwrap();
     }
@@ -464,14 +396,9 @@ async fn e2e_sharding_parallel_recovery_across_shards() {
     for n in &names {
         create_stream(&h.store, n, OCTET).await;
     }
-    let shards: std::collections::BTreeSet<usize> = names
-        .iter()
-        .map(|n| shard_index_of(&h.store, &h.walset, n))
-        .collect();
-    assert!(
-        shards.len() >= 2,
-        "streams must span ≥2 shards; got {shards:?}"
-    );
+    let shards: std::collections::BTreeSet<usize> =
+        names.iter().map(|n| shard_index_of(&h.store, &h.walset, n)).collect();
+    assert!(shards.len() >= 2, "streams must span ≥2 shards; got {shards:?}");
 
     let mut expected: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for n in &names {
@@ -516,22 +443,10 @@ async fn e2e_sharding_below_file_base_record_skipped() {
                                                                   // Fork at offset 5 over the real path → the fork's file_base == 5.
     let resp = handlers::handle(
         Arc::clone(&h.store),
-        put_req(
-            "child",
-            OCTET,
-            b"",
-            &[
-                ("stream-forked-from", "parent"),
-                ("stream-fork-offset", &fork_offset(5)),
-            ],
-        ),
+        put_req("child", OCTET, b"", &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(5))]),
     )
     .await;
-    assert!(
-        (200..300).contains(&resp.status),
-        "fork create got {}",
-        resp.status
-    );
+    assert!((200..300).contains(&resp.status), "fork create got {}", resp.status);
     let child = h.store.get("child").unwrap();
     let file_base = child.shared.read().unwrap().file_base;
     assert_eq!(file_base, 5, "forked stream file_base = fork offset");
@@ -572,16 +487,9 @@ async fn e2e_sharding_below_file_base_record_skipped() {
     // below-frontier record was skipped (not written out of range at a negative
     // / wrapped position).
     let got = stream_file_bytes(&h2.store, "child");
-    assert_eq!(
-        got, b"FORKDATA",
-        "below-file_base WAL record skipped on replay; only the in-range record applied"
-    );
+    assert_eq!(got, b"FORKDATA", "below-file_base WAL record skipped on replay; only the in-range record applied");
     let child2 = h2.store.get("child").unwrap();
-    assert_eq!(
-        child2.tail().bytes,
-        file_base + 8,
-        "fork tail = file_base + in-range bytes (no out-of-range write)"
-    );
+    assert_eq!(child2.tail().bytes, file_base + 8, "fork tail = file_base + in-range bytes (no out-of-range write)");
     h2.crash();
 }
 
@@ -617,23 +525,11 @@ async fn e2e_n_stability_shard_resolution_ignores_core_count() {
     // Reopen with a DIFFERENT default_n (16) — a machine with more cores. The
     // persisted N (4) must win, so every stream resolves to the SAME shard.
     let h2 = Harness::boot(dir.path(), None, 16).unwrap();
-    assert_eq!(
-        h2.walset.shards().len(),
-        4,
-        "persisted N (4) used, not default_n (16)"
-    );
+    assert_eq!(h2.walset.shards().len(), 4, "persisted N (4) used, not default_n (16)");
     for (id, expect_idx) in &want {
         let target = h2.walset.shard_for(*id);
-        let got_idx = h2
-            .walset
-            .shards()
-            .iter()
-            .position(|s| Arc::ptr_eq(s, target))
-            .unwrap();
-        assert_eq!(
-            got_idx, *expect_idx,
-            "stream id {id} resolves to its persisted shard"
-        );
+        let got_idx = h2.walset.shards().iter().position(|s| Arc::ptr_eq(s, target)).unwrap();
+        assert_eq!(got_idx, *expect_idx, "stream id {id} resolves to its persisted shard");
     }
 
     // Lib-level guard (maps to exit 2 in main.rs): a requested N ≠ persisted is
@@ -642,10 +538,7 @@ async fn e2e_n_stability_shard_resolution_ignores_core_count() {
         WalSet::open(dir.path(), Some(8), 8).is_err(),
         "--wal-shards 8 ≠ persisted 4 is rejected (exit 2 at the binary level)"
     );
-    assert!(
-        WalSet::open(dir.path(), Some(4), 99).is_ok(),
-        "a matching --wal-shards is accepted"
-    );
+    assert!(WalSet::open(dir.path(), Some(4), 99).is_ok(), "a matching --wal-shards is accepted");
     h2.crash();
 }
 
@@ -671,24 +564,15 @@ async fn e2e_checkpoint_non_blocking_appends_ack_and_wal_grows() {
     // is provably gated on the committer's durable_lsn, not on checkpoint.
     for i in 0..32u64 {
         let rec = format!("payload-{i:04}|").into_bytes();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            append_acked(&h.store, "s", OCTET, &rec),
-        )
-        .await
-        .expect("appends ack with NO checkpoint having run (non-blocking)");
+        tokio::time::timeout(std::time::Duration::from_secs(5), append_acked(&h.store, "s", OCTET, &rec))
+            .await
+            .expect("appends ack with NO checkpoint having run (non-blocking)");
     }
 
     let size1: u64 = h.walset.shards().iter().map(|s| s.wal_size_bytes()).sum();
-    assert!(
-        size1 >= size0,
-        "WAL size_bytes does not shrink without a checkpoint (got {size0} → {size1})"
-    );
+    assert!(size1 >= size0, "WAL size_bytes does not shrink without a checkpoint (got {size0} → {size1})");
     // And the on-disk segment is retained (not recycled, since no checkpoint ran).
-    assert!(
-        h.walset.shards()[0].wal_segments() >= 1,
-        "WAL segment retained without a checkpoint"
-    );
+    assert!(h.walset.shards()[0].wal_segments() >= 1, "WAL segment retained without a checkpoint");
 
     h.crash();
 }
@@ -717,28 +601,12 @@ async fn e2e_forked_stream_full_http_path_recovers_correctly() {
     append_acked(&h.store, "p", OCTET, b"ABCDEFGHIJ").await;
     let resp = handlers::handle(
         Arc::clone(&h.store),
-        put_req(
-            "f",
-            OCTET,
-            b"",
-            &[
-                ("stream-forked-from", "p"),
-                ("stream-fork-offset", &fork_offset(7)),
-            ],
-        ),
+        put_req("f", OCTET, b"", &[("stream-forked-from", "p"), ("stream-fork-offset", &fork_offset(7))]),
     )
     .await;
-    assert!(
-        (200..300).contains(&resp.status),
-        "fork create got {}",
-        resp.status
-    );
+    assert!((200..300).contains(&resp.status), "fork create got {}", resp.status);
     let child = h.store.get("f").unwrap();
-    assert_eq!(
-        child.shared.read().unwrap().file_base,
-        7,
-        "fork file_base = 7"
-    );
+    assert_eq!(child.shared.read().unwrap().file_base, 7, "fork file_base = 7");
     drop(child);
 
     // Append records to the fork through the REAL POST path. The handler computes
@@ -747,11 +615,7 @@ async fn e2e_forked_stream_full_http_path_recovers_correctly() {
     append_acked(&h.store, "f", OCTET, b"forkrec1|").await;
     append_acked(&h.store, "f", OCTET, b"forkrec2|").await;
     let expected: &[u8] = b"forkrec1|forkrec2|"; // file-relative bytes (file pos 0..)
-    assert_eq!(
-        stream_file_bytes(&h.store, "f"),
-        expected,
-        "fork file before crash"
-    );
+    assert_eq!(stream_file_bytes(&h.store, "f"), expected, "fork file before crash");
 
     h.crash();
 
@@ -759,16 +623,9 @@ async fn e2e_forked_stream_full_http_path_recovers_correctly() {
     // (stream_offset − file_base), reconstructing exactly the fork-relative bytes.
     let h2 = Harness::boot(dir.path(), None, 2).unwrap();
     let got = stream_file_bytes(&h2.store, "f");
-    assert_eq!(
-        got, expected,
-        "forked stream (file_base > 0) recovers byte-correct over the full HTTP path"
-    );
+    assert_eq!(got, expected, "forked stream (file_base > 0) recovers byte-correct over the full HTTP path");
     let child2 = h2.store.get("f").unwrap();
-    assert_eq!(
-        child2.tail().bytes,
-        7 + expected.len() as u64,
-        "fork tail = file_base + recovered bytes"
-    );
+    assert_eq!(child2.tail().bytes, 7 + expected.len() as u64, "fork tail = file_base + recovered bytes");
     h2.crash();
 }
 
@@ -792,11 +649,7 @@ async fn strict_created_dir_reopens_wal_only_without_data_loss() {
     // via the appender so no WAL is touched.
     {
         let store = Arc::new(
-            crate::store::Store::new_with_tier(
-                dir.path().to_path_buf(),
-                crate::tier::TierConfig::default(),
-            )
-            .unwrap(),
+            crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
         );
         let st = {
             let s = Arc::clone(&store);
@@ -835,17 +688,13 @@ async fn strict_created_dir_reopens_wal_only_without_data_loss() {
         }
         // Persist the tail to the sidecar so recovery sees it on reopen.
         let st2 = Arc::clone(&st);
-        tokio::task::spawn_blocking(move || crate::store::write_meta_sync(&st2, true))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::task::spawn_blocking(move || crate::store::write_meta_sync(&st2, true)).await.unwrap().unwrap();
         // A strict-era server predates the `durable_tail` sidecar proof — strip
         // the field the CURRENT writer emitted so the sidecar is byte-faithful
         // to what an old deployment left behind (recovery must fall back to
         // trusting the file size for such sidecars).
         let meta_path = crate::store::meta_path(&st.file_path);
-        let mut v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
         v.as_object_mut().unwrap().remove("durable_tail");
         std::fs::write(&meta_path, serde_json::to_vec(&v).unwrap()).unwrap();
     }
@@ -854,34 +703,18 @@ async fn strict_created_dir_reopens_wal_only_without_data_loss() {
 
     // --- Phase 2: reopen WAL-only (the exact main.rs startup sequence).
     let store = Arc::new(
-        crate::store::Store::new_with_tier(
-            dir.path().to_path_buf(),
-            crate::tier::TierConfig::default(),
-        )
-        .unwrap(),
+        crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
     );
     let walset = crate::wal::walset::WalSet::open(dir.path(), None, 1).unwrap();
     // An empty WAL replay must NOT truncate pre-existing per-stream data.
     crate::wal::recovery::recover(&store, &walset).unwrap();
     walset.reset_after_recovery().unwrap();
-    store
-        .wal
-        .set(Arc::clone(&walset))
-        .unwrap_or_else(|_| panic!("wal already set"));
+    store.wal.set(Arc::clone(&walset)).unwrap_or_else(|_| panic!("wal already set"));
 
-    let st = store
-        .get("s/keep")
-        .expect("stream must survive WAL-only reopen");
+    let st = store.get("s/keep").expect("stream must survive WAL-only reopen");
     let got = std::fs::read(&st.file_path).unwrap();
-    assert_eq!(
-        got, b"hello-world",
-        "pre-WAL data must survive a WAL-only reopen without loss"
-    );
-    assert_eq!(
-        st.tail().bytes,
-        11,
-        "recovered tail must equal the bytes written in Phase 1"
-    );
+    assert_eq!(got, b"hello-world", "pre-WAL data must survive a WAL-only reopen without loss");
+    assert_eq!(st.tail().bytes, 11, "recovered tail must equal the bytes written in Phase 1");
 }
 
 // ===========================================================================
@@ -917,15 +750,9 @@ async fn e2e_multi_segment_acked_records_after_first_seal_survive_crash() {
         append_acked(&h.store, "s", OCTET, &rec).await;
         expected.extend_from_slice(&rec);
         i += 1;
-        assert!(
-            i < 10_000,
-            "never rolled a segment; check SEG/record sizing"
-        );
+        assert!(i < 10_000, "never rolled a segment; check SEG/record sizing");
     }
-    assert!(
-        h.walset.shards()[0].wal_segments() >= 2,
-        "test needs ≥2 retained segments"
-    );
+    assert!(h.walset.shards()[0].wal_segments() >= 2, "test needs ≥2 retained segments");
 
     h.crash();
 
@@ -937,10 +764,7 @@ async fn e2e_multi_segment_acked_records_after_first_seal_survive_crash() {
         "every acked record recovers across ALL retained segments (lost {} bytes)",
         expected.len().saturating_sub(got.len())
     );
-    assert_eq!(
-        got, expected,
-        "recovered bytes byte-identical across segment seams"
-    );
+    assert_eq!(got, expected, "recovered bytes byte-identical across segment seams");
     h2.crash();
 }
 
@@ -1017,11 +841,7 @@ async fn e2e_stage_failure_rolls_back_data_write() {
     // Inject: the next WAL stage write fails -> the append must 500 and the
     // data-file write must be rolled back.
     h.walset.shards()[0].fail_next_write();
-    let resp = handlers::handle(
-        Arc::clone(&h.store),
-        post_req("rb", OCTET, b"LOST-must-not-resurrect|"),
-    )
-    .await;
+    let resp = handlers::handle(Arc::clone(&h.store), post_req("rb", OCTET, b"LOST-must-not-resurrect|")).await;
     assert_eq!(resp.status, 500, "injected stage failure must 500");
 
     // A later append succeeds; the failed bytes must NOT appear before it.
@@ -1029,18 +849,12 @@ async fn e2e_stage_failure_rolls_back_data_write() {
     expected.extend_from_slice(b"second|");
 
     let live = stream_file_bytes(&h.store, "rb");
-    assert_eq!(
-        live, expected,
-        "500'd bytes must not persist in the live file"
-    );
+    assert_eq!(live, expected, "500'd bytes must not persist in the live file");
 
     h.crash();
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
     let got = stream_file_bytes(&h2.store, "rb");
-    assert_eq!(
-        got, expected,
-        "500'd bytes must not resurrect across recovery"
-    );
+    assert_eq!(got, expected, "500'd bytes must not resurrect across recovery");
     h2.crash();
 }
 
@@ -1064,10 +878,7 @@ async fn e2e_corrupt_sidecar_quarantines_instead_of_deleting() {
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
     assert!(h2.store.get("q").is_none(), "stream is skipped this boot");
     assert!(data_path.exists(), "data file must NOT be deleted");
-    assert!(
-        meta_path.with_extension("meta.corrupt").exists(),
-        "sidecar parked as .meta.corrupt for repair"
-    );
+    assert!(meta_path.with_extension("meta.corrupt").exists(), "sidecar parked as .meta.corrupt for repair");
     h2.crash();
 }
 
@@ -1094,10 +905,7 @@ async fn e2e_missing_lane_mount_refuses_boot() {
     let err = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default())
         .err()
         .expect("boot must refuse when a lane mount is missing");
-    assert!(
-        err.to_string().contains("mount"),
-        "error should name the missing mount: {err}"
-    );
+    assert!(err.to_string().contains("mount"), "error should name the missing mount: {err}");
     crate::store::set_stream_lanes(1);
 }
 
@@ -1125,10 +933,7 @@ async fn e2e_stream_lanes_recover_acked_records() {
         for n in &names {
             let rec = format!("{n}-r{round:03}|").into_bytes();
             append_acked(&h.store, n, OCTET, &rec).await;
-            expected
-                .entry(n.clone())
-                .or_default()
-                .extend_from_slice(&rec);
+            expected.entry(n.clone()).or_default().extend_from_slice(&rec);
         }
     }
     // Checkpoint (per-lane syncfs + recycle), then more acked appends on top.
@@ -1136,10 +941,7 @@ async fn e2e_stream_lanes_recover_acked_records() {
     for n in &names {
         let rec = format!("{n}-post|").into_bytes();
         append_acked(&h.store, n, OCTET, &rec).await;
-        expected
-            .entry(n.clone())
-            .or_default()
-            .extend_from_slice(&rec);
+        expected.entry(n.clone()).or_default().extend_from_slice(&rec);
     }
 
     h.crash();
@@ -1153,17 +955,10 @@ async fn e2e_stream_lanes_recover_acked_records() {
                 .unwrap_or(false)
         })
         .count();
-    assert!(
-        lanes_used >= 2,
-        "expected streams spread over lanes, got {lanes_used}"
-    );
+    assert!(lanes_used >= 2, "expected streams spread over lanes, got {lanes_used}");
     for n in &names {
         let got = stream_file_bytes(&h2.store, n);
-        assert_eq!(
-            &got,
-            expected.get(n).unwrap(),
-            "stream {n} recovers byte-identical across lanes"
-        );
+        assert_eq!(&got, expected.get(n).unwrap(), "stream {n} recovers byte-identical across lanes");
     }
     h2.crash();
     // Layout-mismatch guard: reopening this 3-lane dir with a different lane
@@ -1173,10 +968,7 @@ async fn e2e_stream_lanes_recover_acked_records() {
     let err = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default())
         .err()
         .expect("opening a 3-lane layout with --stream-lanes 2 must fail");
-    assert!(
-        err.to_string().contains("stream-lanes"),
-        "mismatch error should name the knob: {err}"
-    );
+    assert!(err.to_string().contains("stream-lanes"), "mismatch error should name the knob: {err}");
     crate::store::set_stream_lanes(1);
 }
 
@@ -1263,17 +1055,12 @@ async fn e2e_wal_quiet_stream_torn_unacked_tail_truncated() {
     let torn: &[u8] = b"TORN-IN-FLIGHT-NEVER-ACKED";
     {
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&st.file_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&st.file_path).unwrap();
         f.write_all(torn).unwrap();
         f.sync_all().unwrap(); // even fully-persisted: still un-acked, must go
     }
     let shard = h.walset.shard_for(st.id).clone();
-    shard
-        .reserve_and_stage(crate::wal::codec::RecordKind::Append, st.id, 0, torn)
-        .unwrap();
+    shard.reserve_and_stage(crate::wal::codec::RecordKind::Append, st.id, 0, torn).unwrap();
     // Power loss tears the staged (never-fdatasync'd) WAL record: zero it out.
     // Everything at/above this record was never covered by an ack.
     {
@@ -1286,9 +1073,8 @@ async fn e2e_wal_quiet_stream_torn_unacked_tail_truncated() {
         // offset by decoding up to the first record for `st.id`.
         let bytes = std::fs::read(&seg).unwrap();
         let mut off = 0usize;
-        while let crate::wal::codec::Decoded::Record {
-            stream_id, total, ..
-        } = crate::wal::codec::decode_at(&bytes, off)
+        while let crate::wal::codec::Decoded::Record { stream_id, total, .. } =
+            crate::wal::codec::decode_at(&bytes, off)
         {
             if stream_id == st.id {
                 break;
@@ -1311,16 +1097,9 @@ async fn e2e_wal_quiet_stream_torn_unacked_tail_truncated() {
     // proof (0, persisted at create) is the seed.
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
     let got = stream_file_bytes(&h2.store, "fresh");
-    assert_eq!(
-        got, b"",
-        "torn un-acked tail truncated on a WAL-quiet stream (sidecar durable_tail proof)"
-    );
+    assert_eq!(got, b"", "torn un-acked tail truncated on a WAL-quiet stream (sidecar durable_tail proof)");
     let st2 = h2.store.get("fresh").unwrap();
-    assert_eq!(
-        st2.tail().bytes,
-        0,
-        "tail reconciled to the durable frontier (0)"
-    );
+    assert_eq!(st2.tail().bytes, 0, "tail reconciled to the durable frontier (0)");
     // The checkpointed stream is untouched.
     assert_eq!(stream_file_bytes(&h2.store, "older"), b"older-rec|");
     h2.crash();
@@ -1348,31 +1127,19 @@ async fn e2e_acked_delete_is_durable_no_resurrection_after_crash() {
 
     let resp = handlers::handle(
         Arc::clone(&h.store),
-        Req {
-            method: Method::Delete,
-            path: "victim".into(),
-            query: None,
-            headers: vec![],
-            body: Bytes::new(),
-        },
+        Req { method: Method::Delete, path: "victim".into(), query: None, headers: vec![], body: Bytes::new() },
     )
     .await;
     assert_eq!(resp.status, 204, "delete acked");
     // The ack IS the durability point: both on-disk artifacts are already gone
     // when the response returns (not on some detached task's schedule).
-    assert!(
-        !file_path.exists(),
-        "data file removed before the DELETE ack"
-    );
+    assert!(!file_path.exists(), "data file removed before the DELETE ack");
     assert!(!meta.exists(), "meta sidecar removed before the DELETE ack");
 
     // Crash + reboot: the stream must not resurrect.
     h.crash();
     let h2 = Harness::boot(dir.path(), None, 1).unwrap();
-    assert!(
-        h2.store.get("victim").is_none(),
-        "acked-deleted stream must not resurrect after a crash"
-    );
+    assert!(h2.store.get("victim").is_none(), "acked-deleted stream must not resurrect after a crash");
     h2.crash();
 }
 
@@ -1398,9 +1165,7 @@ async fn memory_mode_data_survives_restart_via_sidecar() {
 
     // Phase 1: create + append in memory mode (no WAL attached).
     {
-        let store = Arc::new(
-            Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap(),
-        );
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
         // Do NOT attach a WalSet — memory mode has no WAL.
         create_stream(&store, "m/keep", OCTET).await;
         append_acked(&store, "m/keep", OCTET, b"survive-me").await;
@@ -1409,17 +1174,9 @@ async fn memory_mode_data_survives_restart_via_sidecar() {
 
     // Phase 2: reopen — the sidecar pass rebuilds from the per-stream file +
     // `.meta`; no WAL to replay.
-    let store2 =
-        Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+    let store2 = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
     let st = store2.get("m/keep").expect("stream recovered from sidecar");
     let got = std::fs::read(&st.file_path).unwrap();
-    assert_eq!(
-        got, b"survive-me",
-        "memory-mode data survives restart via sidecar pass"
-    );
-    assert_eq!(
-        st.tail().bytes,
-        b"survive-me".len() as u64,
-        "recovered tail == appended bytes"
-    );
+    assert_eq!(got, b"survive-me", "memory-mode data survives restart via sidecar pass");
+    assert_eq!(st.tail().bytes, b"survive-me".len() as u64, "recovered tail == appended bytes");
 }

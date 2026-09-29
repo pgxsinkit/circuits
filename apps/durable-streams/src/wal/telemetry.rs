@@ -184,15 +184,13 @@ impl ShardStats {
     /// Record one append-path `inner` Mutex acquisition that waited `nanos`.
     /// Called twice per append (reserve + mark_written) only when stats armed.
     pub fn record_inner_lock_wait(&self, nanos: u64) {
-        self.inner_lock_wait_nanos
-            .fetch_add(nanos, Ordering::Relaxed);
+        self.inner_lock_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.inner_lock_acquires.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record one `dirty` Mutex acquisition that waited `nanos` (once per append).
     pub fn record_dirty_lock_wait(&self, nanos: u64) {
-        self.dirty_lock_wait_nanos
-            .fetch_add(nanos, Ordering::Relaxed);
+        self.dirty_lock_wait_nanos.fetch_add(nanos, Ordering::Relaxed);
         self.dirty_lock_acquires.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -210,10 +208,7 @@ impl ShardStats {
     /// The bucket index for a batch size (the first boundary it does not exceed,
     /// else the overflow slot).
     fn bucket_index(batch: u64) -> usize {
-        BATCH_BUCKETS
-            .iter()
-            .position(|&b| batch <= b)
-            .unwrap_or(BATCH_BUCKETS.len())
+        BATCH_BUCKETS.iter().position(|&b| batch <= b).unwrap_or(BATCH_BUCKETS.len())
     }
 
     /// Snapshot the current counters into a plain (non-atomic) [`StatsSnapshot`]
@@ -524,42 +519,18 @@ mod stats_emitter {
         let d_staged = cur.staged.saturating_sub(prev.staged);
         let d_fsync = cur.fsync_count.saturating_sub(prev.fsync_count);
         let d_records = cur.records_committed.saturating_sub(prev.records_committed);
-        let d_inner_ns = cur
-            .inner_lock_wait_nanos
-            .saturating_sub(prev.inner_lock_wait_nanos);
-        let d_inner_acq = cur
-            .inner_lock_acquires
-            .saturating_sub(prev.inner_lock_acquires);
-        let d_dirty_ns = cur
-            .dirty_lock_wait_nanos
-            .saturating_sub(prev.dirty_lock_wait_nanos);
-        let d_dirty_acq = cur
-            .dirty_lock_acquires
-            .saturating_sub(prev.dirty_lock_acquires);
+        let d_inner_ns = cur.inner_lock_wait_nanos.saturating_sub(prev.inner_lock_wait_nanos);
+        let d_inner_acq = cur.inner_lock_acquires.saturating_sub(prev.inner_lock_acquires);
+        let d_dirty_ns = cur.dirty_lock_wait_nanos.saturating_sub(prev.dirty_lock_wait_nanos);
+        let d_dirty_acq = cur.dirty_lock_acquires.saturating_sub(prev.dirty_lock_acquires);
         let d_woken = cur.waiters_woken.saturating_sub(prev.waiters_woken);
 
         let staged_per_s = d_staged as f64 / dt;
         let fsync_per_s = d_fsync as f64 / dt;
-        let batch_avg = if d_fsync == 0 {
-            0.0
-        } else {
-            d_records as f64 / d_fsync as f64
-        };
-        let inner_wait_us = if d_inner_acq == 0 {
-            0.0
-        } else {
-            d_inner_ns as f64 / d_inner_acq as f64 / 1000.0
-        };
-        let dirty_wait_us = if d_dirty_acq == 0 {
-            0.0
-        } else {
-            d_dirty_ns as f64 / d_dirty_acq as f64 / 1000.0
-        };
-        let woken_avg = if d_fsync == 0 {
-            0.0
-        } else {
-            d_woken as f64 / d_fsync as f64
-        };
+        let batch_avg = if d_fsync == 0 { 0.0 } else { d_records as f64 / d_fsync as f64 };
+        let inner_wait_us = if d_inner_acq == 0 { 0.0 } else { d_inner_ns as f64 / d_inner_acq as f64 / 1000.0 };
+        let dirty_wait_us = if d_dirty_acq == 0 { 0.0 } else { d_dirty_ns as f64 / d_dirty_acq as f64 / 1000.0 };
+        let woken_avg = if d_fsync == 0 { 0.0 } else { d_woken as f64 / d_fsync as f64 };
         // Lock-wait *load*: fraction of one core-second spent purely WAITING on
         // each lock in this window (Σ wait nanos / window nanos). >1.0 means more
         // than a whole core's worth of time was lost parking on that lock.
@@ -614,11 +585,7 @@ mod tests {
         assert_eq!(snap.max(), 200);
         // The 200-batch is in the overflow (>128) slot; the top quantile reports
         // that slot's true upper bound = the observed max.
-        assert_eq!(
-            snap.quantile(1.0),
-            200,
-            "top quantile reaches the overflow max"
-        );
+        assert_eq!(snap.quantile(1.0), 200, "top quantile reaches the overflow max");
     }
 
     #[test]

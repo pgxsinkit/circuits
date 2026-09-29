@@ -57,12 +57,7 @@ impl FileSegment {
     /// `set_len` (`ftruncate`), which zero-fills the range and is sufficient for
     /// the test/dev path — production io_uring/`fallocate` is Linux-only anyway.
     pub fn create(path: PathBuf, size: u64) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
 
         let fd = file.as_raw_fd();
         #[cfg(target_os = "linux")]
@@ -92,11 +87,7 @@ impl FileSegment {
     /// recovery would mis-read that tail as the end of the durable log — dropping
     /// every later segment's acked records. This constructor only opens the fd.
     pub fn open_existing(path: PathBuf) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = std::fs::OpenOptions::new().read(true).write(true).truncate(false).open(&path)?;
         Ok(FileSegment { file })
     }
 
@@ -186,21 +177,13 @@ impl SegmentWriter for FileSegment {
             // SAFETY: `fd` is valid; `buf.as_ptr()`/`buf.len()` describe a live
             // slice; the kernel writes at the explicit offset (no cursor use).
             let n = unsafe {
-                libc::pwrite(
-                    fd,
-                    buf.as_ptr() as *const libc::c_void,
-                    buf.len(),
-                    (off + written as u64) as libc::off_t,
-                )
+                libc::pwrite(fd, buf.as_ptr() as *const libc::c_void, buf.len(), (off + written as u64) as libc::off_t)
             };
             if n < 0 {
                 return Err(io::Error::last_os_error());
             }
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "pwrite returned 0",
-                ));
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite returned 0"));
             }
             written += n as usize;
         }

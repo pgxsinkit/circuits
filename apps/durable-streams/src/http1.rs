@@ -193,10 +193,7 @@ pub(crate) enum HeadResult {
 }
 
 /// Read and parse the next request head, filling from `reader` as needed.
-pub(crate) async fn read_head<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    buf: &mut BytesMut,
-) -> std::io::Result<HeadResult> {
+pub(crate) async fn read_head<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut BytesMut) -> std::io::Result<HeadResult> {
     loop {
         match try_parse_head(buf) {
             Err(()) => return Ok(HeadResult::Bad),
@@ -276,15 +273,7 @@ pub(crate) async fn decode_chunked<R: AsyncRead + Unpin>(
         }
         // Guard against overflow from a hostile chunk-size line.
         let need = match size.checked_add(2) {
-            Some(v)
-                if out
-                    .len()
-                    .checked_add(size)
-                    .map(|t| t <= MAX_BODY_BYTES)
-                    .unwrap_or(false) =>
-            {
-                v
-            }
+            Some(v) if out.len().checked_add(size).map(|t| t <= MAX_BODY_BYTES).unwrap_or(false) => v,
             _ => return Ok(None),
         };
         while buf.len() < need {
@@ -315,9 +304,7 @@ mod tests {
     impl ChunkedReader {
         fn new(wire: &[u8], step: usize) -> Self {
             let step = step.max(1);
-            ChunkedReader {
-                pending: wire.chunks(step).map(|c| c.to_vec()).collect(),
-            }
+            ChunkedReader { pending: wire.chunks(step).map(|c| c.to_vec()).collect() }
         }
     }
 
@@ -344,10 +331,7 @@ mod tests {
     async fn decode(wire: &[u8], step: usize) -> Option<Vec<u8>> {
         let mut reader = ChunkedReader::new(wire, step);
         let mut buf = BytesMut::new();
-        decode_chunked(&mut reader, &mut buf)
-            .await
-            .unwrap()
-            .map(|b| b.to_vec())
+        decode_chunked(&mut reader, &mut buf).await.unwrap().map(|b| b.to_vec())
     }
 
     // Run a chunked-decode assertion across several fill granularities so a
@@ -367,30 +351,17 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_single() {
-        assert_eq!(
-            decode_all_steps(b"5\r\nhello\r\n0\r\n\r\n")
-                .await
-                .as_deref(),
-            Some(&b"hello"[..])
-        );
+        assert_eq!(decode_all_steps(b"5\r\nhello\r\n0\r\n\r\n").await.as_deref(), Some(&b"hello"[..]));
     }
 
     #[tokio::test]
     async fn chunked_multiple() {
-        assert_eq!(
-            decode_all_steps(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
-                .await
-                .as_deref(),
-            Some(&b"abcde"[..])
-        );
+        assert_eq!(decode_all_steps(b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n").await.as_deref(), Some(&b"abcde"[..]));
     }
 
     #[tokio::test]
     async fn chunked_empty_body() {
-        assert_eq!(
-            decode_all_steps(b"0\r\n\r\n").await.as_deref(),
-            Some(&b""[..])
-        );
+        assert_eq!(decode_all_steps(b"0\r\n\r\n").await.as_deref(), Some(&b""[..]));
     }
 
     #[tokio::test]
@@ -406,20 +377,13 @@ mod tests {
     #[tokio::test]
     async fn chunked_extension_ignored() {
         // chunk-extension after `;` is ignored.
-        assert_eq!(
-            decode_all_steps(b"3;ext=1\r\nabc\r\n0\r\n\r\n")
-                .await
-                .as_deref(),
-            Some(&b"abc"[..])
-        );
+        assert_eq!(decode_all_steps(b"3;ext=1\r\nabc\r\n0\r\n\r\n").await.as_deref(), Some(&b"abc"[..]));
     }
 
     #[tokio::test]
     async fn chunked_trailers_consumed() {
         assert_eq!(
-            decode_all_steps(b"3\r\nabc\r\n0\r\nTrailer: x\r\nMore: y\r\n\r\n")
-                .await
-                .as_deref(),
+            decode_all_steps(b"3\r\nabc\r\n0\r\nTrailer: x\r\nMore: y\r\n\r\n").await.as_deref(),
             Some(&b"abc"[..])
         );
     }
@@ -455,12 +419,7 @@ mod tests {
     async fn read_sized_over_limit_rejected() {
         let mut reader = ChunkedReader::new(b"x", 1);
         let mut buf = BytesMut::new();
-        assert_eq!(
-            read_sized(&mut reader, &mut buf, MAX_BODY_BYTES + 1)
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(read_sized(&mut reader, &mut buf, MAX_BODY_BYTES + 1).await.unwrap(), None);
     }
 
     // ---- request-smuggling / framing-conflict rejection (H6) ----
@@ -477,31 +436,21 @@ mod tests {
 
     #[test]
     fn cl_and_te_together_rejected() {
-        assert!(parse_rejected(
-            b"POST /s HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
-        ));
+        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"));
     }
     #[test]
     fn duplicate_content_length_rejected() {
-        assert!(parse_rejected(
-            b"POST /s HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n"
-        ));
+        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nContent-Length: 0\r\nContent-Length: 5\r\n\r\n"));
     }
     #[test]
     fn non_numeric_content_length_rejected() {
-        assert!(parse_rejected(
-            b"POST /s HTTP/1.1\r\nContent-Length: 5x\r\n\r\n"
-        ));
+        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nContent-Length: 5x\r\n\r\n"));
     }
     #[test]
     fn non_chunked_transfer_encoding_rejected() {
-        assert!(parse_rejected(
-            b"POST /s HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"
-        ));
+        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n"));
         // substring `chunked` must not satisfy the framing check
-        assert!(parse_rejected(
-            b"POST /s HTTP/1.1\r\nTransfer-Encoding: x-chunked\r\n\r\n"
-        ));
+        assert!(parse_rejected(b"POST /s HTTP/1.1\r\nTransfer-Encoding: x-chunked\r\n\r\n"));
     }
     #[test]
     fn plain_chunked_and_single_cl_accepted() {

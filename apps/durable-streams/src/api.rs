@@ -104,16 +104,11 @@ pub struct Req {
 
 impl Req {
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
     }
 
     pub fn header_is_true(&self, name: &str) -> bool {
-        self.header(name)
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        self.header(name).map(|v| v.eq_ignore_ascii_case("true")).unwrap_or(false)
     }
 }
 
@@ -150,16 +145,9 @@ impl Body {
             Body::Full(b) => Some(b.len() as u64),
             Body::Channel(_) => None,
             Body::Sse(_) => None,
-            Body::FileRange {
-                segments,
-                prefix,
-                suffix,
-                ..
-            } => Some(
-                prefix.len() as u64
-                    + segments.iter().map(|s| s.len).sum::<u64>()
-                    + suffix.len() as u64,
-            ),
+            Body::FileRange { segments, prefix, suffix, .. } => {
+                Some(prefix.len() as u64 + segments.iter().map(|s| s.len).sum::<u64>() + suffix.len() as u64)
+            }
         }
     }
 }
@@ -173,26 +161,17 @@ pub struct Resp {
 
 impl Resp {
     pub fn new(status: u16) -> Resp {
-        Resp {
-            status,
-            headers: Vec::with_capacity(8),
-            body: Body::Empty,
-        }
+        Resp { status, headers: Vec::with_capacity(8), body: Body::Empty }
     }
 }
 
-pub const BASE64_STD: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+pub const BASE64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// RFC 4648 base64. `pad` adds trailing `=` (standard, used for SSE binary frames).
 pub fn base64_encode(data: &[u8], charset: &[u8; 64], pad: bool) -> String {
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(charset[(n >> 18) as usize & 63] as char);
         out.push(charset[(n >> 12) as usize & 63] as char);
@@ -212,10 +191,8 @@ pub fn base64_encode(data: &[u8], charset: &[u8; 64], pad: bool) -> String {
 
 /// Constant security headers added to every response by the HTTP engines.
 /// Kept as static name/value pairs so engines emit them with no allocation.
-pub const SECURITY_HEADERS: &[(&str, &str)] = &[
-    ("x-content-type-options", "nosniff"),
-    ("cross-origin-resource-policy", "cross-origin"),
-];
+pub const SECURITY_HEADERS: &[(&str, &str)] =
+    &[("x-content-type-options", "nosniff"), ("cross-origin-resource-policy", "cross-origin")];
 
 pub fn status_reason(status: u16) -> &'static str {
     match status {

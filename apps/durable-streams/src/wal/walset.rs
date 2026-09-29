@@ -66,17 +66,8 @@ impl WalSet {
     ///
     /// `default_n` is the caller's `available_parallelism()` — used **only** on a
     /// fresh data dir, **never** to route once `N` is persisted.
-    pub fn open(
-        data_dir: &Path,
-        requested_n: Option<usize>,
-        default_n: usize,
-    ) -> io::Result<Arc<WalSet>> {
-        WalSet::open_with_segment_size(
-            data_dir,
-            requested_n,
-            default_n,
-            super::segment::SEGMENT_BYTES,
-        )
+    pub fn open(data_dir: &Path, requested_n: Option<usize>, default_n: usize) -> io::Result<Arc<WalSet>> {
+        WalSet::open_with_segment_size(data_dir, requested_n, default_n, super::segment::SEGMENT_BYTES)
     }
 
     /// Like [`WalSet::open`] but with an explicit per-shard `segment_size` (the
@@ -132,16 +123,9 @@ impl WalSet {
 
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
-            shards.push(Shard::open_with_segment_size(
-                wal_dir.join(i.to_string()),
-                segment_size,
-            )?);
+            shards.push(Shard::open_with_segment_size(wal_dir.join(i.to_string()), segment_size)?);
         }
-        Ok(Arc::new(WalSet {
-            shards,
-            n,
-            committers: Mutex::new(Vec::new()),
-        }))
+        Ok(Arc::new(WalSet { shards, n, committers: Mutex::new(Vec::new()) }))
     }
 
     /// The shard a `stream_id` routes to — computed **only** from the persisted
@@ -205,10 +189,7 @@ fn read_persisted_n(path: &Path) -> io::Result<Option<usize>> {
     match std::fs::read_to_string(path) {
         Ok(s) => {
             let n = s.trim().parse::<usize>().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("corrupt {SHARDS_FILE} file ({path:?}): {e}"),
-                )
+                io::Error::new(io::ErrorKind::InvalidData, format!("corrupt {SHARDS_FILE} file ({path:?}): {e}"))
             })?;
             if n == 0 {
                 return Err(io::Error::new(
@@ -233,24 +214,13 @@ mod tests {
         let d = temp_dir("wset");
         let w = WalSet::open(d.path(), Some(4), 16).unwrap(); // requested 4 → persisted 4 (default_n ignored)
         let s_id = 12345u64;
-        let idx = w
-            .shards
-            .iter()
-            .position(|s| std::ptr::eq(&**s, &**w.shard_for(s_id)))
-            .unwrap();
+        let idx = w.shards.iter().position(|s| std::ptr::eq(&**s, &**w.shard_for(s_id))).unwrap();
         drop(w);
         // None + a DIFFERENT default_n (8) → still uses the persisted N (4), NOT default_n:
         let w2 = WalSet::open(d.path(), None, 8).unwrap();
         assert_eq!(w2.n, 4);
-        let idx2 = w2
-            .shards
-            .iter()
-            .position(|s| std::ptr::eq(&**s, &**w2.shard_for(s_id)))
-            .unwrap();
+        let idx2 = w2.shards.iter().position(|s| std::ptr::eq(&**s, &**w2.shard_for(s_id))).unwrap();
         assert_eq!(idx, idx2, "stream resolves to the same shard across reopen");
-        assert!(
-            WalSet::open(d.path(), Some(8), 8).is_err(),
-            "mismatched --wal-shards rejected"
-        );
+        assert!(WalSet::open(d.path(), Some(8), 8).is_err(), "mismatched --wal-shards rejected");
     }
 }

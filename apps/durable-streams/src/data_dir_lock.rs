@@ -14,22 +14,12 @@ impl DataDirLock {
     pub fn acquire(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         let path = data_dir.join(".durable-streams.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)?;
 
         #[cfg(unix)]
         {
             // SAFETY: `file` remains open in this value until process shutdown.
-            let rc = unsafe {
-                libc::flock(
-                    std::os::fd::AsRawFd::as_raw_fd(&file),
-                    libc::LOCK_EX | libc::LOCK_NB,
-                )
-            };
+            let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
             if rc != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -40,10 +30,7 @@ impl DataDirLock {
 
         #[cfg(not(unix))]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "exclusive data-directory locking requires Unix",
-            ));
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "exclusive data-directory locking requires Unix"));
         }
 
         Ok(Self { _file: file })

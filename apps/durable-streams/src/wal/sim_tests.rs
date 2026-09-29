@@ -76,9 +76,7 @@ impl Rng {
     }
     fn alnum(&mut self, len: usize) -> String {
         const CS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-        (0..len)
-            .map(|_| CS[self.below(CS.len() as u64) as usize] as char)
-            .collect()
+        (0..len).map(|_| CS[self.below(CS.len() as u64) as usize] as char).collect()
     }
 }
 
@@ -143,13 +141,7 @@ fn put_req(path: &str, content_type: &str, extra: &[(&str, &str)]) -> Req {
     for (k, v) in extra {
         headers.push((k.to_string(), v.to_string()));
     }
-    Req {
-        method: Method::Put,
-        path: path.to_string(),
-        query: None,
-        headers,
-        body: Bytes::new(),
-    }
+    Req { method: Method::Put, path: path.to_string(), query: None, headers, body: Bytes::new() }
 }
 
 fn post_req(path: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)]) -> Req {
@@ -157,23 +149,11 @@ fn post_req(path: &str, content_type: &str, body: &[u8], extra: &[(&str, &str)])
     for (k, v) in extra {
         headers.push((k.to_string(), v.to_string()));
     }
-    Req {
-        method: Method::Post,
-        path: path.to_string(),
-        query: None,
-        headers,
-        body: Bytes::copy_from_slice(body),
-    }
+    Req { method: Method::Post, path: path.to_string(), query: None, headers, body: Bytes::copy_from_slice(body) }
 }
 
 fn delete_req(path: &str) -> Req {
-    Req {
-        method: Method::Delete,
-        path: path.to_string(),
-        query: None,
-        headers: vec![],
-        body: Bytes::new(),
-    }
+    Req { method: Method::Delete, path: path.to_string(), query: None, headers: vec![], body: Bytes::new() }
 }
 
 fn fork_offset(bytes: u64) -> String {
@@ -239,8 +219,7 @@ impl Sim {
         let filler = self.rng.alnum(fill_len);
         let name = self.models[mi].name.clone();
         if self.models[mi].json {
-            let payload =
-                format!("{{\"s\":\"{name}\",\"i\":\"{seq:08}\",\"p\":\"{filler}\"}}").into_bytes();
+            let payload = format!("{{\"s\":\"{name}\",\"i\":\"{seq:08}\",\"p\":\"{filler}\"}}").into_bytes();
             let mut wire = payload.clone();
             wire.push(b',');
             (payload, wire)
@@ -259,13 +238,7 @@ impl Sim {
     }
 
     fn pick(&mut self, pred: impl Fn(&SModel) -> bool) -> Option<usize> {
-        let idxs: Vec<usize> = self
-            .models
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| pred(m))
-            .map(|(i, _)| i)
-            .collect();
+        let idxs: Vec<usize> = self.models.iter().enumerate().filter(|(_, m)| pred(m)).map(|(i, _)| i).collect();
         if idxs.is_empty() {
             None
         } else {
@@ -280,18 +253,11 @@ fn boot(
     shards: Option<usize>,
     shards_n: usize,
 ) -> (Arc<Store>, Arc<WalSet>, Vec<CommitterHandle>) {
-    let walset = WalSet::open_with_segment_size(dir, shards, shards_n, SEG_BYTES)
-        .expect("WalSet::open must succeed");
-    let store = Arc::new(
-        Store::new_with_tier(dir.to_path_buf(), TierConfig::default()).expect("Store::new"),
-    );
-    crate::wal::recovery::recover(&store, &walset)
-        .expect("recovery must not error on in-model faults");
+    let walset = WalSet::open_with_segment_size(dir, shards, shards_n, SEG_BYTES).expect("WalSet::open must succeed");
+    let store = Arc::new(Store::new_with_tier(dir.to_path_buf(), TierConfig::default()).expect("Store::new"));
+    crate::wal::recovery::recover(&store, &walset).expect("recovery must not error on in-model faults");
     walset.reset_after_recovery().expect("reset_after_recovery");
-    store
-        .wal
-        .set(Arc::clone(&walset))
-        .unwrap_or_else(|_| panic!("WAL already attached"));
+    store.wal.set(Arc::clone(&walset)).unwrap_or_else(|_| panic!("WAL already attached"));
     let mut committers = Vec::new();
     for shard in walset.shards() {
         committers.push(shard.spawn_committer());
@@ -306,13 +272,7 @@ fn boot(
 fn escape_snippet(b: &[u8]) -> String {
     b.iter()
         .take(120)
-        .map(|&c| {
-            if (0x20..0x7f).contains(&c) {
-                (c as char).to_string()
-            } else {
-                format!("\\x{c:02x}")
-            }
-        })
+        .map(|&c| if (0x20..0x7f).contains(&c) { (c as char).to_string() } else { format!("\\x{c:02x}") })
         .collect()
 }
 
@@ -381,23 +341,16 @@ fn verify_recovery(sim: &mut Sim, store: &Arc<Store>) {
             if let Some(st) = store.get(&name) {
                 let soft = st.shared.read().unwrap().soft_deleted;
                 if !soft {
-                    sim.fail(format!(
-                        "stream {name}: DELETED stream resurrected after recovery"
-                    ));
+                    sim.fail(format!("stream {name}: DELETED stream resurrected after recovery"));
                 }
             }
             continue;
         }
         let Some(st) = store.get(&name) else {
-            sim.fail(format!(
-                "stream {name}: acked-created stream MISSING after recovery"
-            ));
+            sim.fail(format!("stream {name}: acked-created stream MISSING after recovery"));
         };
-        let bytes = std::fs::read(&st.file_path).unwrap_or_else(|e| {
-            sim.fail(format!(
-                "stream {name}: cannot read data file after recovery: {e}"
-            ))
-        });
+        let bytes = std::fs::read(&st.file_path)
+            .unwrap_or_else(|e| sim.fail(format!("stream {name}: cannot read data file after recovery: {e}")));
 
         // File/base/tail consistency.
         let (file_base, durable_tail, tail) = {
@@ -411,29 +364,19 @@ fn verify_recovery(sim: &mut Sim, store: &Arc<Store>) {
             ));
         }
         if tail != file_base + bytes.len() as u64 {
-            sim.fail(format!(
-                "stream {name}: Shared.tail {tail} != file_base {file_base} + file_len {}",
-                bytes.len()
-            ));
+            sim.fail(format!("stream {name}: Shared.tail {tail} != file_base {file_base} + file_len {}", bytes.len()));
         }
         if durable_tail != tail {
-            sim.fail(format!(
-                "stream {name}: durable_tail {durable_tail} != tail {tail} after recovery"
-            ));
+            sim.fail(format!("stream {name}: durable_tail {durable_tail} != tail {tail} after recovery"));
         }
         let watch_tail = st.tail();
         if watch_tail.bytes != tail {
-            sim.fail(format!(
-                "stream {name}: watch tail {} != Shared.tail {tail} after recovery",
-                watch_tail.bytes
-            ));
+            sim.fail(format!("stream {name}: watch tail {} != Shared.tail {tail} after recovery", watch_tail.bytes));
         }
 
         // Closed-ness durability.
         if sim.models[mi].closed && !watch_tail.closed {
-            sim.fail(format!(
-                "stream {name}: close was ACKED but stream recovered open"
-            ));
+            sim.fail(format!("stream {name}: close was ACKED but stream recovered open"));
         }
 
         // Content: acked ⊆ recovered ⊆ issued, in order, whole records only.
@@ -444,11 +387,8 @@ fn verify_recovery(sim: &mut Sim, store: &Arc<Store>) {
 
         // JSON read-surface validity.
         if sim.models[mi].json && !bytes.is_empty() {
-            let text = String::from_utf8(bytes.clone()).unwrap_or_else(|_| {
-                sim.fail(format!(
-                    "stream {name}: JSON stream contains non-UTF8 bytes"
-                ))
-            });
+            let text = String::from_utf8(bytes.clone())
+                .unwrap_or_else(|_| sim.fail(format!("stream {name}: JSON stream contains non-UTF8 bytes")));
             let wrapped = format!("[{}]", text.trim_end_matches(','));
             if let Err(e) = serde_json::from_str::<serde_json::Value>(&wrapped) {
                 sim.fail(format!(
@@ -492,9 +432,7 @@ fn inject_data_file_faults(sim: &mut Sim) {
             continue;
         };
         let len = meta.len();
-        let floor_pos = sim.models[mi]
-            .floor
-            .saturating_sub(sim.models[mi].file_base);
+        let floor_pos = sim.models[mi].floor.saturating_sub(sim.models[mi].file_base);
         let kind = sim.rng.below(3);
         let name = sim.models[mi].name.clone();
         match kind {
@@ -506,9 +444,7 @@ fn inject_data_file_faults(sim: &mut Sim) {
                 let to = floor_pos + sim.rng.below(len - floor_pos + 1);
                 let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
                 f.set_len(to).unwrap();
-                sim.note(format!(
-                    "FAULT data-trunc {name}: {len} -> {to} (floor_pos {floor_pos})"
-                ));
+                sim.note(format!("FAULT data-trunc {name}: {len} -> {to} (floor_pos {floor_pos})"));
             }
             1 => {
                 // Scribble garbage over a random subrange of [floor_pos, len).
@@ -599,27 +535,19 @@ fn inject_wal_faults(sim: &mut Sim, durable: &[u64]) {
             continue;
         }
         use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(seg_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().write(true).open(seg_path).unwrap();
         if sim.rng.chance(50) {
             // Zero from p to the end of the file's logical region (lost pages).
             let zeros = vec![0u8; logical_end - p as usize];
             f.seek(SeekFrom::Start(p)).unwrap();
             f.write_all(&zeros).unwrap();
-            sim.note(format!(
-                "FAULT wal-zero shard {i}: [{p}, {logical_end}) durable_lsn {d}"
-            ));
+            sim.note(format!("FAULT wal-zero shard {i}: [{p}, {logical_end}) durable_lsn {d}"));
         } else {
             let glen = 1 + sim.rng.below(64) as usize;
             let garbage: Vec<u8> = (0..glen).map(|_| sim.rng.next_u64() as u8 | 1).collect();
             f.seek(SeekFrom::Start(p)).unwrap();
             f.write_all(&garbage).unwrap();
-            sim.note(format!(
-                "FAULT wal-scribble shard {i}: [{p}, {}) durable_lsn {d}",
-                p + glen as u64
-            ));
+            sim.note(format!("FAULT wal-scribble shard {i}: [{p}, {}) durable_lsn {d}", p + glen as u64));
         }
         f.sync_all().unwrap();
     }
@@ -642,11 +570,7 @@ async fn ack_append(sim: &mut Sim, store: &Arc<Store>, mi: usize) {
             payload.len()
         ));
     }
-    sim.note(format!(
-        "append {name} seq={} {}B acked",
-        sim.models[mi].next_seq - 1,
-        wire.len()
-    ));
+    sim.note(format!("append {name} seq={} {}B acked", sim.models[mi].next_seq - 1, wire.len()));
     sim.push_rec(mi, wire, RecStatus::Acked);
 }
 
@@ -663,10 +587,7 @@ async fn cancelled_append(sim: &mut Sim, store: &Arc<Store>, mi: usize) {
     jh.abort();
     match jh.await {
         Ok(resp) if (200..300).contains(&resp.status) => {
-            sim.note(format!(
-                "append {name} cancelled-but-acked ({}B)",
-                wire.len()
-            ));
+            sim.note(format!("append {name} cancelled-but-acked ({}B)", wire.len()));
             sim.push_rec(mi, wire, RecStatus::Acked);
         }
         Ok(resp) => {
@@ -674,10 +595,7 @@ async fn cancelled_append(sim: &mut Sim, store: &Arc<Store>, mi: usize) {
             sim.push_rec(mi, wire, RecStatus::Maybe);
         }
         Err(_) => {
-            sim.note(format!(
-                "append {name} cancelled mid-flight ({}B) -> maybe",
-                wire.len()
-            ));
+            sim.note(format!("append {name} cancelled mid-flight ({}B) -> maybe", wire.len()));
             sim.push_rec(mi, wire, RecStatus::Maybe);
         }
     }
@@ -697,9 +615,8 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                 if !(200..300).contains(&resp.status) {
                     sim.fail(format!("create {name} rejected: {}", resp.status));
                 }
-                let st = store.get(&name).unwrap_or_else(|| {
-                    sim.fail(format!("create {name} acked but store.get is None"))
-                });
+                let st =
+                    store.get(&name).unwrap_or_else(|| sim.fail(format!("create {name} acked but store.get is None")));
                 sim.note(format!("create {name} json={json}"));
                 sim.models.push(SModel {
                     name,
@@ -727,11 +644,9 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                 if let Some(mi) = sim.pick(|m| !m.deleted && !m.closed) {
                     let name = sim.models[mi].name.clone();
                     let ct = if sim.models[mi].json { JSON_CT } else { OCTET };
-                    let resp = handlers::handle(
-                        Arc::clone(store),
-                        post_req(&name, ct, b"", &[("stream-closed", "true")]),
-                    )
-                    .await;
+                    let resp =
+                        handlers::handle(Arc::clone(store), post_req(&name, ct, b"", &[("stream-closed", "true")]))
+                            .await;
                     if !(200..300).contains(&resp.status) {
                         sim.fail(format!("close {name} rejected: {}", resp.status));
                     }
@@ -754,22 +669,16 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                         put_req(
                             &name,
                             ct,
-                            &[
-                                ("stream-forked-from", parent.as_str()),
-                                ("stream-fork-offset", &fork_offset(at)),
-                            ],
+                            &[("stream-forked-from", parent.as_str()), ("stream-fork-offset", &fork_offset(at))],
                         ),
                     )
                     .await;
                     if !(200..300).contains(&resp.status) {
-                        sim.fail(format!(
-                            "fork {name} from {parent}@{at} rejected: {}",
-                            resp.status
-                        ));
+                        sim.fail(format!("fork {name} from {parent}@{at} rejected: {}", resp.status));
                     }
-                    let st = store.get(&name).unwrap_or_else(|| {
-                        sim.fail(format!("fork {name} acked but store.get is None"))
-                    });
+                    let st = store
+                        .get(&name)
+                        .unwrap_or_else(|| sim.fail(format!("fork {name} acked but store.get is None")));
                     let fb = st.shared.read().unwrap().file_base;
                     if fb != at {
                         sim.fail(format!("fork {name}: file_base {fb} != fork offset {at}"));
@@ -808,10 +717,7 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
             _ if op < 30 => {
                 let si = sim.rng.below(sim.shards_n as u64) as usize;
                 let shard = Arc::clone(&walset.shards()[si]);
-                shard
-                    .checkpoint()
-                    .await
-                    .unwrap_or_else(|e| sim.fail(format!("checkpoint shard {si} failed: {e}")));
+                shard.checkpoint().await.unwrap_or_else(|e| sim.fail(format!("checkpoint shard {si} failed: {e}")));
                 let tails = shard.read_durable_tails();
                 for m in &mut sim.models {
                     if let Some(&t) = tails.get(&m.id) {
@@ -831,9 +737,7 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                 if let Some(mi) = sim.pick(|m| !m.deleted) {
                     let name = sim.models[mi].name.clone();
                     if let Some(st) = store.get(&name) {
-                        let len = std::fs::metadata(&st.file_path)
-                            .map(|m| m.len())
-                            .unwrap_or(0);
+                        let len = std::fs::metadata(&st.file_path).map(|m| m.len()).unwrap_or(0);
                         let tail = st.tail().bytes;
                         let fb = sim.models[mi].file_base;
                         if tail > fb + len {
@@ -864,10 +768,7 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
             let (payload, wire) = sim.make_record(mi);
             let ct = if sim.models[mi].json { JSON_CT } else { OCTET };
             let name = sim.models[mi].name.clone();
-            sim.note(format!(
-                "in-flight append {name} ({}B) at crash",
-                wire.len()
-            ));
+            sim.note(format!("in-flight append {name} ({}B) at crash", wire.len()));
             sim.push_rec(mi, wire, RecStatus::Maybe);
             let req = post_req(&name, ct, &payload, &[]);
             let store2 = Arc::clone(store);
@@ -897,26 +798,16 @@ fn stage_torn_appends(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>) {
         let (_, wire) = sim.make_record(mi);
         let name = sim.models[mi].name.clone();
         let Some(st) = store.get(&name) else { continue };
-        let cur_len = std::fs::metadata(&st.file_path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let cur_len = std::fs::metadata(&st.file_path).map(|m| m.len()).unwrap_or(0);
         let offset = sim.models[mi].file_base + cur_len;
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&st.file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&st.file_path).unwrap();
             f.write_all(&wire).unwrap();
         }
         let shard = walset.shard_for(st.id);
-        shard
-            .reserve_and_stage(RecordKind::Append, st.id, offset, &wire)
-            .unwrap();
-        sim.note(format!(
-            "staged-at-crash append {name} @{offset} ({}B, never fdatasync'd)",
-            wire.len()
-        ));
+        shard.reserve_and_stage(RecordKind::Append, st.id, offset, &wire).unwrap();
+        sim.note(format!("staged-at-crash append {name} @{offset} ({}B, never fdatasync'd)", wire.len()));
         sim.push_rec(mi, wire, RecStatus::Maybe);
     }
 }
@@ -926,10 +817,7 @@ fn stage_torn_appends(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>) {
 // ---------------------------------------------------------------------------
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
 fn run_one_seed(seed: u64, gens: u64, steps: u64) {
@@ -959,22 +847,14 @@ fn run_one_seed(seed: u64, gens: u64, steps: u64) {
         // Forensics: snapshot the pre-boot (post-crash, post-fault) disk state
         // so a violation can be inspected before recovery/reset mutate it.
         if std::env::var("DS_SIM_SNAPSHOT").is_ok() && g > 0 {
-            let snap = dir.path().with_file_name(format!(
-                "{}-preboot-gen{g}",
-                dir.path().file_name().unwrap().to_str().unwrap()
-            ));
+            let snap = dir
+                .path()
+                .with_file_name(format!("{}-preboot-gen{g}", dir.path().file_name().unwrap().to_str().unwrap()));
             let _ = std::fs::remove_dir_all(&snap);
-            let _ = std::process::Command::new("cp")
-                .arg("-R")
-                .arg(dir.path())
-                .arg(&snap)
-                .status();
+            let _ = std::process::Command::new("cp").arg("-R").arg(dir.path()).arg(&snap).status();
             eprintln!("[sim] snapshot: {}", snap.display());
         }
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let last = g == gens;
         let (store, walset, committers) = rt.block_on(async {
             let (store, walset, committers) = if g == 0 {
@@ -1011,11 +891,7 @@ fn run_one_seed(seed: u64, gens: u64, steps: u64) {
         }
         // Durable frontier per shard, BEFORE staging the torn tail below —
         // everything at/below this is fdatasync'd and must survive faults.
-        let durable: Vec<u64> = walset
-            .shards()
-            .iter()
-            .map(|s| s.durable_lsn_now())
-            .collect();
+        let durable: Vec<u64> = walset.shards().iter().map(|s| s.durable_lsn_now()).collect();
         // Stage page-cache-only appends (data file + WAL staging, no fsync).
         if sim.rng.chance(60) {
             stage_torn_appends(&mut sim, &store, &walset);
@@ -1043,11 +919,7 @@ fn wal_forensic_dump() {
     for entry in std::fs::read_dir(dir.join("streams")).unwrap().flatten() {
         let p = entry.path();
         if p.extension().is_none() {
-            eprintln!(
-                "stream file {:?}: {} bytes",
-                p.file_name().unwrap(),
-                p.metadata().unwrap().len()
-            );
+            eprintln!("stream file {:?}: {} bytes", p.file_name().unwrap(), p.metadata().unwrap().len());
         }
     }
     let wal_root = dir.join("wal");
@@ -1068,27 +940,14 @@ fn wal_forensic_dump() {
         segs.sort();
         let ckpt = std::fs::read_to_string(sp.join("checkpoint")).unwrap_or_default();
         let tails = std::fs::read_to_string(sp.join("tails")).unwrap_or_default();
-        eprintln!(
-            "== shard {:?} checkpoint={} tails={}",
-            sp.file_name().unwrap(),
-            ckpt.trim(),
-            tails.trim()
-        );
+        eprintln!("== shard {:?} checkpoint={} tails={}", sp.file_name().unwrap(), ckpt.trim(), tails.trim());
         for (start, seg) in segs {
             let bytes = std::fs::read(&seg).unwrap();
             eprintln!("-- segment {start}.wal ({} bytes)", bytes.len());
             let mut off = 0usize;
             loop {
                 match decode_at(&bytes, off) {
-                    Decoded::Record {
-                        lsn,
-                        kind,
-                        stream_id,
-                        stream_offset,
-                        len,
-                        total,
-                        ..
-                    } => {
+                    Decoded::Record { lsn, kind, stream_id, stream_offset, len, total, .. } => {
                         eprintln!(
                             "   off={off:<8} lsn={lsn:<6} kind={kind:?} stream={stream_id} s_off={stream_offset} len={len}"
                         );
@@ -1120,10 +979,7 @@ fn wal_forensic_replay() {
         shard
             .replay_from_checkpoint(0, |kind, sid, soff, payload| {
                 n += 1;
-                eprintln!(
-                    "shard {i}: {kind:?} stream={sid} s_off={soff} len={}",
-                    payload.len()
-                );
+                eprintln!("shard {i}: {kind:?} stream={sid} s_off={soff} len={}", payload.len());
             })
             .unwrap();
         eprintln!("shard {i}: {n} records replayed");

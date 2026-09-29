@@ -108,15 +108,7 @@ pub enum Decoded {
 /// torn/garbled flags byte or payload-CRC field fails the header CRC. Used by
 /// both [`encode_header_into`] and [`decode_at`] so they cannot diverge.
 #[inline]
-fn header_crc(
-    lsn: u64,
-    kind: u8,
-    stream_id: u64,
-    stream_offset: u64,
-    len: u32,
-    flags: u8,
-    payload_crc: u32,
-) -> u32 {
+fn header_crc(lsn: u64, kind: u8, stream_id: u64, stream_offset: u64, len: u32, flags: u8, payload_crc: u32) -> u32 {
     let mut f = [0u8; 8 + 1 + 8 + 8 + 4 + 1 + 4];
     f[0..8].copy_from_slice(&lsn.to_le_bytes());
     f[8] = kind;
@@ -151,15 +143,7 @@ pub(crate) fn encode_header_into(
     payload_crc: u32,
 ) {
     let kind_byte = kind as u8;
-    let crc = header_crc(
-        lsn,
-        kind_byte,
-        stream_id,
-        stream_offset,
-        len,
-        flags,
-        payload_crc,
-    );
+    let crc = header_crc(lsn, kind_byte, stream_id, stream_offset, len, flags, payload_crc);
     buf.reserve(HEADER_LEN);
     buf.extend_from_slice(&len.to_le_bytes()); // [0..4)
     buf.extend_from_slice(&crc.to_le_bytes()); // [4..8)
@@ -214,16 +198,7 @@ pub fn decode_at(seg: &[u8], off: usize) -> Decoded {
 
     // Validate the header CRC. A torn/partially-written header fails here. The
     // CRC covers flags + payload_crc too, so a garbled flag/CRC field is caught.
-    if header_crc(
-        lsn,
-        kind_byte,
-        stream_id,
-        stream_offset,
-        len,
-        flags,
-        payload_crc,
-    ) != crc
-    {
+    if header_crc(lsn, kind_byte, stream_id, stream_offset, len, flags, payload_crc) != crc {
         return Decoded::Torn;
     }
 
@@ -245,21 +220,11 @@ pub fn decode_at(seg: &[u8], off: usize) -> Decoded {
     // header (the fallocate'd-tail case) fails here and is rejected as Torn.
     // Every writer sets PAYLOAD_CHECKSUMMED; a clear flag marks the record
     // torn/corrupt (no writer has ever legitimately omitted the checksum here).
-    if flags & PAYLOAD_CHECKSUMMED == 0
-        || crc32c::crc32c(&seg[payload_off..payload_off + len]) != payload_crc
-    {
+    if flags & PAYLOAD_CHECKSUMMED == 0 || crc32c::crc32c(&seg[payload_off..payload_off + len]) != payload_crc {
         return Decoded::Torn;
     }
 
-    Decoded::Record {
-        lsn,
-        kind,
-        stream_id,
-        stream_offset,
-        payload_off,
-        len,
-        total,
-    }
+    Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total }
 }
 
 #[cfg(test)]
@@ -284,16 +249,7 @@ mod tests {
         let payload_crc = crc32c::crc32c(&full_payload);
 
         let mut seg = Vec::new();
-        encode_header_into(
-            &mut seg,
-            1,
-            RecordKind::Append,
-            42,
-            0,
-            len as u32,
-            PAYLOAD_CHECKSUMMED,
-            payload_crc,
-        );
+        encode_header_into(&mut seg, 1, RecordKind::Append, 42, 0, len as u32, PAYLOAD_CHECKSUMMED, payload_crc);
         seg.extend(std::iter::repeat(0xAB).take(prefix)); // written payload prefix
         seg.extend(std::iter::repeat(0u8).take(len - prefix)); // torn (fallocate zeros)
         seg.extend(std::iter::repeat(0u8).take(1 << 20)); // rest of fallocate'd segment
@@ -320,9 +276,7 @@ mod tests {
         encode_into(&mut b, &r); // sets PAYLOAD_CHECKSUMMED + correct payload_crc
         b.extend(std::iter::repeat(0u8).take(64)); // fallocate'd tail
         match decode_at(&b, 0) {
-            Decoded::Record {
-                payload_off, len, ..
-            } => {
+            Decoded::Record { payload_off, len, .. } => {
                 assert_eq!(&b[payload_off..payload_off + len], b"checksummed-payload");
             }
             other => panic!("expected Record, got {other:?}"),
@@ -332,24 +286,10 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip_and_torn() {
         let mut b = Vec::new();
-        let r = Record {
-            lsn: 7,
-            kind: RecordKind::Append,
-            stream_id: 3,
-            stream_offset: 100,
-            payload: b"hello",
-        };
+        let r = Record { lsn: 7, kind: RecordKind::Append, stream_id: 3, stream_offset: 100, payload: b"hello" };
         encode_into(&mut b, &r);
         match decode_at(&b, 0) {
-            Decoded::Record {
-                lsn,
-                kind,
-                stream_id,
-                stream_offset,
-                payload_off,
-                len,
-                total,
-            } => {
+            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (7, 3, 100, 5));
                 assert!(matches!(kind, RecordKind::Append));
                 assert_eq!(&b[payload_off..payload_off + len], b"hello");
@@ -361,14 +301,8 @@ mod tests {
         let torn = &b[..b.len() - 1];
         assert!(matches!(decode_at(torn, 0), Decoded::Torn));
         // torn header (partial) and all-zero (fallocate) → not a Record
-        assert!(matches!(
-            decode_at(&b[..HEADER_LEN - 1], 0),
-            Decoded::Incomplete | Decoded::Torn
-        ));
-        assert!(matches!(
-            decode_at(&[0u8; HEADER_LEN + 5], 0),
-            Decoded::Incomplete | Decoded::Torn
-        ));
+        assert!(matches!(decode_at(&b[..HEADER_LEN - 1], 0), Decoded::Incomplete | Decoded::Torn));
+        assert!(matches!(decode_at(&[0u8; HEADER_LEN + 5], 0), Decoded::Incomplete | Decoded::Torn));
     }
 
     #[test]
@@ -376,13 +310,7 @@ mod tests {
         // Encode two records into one buffer; decode_at must read the first at
         // off=0 and the second at off=t1 (exercises off>0 decode, the Task-1 gap).
         let mut b = Vec::new();
-        let r1 = Record {
-            lsn: 1,
-            kind: RecordKind::Append,
-            stream_id: 10,
-            stream_offset: 0,
-            payload: b"first",
-        };
+        let r1 = Record { lsn: 1, kind: RecordKind::Append, stream_id: 10, stream_offset: 0, payload: b"first" };
         let r2 = Record {
             lsn: 2,
             kind: RecordKind::StreamCreate,
@@ -394,15 +322,7 @@ mod tests {
         encode_into(&mut b, &r2);
 
         let t1 = match decode_at(&b, 0) {
-            Decoded::Record {
-                lsn,
-                kind,
-                stream_id,
-                stream_offset,
-                payload_off,
-                len,
-                total,
-            } => {
+            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (1, 10, 0, 5));
                 assert!(matches!(kind, RecordKind::Append));
                 assert_eq!(&b[payload_off..payload_off + len], b"first");
@@ -413,15 +333,7 @@ mod tests {
         };
 
         match decode_at(&b, t1) {
-            Decoded::Record {
-                lsn,
-                kind,
-                stream_id,
-                stream_offset,
-                payload_off,
-                len,
-                total,
-            } => {
+            Decoded::Record { lsn, kind, stream_id, stream_offset, payload_off, len, total } => {
                 assert_eq!((lsn, stream_id, stream_offset, len), (2, 11, 5, 14));
                 assert!(matches!(kind, RecordKind::StreamCreate));
                 assert_eq!(&b[payload_off..payload_off + len], b"second-payload");

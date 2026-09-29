@@ -90,20 +90,13 @@ fn wal_dir_has_segments(wal_dir: &std::path::Path) -> bool {
 #[cfg(unix)]
 fn raise_nofile_limit() {
     unsafe {
-        let mut lim = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             return;
         }
         // macOS rejects RLIM_INFINITY for NOFILE (and caps at kern.maxfilesperproc);
         // pick a high concrete target so the raise succeeds across platforms.
-        let target = if lim.rlim_max == libc::RLIM_INFINITY {
-            1_048_576
-        } else {
-            lim.rlim_max
-        };
+        let target = if lim.rlim_max == libc::RLIM_INFINITY { 1_048_576 } else { lim.rlim_max };
         if lim.rlim_cur < target {
             lim.rlim_cur = target;
             let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
@@ -301,9 +294,7 @@ fn main() {
                 match v.parse::<u64>() {
                     Ok(bytes) => wal::shard::set_checkpoint_wal_bytes(bytes),
                     _ => {
-                        eprintln!(
-                            "--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)"
-                        );
+                        eprintln!("--wal-checkpoint-wal-bytes must be a non-negative integer (bytes)");
                         std::process::exit(2);
                     }
                 }
@@ -400,19 +391,12 @@ fn main() {
     // S3 credentials come from env (never CLI flags), matching the OTEL_*/AWS
     // convention. Honour both the DS_* names and the standard AWS_* fallbacks.
     if tier.kind == tier::TierKind::S3 {
-        tier.access_key_id = std::env::var("DS_S3_ACCESS_KEY_ID")
-            .or_else(|_| std::env::var("AWS_ACCESS_KEY_ID"))
-            .ok();
-        tier.secret_access_key = std::env::var("DS_S3_SECRET_ACCESS_KEY")
-            .or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY"))
-            .ok();
+        tier.access_key_id = std::env::var("DS_S3_ACCESS_KEY_ID").or_else(|_| std::env::var("AWS_ACCESS_KEY_ID")).ok();
+        tier.secret_access_key =
+            std::env::var("DS_S3_SECRET_ACCESS_KEY").or_else(|_| std::env::var("AWS_SECRET_ACCESS_KEY")).ok();
     }
 
-    let workers = worker_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    });
+    let workers = worker_threads.unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()
@@ -424,9 +408,7 @@ fn main() {
         // `--features telemetry`. Held across the run and flushed on Ctrl-C —
         // `serve()` never returns on its own.
         let mut telemetry_guard = telemetry::init();
-        let store = Arc::new(
-            Store::new_with_tier(data_dir.clone(), tier.clone()).expect("failed to init store"),
-        );
+        let store = Arc::new(Store::new_with_tier(data_dir.clone(), tier.clone()).expect("failed to init store"));
         // Batched meta-sidecar sweeper (#4691): flushes every stream queued by
         // `Store::mark_meta_dirty` (memory-mode appends, TTL read touches) in
         // one pass per tick, replacing the per-stream 100 ms debounce timer.
@@ -473,9 +455,7 @@ fn main() {
         let mut wal_for_shutdown: Option<Arc<wal::walset::WalSet>> = None;
         if handlers::durability() == handlers::DurabilityMode::Wal {
             let open_res = match wal_segment_bytes {
-                Some(sz) => {
-                    wal::walset::WalSet::open_with_segment_size(&data_dir, wal_shards, workers, sz)
-                }
+                Some(sz) => wal::walset::WalSet::open_with_segment_size(&data_dir, wal_shards, workers, sz),
                 None => wal::walset::WalSet::open(&data_dir, wal_shards, workers),
             };
             let walset = open_res.unwrap_or_else(|e| {
@@ -483,23 +463,15 @@ fn main() {
                 std::process::exit(2);
             });
             wal::recovery::recover(&store, &walset).expect("WAL recovery failed");
-            walset
-                .reset_after_recovery()
-                .expect("WAL reset after recovery failed");
-            store
-                .wal
-                .set(Arc::clone(&walset))
-                .unwrap_or_else(|_| panic!("WAL already attached"));
+            walset.reset_after_recovery().expect("WAL reset after recovery failed");
+            store.wal.set(Arc::clone(&walset)).unwrap_or_else(|_| panic!("WAL already attached"));
             // Arm the contention timing + spawn the dependency-free stderr
             // emitter BEFORE committers/serving start, so every acquisition from
             // the first append is timed. No-op (and no clock reads) when the flag
             // is absent.
             if let Some(secs) = wal_stats_secs {
                 wal::telemetry::set_stats_enabled(true);
-                wal::telemetry::spawn_stats_emitter(
-                    Arc::clone(&walset),
-                    std::time::Duration::from_secs(secs),
-                );
+                wal::telemetry::spawn_stats_emitter(Arc::clone(&walset), std::time::Duration::from_secs(secs));
             }
             walset.spawn_committers();
             // Per-shard checkpoint ticker (spec §7): periodically `fdatasync` each
@@ -516,10 +488,7 @@ fn main() {
 
         let addr: SocketAddr = (host, port).into();
         let listener = TcpListener::bind(addr).await.expect("bind failed");
-        println!(
-            "durable-streams-server listening on http://{addr} (data: {})",
-            data_dir.display()
-        );
+        println!("durable-streams-server listening on http://{addr} (data: {})", data_dir.display());
         tokio::select! {
             _ = engine_raw::serve(store, listener) => {}
             _ = shutdown_signal() => {
@@ -576,8 +545,7 @@ fn spawn_checkpoint_ticker(walset: Arc<wal::walset::WalSet>) {
         // task-id → shard index, so a PANICKED checkpoint task (JoinError carries
         // no payload) still clears its shard's in-flight guard — otherwise one
         // panic would silence that shard's checkpoints forever (unbounded WAL).
-        let mut task_shard: std::collections::HashMap<tokio::task::Id, usize> =
-            std::collections::HashMap::new();
+        let mut task_shard: std::collections::HashMap<tokio::task::Id, usize> = std::collections::HashMap::new();
         let mut ticker = tokio::time::interval(CHECKPOINT_POLL.min(interval));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Skip the immediate first tick — there is nothing to checkpoint at boot.

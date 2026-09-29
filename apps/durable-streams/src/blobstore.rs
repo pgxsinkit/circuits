@@ -30,12 +30,7 @@ pub trait BlobStore: Send + Sync {
     /// Upload an object in full.
     fn put<'a>(&'a self, key: &'a str, body: Bytes) -> BoxFuture<'a, io::Result<()>>;
     /// Read `[start, start+len)` of an object.
-    fn get_range<'a>(
-        &'a self,
-        key: &'a str,
-        start: u64,
-        len: u64,
-    ) -> BoxFuture<'a, io::Result<Bytes>>;
+    fn get_range<'a>(&'a self, key: &'a str, start: u64, len: u64) -> BoxFuture<'a, io::Result<Bytes>>;
     /// Object size, or None if it does not exist (used to verify before delete).
     fn head<'a>(&'a self, key: &'a str) -> BoxFuture<'a, io::Result<Option<u64>>>;
     /// Delete an object. Missing-object is not an error (idempotent).
@@ -50,9 +45,7 @@ pub type SharedBlobStore = Arc<dyn BlobStore>;
 /// `usize` — defence against a corrupt/hostile manifest minting a wrapped or
 /// truncated range (which could otherwise read the wrong bytes or over-allocate).
 fn checked_range(start: u64, len: u64) -> io::Result<std::ops::Range<usize>> {
-    let end = start
-        .checked_add(len)
-        .ok_or_else(|| io::Error::other("blob range overflow"))?;
+    let end = start.checked_add(len).ok_or_else(|| io::Error::other("blob range overflow"))?;
     let s = usize::try_from(start).map_err(|_| io::Error::other("blob range start too large"))?;
     let e = usize::try_from(end).map_err(|_| io::Error::other("blob range end too large"))?;
     Ok(s..e)
@@ -97,12 +90,7 @@ impl BlobStore for LocalFsBlobStore {
         })
     }
 
-    fn get_range<'a>(
-        &'a self,
-        key: &'a str,
-        start: u64,
-        len: u64,
-    ) -> BoxFuture<'a, io::Result<Bytes>> {
+    fn get_range<'a>(&'a self, key: &'a str, start: u64, len: u64) -> BoxFuture<'a, io::Result<Bytes>> {
         let path = self.path_for(key);
         Box::pin(async move {
             let range = checked_range(start, len)?;
@@ -167,10 +155,8 @@ mod s3 {
 
     impl S3BlobStore {
         pub fn new(cfg: &crate::tier::TierConfig) -> io::Result<Self> {
-            let bucket = cfg
-                .bucket
-                .as_ref()
-                .ok_or_else(|| io::Error::other("--tier-bucket is required for --tier s3"))?;
+            let bucket =
+                cfg.bucket.as_ref().ok_or_else(|| io::Error::other("--tier-bucket is required for --tier s3"))?;
             let mut b = AmazonS3Builder::new().with_bucket_name(bucket);
             if let Some(ep) = &cfg.endpoint {
                 b = b.with_endpoint(ep.clone());
@@ -185,9 +171,7 @@ mod s3 {
                 b = b.with_allow_http(true);
             }
             if let (Some(k), Some(s)) = (&cfg.access_key_id, &cfg.secret_access_key) {
-                b = b
-                    .with_access_key_id(k.clone())
-                    .with_secret_access_key(s.clone());
+                b = b.with_access_key_id(k.clone()).with_secret_access_key(s.clone());
             }
             let inner = b.build().map_err(io::Error::other)?;
             Ok(S3BlobStore { inner })
@@ -197,33 +181,15 @@ mod s3 {
     impl BlobStore for S3BlobStore {
         fn put<'a>(&'a self, key: &'a str, body: Bytes) -> BoxFuture<'a, io::Result<()>> {
             let path = ObjPath::from(key);
-            Box::pin(async move {
-                self.inner
-                    .put(&path, body.into())
-                    .await
-                    .map(|_| ())
-                    .map_err(io::Error::other)
-            })
+            Box::pin(async move { self.inner.put(&path, body.into()).await.map(|_| ()).map_err(io::Error::other) })
         }
 
-        fn get_range<'a>(
-            &'a self,
-            key: &'a str,
-            start: u64,
-            len: u64,
-        ) -> BoxFuture<'a, io::Result<Bytes>> {
+        fn get_range<'a>(&'a self, key: &'a str, start: u64, len: u64) -> BoxFuture<'a, io::Result<Bytes>> {
             let path = ObjPath::from(key);
             Box::pin(async move {
                 let range = super::checked_range(start, len)?;
-                let opts = GetOptions {
-                    range: Some(GetRange::Bounded(range)),
-                    ..Default::default()
-                };
-                let res = self
-                    .inner
-                    .get_opts(&path, opts)
-                    .await
-                    .map_err(io::Error::other)?;
+                let opts = GetOptions { range: Some(GetRange::Bounded(range)), ..Default::default() };
+                let res = self.inner.get_opts(&path, opts).await.map_err(io::Error::other)?;
                 res.bytes().await.map_err(io::Error::other)
             })
         }
@@ -261,9 +227,7 @@ mod tests {
         let dir = crate::handlers::test_support::temp_dir("blob");
         let bs = LocalFsBlobStore::new(dir.path().to_path_buf()).unwrap();
         let key = "stream-abc/0000000000000000";
-        bs.put(key, Bytes::from_static(b"hello world payload"))
-            .await
-            .unwrap();
+        bs.put(key, Bytes::from_static(b"hello world payload")).await.unwrap();
         assert_eq!(bs.head(key).await.unwrap(), Some(19));
         let got = bs.get_range(key, 6, 5).await.unwrap();
         assert_eq!(&got[..], b"world");
@@ -301,10 +265,7 @@ mod tests {
         let key = "stream-test/0000000000000042";
         let payload = Bytes::from_static(b"the quick brown fox jumps over the lazy dog");
         bs.put(key, payload.clone()).await.expect("put");
-        assert_eq!(
-            bs.head(key).await.expect("head"),
-            Some(payload.len() as u64)
-        );
+        assert_eq!(bs.head(key).await.expect("head"), Some(payload.len() as u64));
         let got = bs.get_range(key, 4, 5).await.expect("get_range");
         assert_eq!(&got[..], b"quick");
         bs.delete(key).await.expect("delete");

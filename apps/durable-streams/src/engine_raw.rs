@@ -106,8 +106,7 @@ pub async fn serve(store: Arc<Store>, listener: TcpListener) {
                 // checks — until load drops. That is the "hangs above ~1024
                 // connections and doesn't recover" failure. Sleeping frees the core
                 // and lets in-flight connections close and release fds.
-                let fd_exhausted =
-                    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE));
+                let fd_exhausted = matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE));
                 let backoff = if fd_exhausted {
                     std::time::Duration::from_millis(50)
                 } else {
@@ -167,10 +166,8 @@ async fn conn_loop(
     mut stream: TcpStream,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> std::io::Result<()> {
-    const BAD_REQUEST: &[u8] =
-        b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-    const TOO_LARGE: &[u8] =
-        b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+    const TOO_LARGE: &[u8] = b"HTTP/1.1 413 Payload Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
     // Initial capacity for the per-connection read buffer. Small on purpose:
     // it persists for the whole (possibly long-lived, idle) connection, and
     // `read_buf` grows it on demand, so a request head/body larger than this
@@ -190,10 +187,7 @@ async fn conn_loop(
 
         // Reject an over-limit declared body before sending 100-continue or
         // reading anything (RFC 9110 §10.1.1 permits a 4xx instead of 100).
-        if head
-            .content_length
-            .is_some_and(|n| n > crate::api::MAX_BODY_BYTES)
-        {
+        if head.content_length.is_some_and(|n| n > crate::api::MAX_BODY_BYTES) {
             let _ = stream.write_all(TOO_LARGE).await;
             return Ok(());
         }
@@ -226,13 +220,7 @@ async fn conn_loop(
             }
         };
 
-        let req = Req {
-            method: head.method,
-            path: head.path,
-            query: head.query,
-            headers: head.headers,
-            body,
-        };
+        let req = Req { method: head.method, path: head.path, query: head.query, headers: head.headers, body };
         let resp = handlers::handle(store.clone(), req).await;
         // SSE: hand the connection off to a DETACHED, minimal streaming task and
         // return. An SSE subscriber parks for up to SSE_MAX_DURATION; driving it
@@ -284,12 +272,7 @@ async fn conn_loop(
     }
 }
 
-async fn write_response(
-    stream: &mut TcpStream,
-    resp: Resp,
-    is_head: bool,
-    keep_alive: bool,
-) -> std::io::Result<()> {
+async fn write_response(stream: &mut TcpStream, resp: Resp, is_head: bool, keep_alive: bool) -> std::io::Result<()> {
     let status = resp.status;
     let body_len = resp.body.len();
     let mut head: Vec<u8> = Vec::with_capacity(512);
@@ -314,12 +297,7 @@ async fn write_response(
                 stream.write_all(&b).await?;
             }
         }
-        Body::FileRange {
-            segments,
-            prefix,
-            suffix,
-            hot,
-        } => {
+        Body::FileRange { segments, prefix, suffix, hot } => {
             head.extend_from_slice(prefix);
             stream.write_all(&head).await?;
             write_segments(stream, segments, hot).await?;
@@ -375,11 +353,7 @@ async fn write_response(
 /// configured ReadOffload strategy. `hot` marks a live tail feed (freshly
 /// appended, page-cache resident). Non-Linux always uses the inline (buffered)
 /// fallback — there is no sendfile there and the pool buys nothing.
-async fn write_segments(
-    stream: &mut TcpStream,
-    segments: Vec<Segment>,
-    hot: bool,
-) -> std::io::Result<()> {
+async fn write_segments(stream: &mut TcpStream, segments: Vec<Segment>, hot: bool) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let pool = match read_offload() {
@@ -410,10 +384,7 @@ async fn write_segments(
 /// can never write to a recycled, unrelated fd. The dup shares O_NONBLOCK with
 /// the original tokio socket, so the loop waits on POLLOUT for backpressure.
 #[cfg(target_os = "linux")]
-async fn write_segments_blocking(
-    stream: &mut TcpStream,
-    segments: Vec<Segment>,
-) -> std::io::Result<()> {
+async fn write_segments_blocking(stream: &mut TcpStream, segments: Vec<Segment>) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let dup = unsafe {
         let fd = libc::dup(stream.as_raw_fd());
@@ -468,10 +439,7 @@ fn blocking_sendfile(sock_fd: std::os::fd::RawFd, seg: &Segment) -> std::io::Res
         }
         if sent == 0 {
             // No progress with bytes pending (e.g. file truncated under us).
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "sendfile made no progress",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "sendfile made no progress"));
         }
     }
     Ok(())
@@ -480,11 +448,7 @@ fn blocking_sendfile(sock_fd: std::os::fd::RawFd, seg: &Segment) -> std::io::Res
 /// Block until the socket is writable (POLLOUT), retrying on EINTR.
 #[cfg(target_os = "linux")]
 fn wait_writable(sock_fd: std::os::fd::RawFd) -> std::io::Result<()> {
-    let mut pfd = libc::pollfd {
-        fd: sock_fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
+    let mut pfd = libc::pollfd { fd: sock_fd, events: libc::POLLOUT, revents: 0 };
     loop {
         let r = unsafe { libc::poll(&mut pfd, 1, -1) };
         if r < 0 {
@@ -526,12 +490,7 @@ async fn write_segment(stream: &mut TcpStream, seg: &Segment) -> std::io::Result
             // sendfile advances `offset` by the bytes sent. A 0 return with
             // bytes still pending means no progress is possible (e.g. the file
             // was truncated under us) — stop rather than spin forever.
-            Ok(0) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "sendfile made no progress",
-                ))
-            }
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "sendfile made no progress")),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
             Err(e) => return Err(e),

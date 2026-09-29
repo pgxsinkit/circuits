@@ -104,12 +104,7 @@ struct Slot {
 /// (and the connection-limiter permit, so the connection stays counted) — the
 /// tokio task returns immediately afterward. Best-effort: a fd-extraction failure
 /// just drops the connection.
-pub fn register(
-    stream: tokio::net::TcpStream,
-    head: Vec<u8>,
-    reg: SseReg,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
+pub fn register(stream: tokio::net::TcpStream, head: Vec<u8>, reg: SseReg, permit: tokio::sync::OwnedSemaphorePermit) {
     let std_stream = match stream.into_std() {
         Ok(s) => s,
         Err(_) => return,
@@ -157,11 +152,7 @@ pub fn wake_stream(st: &StreamState) {
         // Subscribers exist only because `register` ran, so the pool is live.
         let pool = pool();
         for h in &list.subs {
-            pool[h.shard as usize]
-                .wake
-                .lock()
-                .unwrap()
-                .push((h.key, h.gen));
+            pool[h.shard as usize].wake.lock().unwrap().push((h.key, h.gen));
             if !to_signal.contains(&h.shard) {
                 to_signal.push(h.shard);
             }
@@ -187,17 +178,11 @@ pub fn shutdown() {
 
 fn pool() -> &'static Vec<Arc<Shard>> {
     POOL.get_or_init(|| {
-        let n = std::thread::available_parallelism()
-            .map(|x| x.get())
-            .unwrap_or(4);
+        let n = std::thread::available_parallelism().map(|x| x.get()).unwrap_or(4);
         let mut shards = Vec::with_capacity(n);
         for i in 0..n {
             let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-            let shard = Arc::new(Shard {
-                eventfd,
-                intake: Mutex::new(Vec::new()),
-                wake: Mutex::new(Vec::new()),
-            });
+            let shard = Arc::new(Shard { eventfd, intake: Mutex::new(Vec::new()), wake: Mutex::new(Vec::new()) });
             let me = shard.clone();
             std::thread::Builder::new()
                 .name(format!("sse-reactor-{i}"))
@@ -230,20 +215,11 @@ impl Reactor {
     fn new(shard: Arc<Shard>, shard_idx: u16) -> Reactor {
         let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
         // Register the wakeup eventfd. EPOLLIN level-triggered; drained each wake.
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLIN as u32,
-            u64: EVENTFD_TOKEN,
-        };
+        let mut ev = libc::epoll_event { events: libc::EPOLLIN as u32, u64: EVENTFD_TOKEN };
         unsafe {
             libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, shard.eventfd, &mut ev);
         }
-        Reactor {
-            shard,
-            shard_idx,
-            epfd,
-            slab: Vec::new(),
-            free: Vec::new(),
-        }
+        Reactor { shard, shard_idx, epfd, slab: Vec::new(), free: Vec::new() }
     }
 
     fn run(mut self) {
@@ -253,9 +229,7 @@ impl Reactor {
                 self.close_all();
                 return;
             }
-            let n = unsafe {
-                libc::epoll_wait(self.epfd, events.as_mut_ptr(), MAX_EVENTS as i32, TICK_MS)
-            };
+            let n = unsafe { libc::epoll_wait(self.epfd, events.as_mut_ptr(), MAX_EVENTS as i32, TICK_MS) };
             if n < 0 {
                 // EINTR or similar: re-arm the loop (shutdown re-checked at top).
                 continue;
@@ -270,9 +244,7 @@ impl Reactor {
                     continue;
                 }
                 let key = token as u32;
-                if flags & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32 | libc::EPOLLRDHUP as u32)
-                    != 0
-                {
+                if flags & (libc::EPOLLHUP as u32 | libc::EPOLLERR as u32 | libc::EPOLLRDHUP as u32) != 0 {
                     self.close(key);
                     continue;
                 }
@@ -281,18 +253,13 @@ impl Reactor {
                 }
             }
             if got_wakeup {
-                let intake: Vec<Registration> =
-                    std::mem::take(&mut *self.shard.intake.lock().unwrap());
+                let intake: Vec<Registration> = std::mem::take(&mut *self.shard.intake.lock().unwrap());
                 for reg in intake {
                     self.insert(reg);
                 }
                 let wakes: Vec<(u32, u32)> = std::mem::take(&mut *self.shard.wake.lock().unwrap());
                 for (key, gen) in wakes {
-                    if self
-                        .slab
-                        .get(key as usize)
-                        .is_some_and(|s| s.gen == gen && s.sub.is_some())
-                    {
+                    if self.slab.get(key as usize).is_some_and(|s| s.gen == gen && s.sub.is_some()) {
                         // Clear the stream's coalescing latch BEFORE producing:
                         // produce() reads the tail after the clear, so a publish
                         // racing this flush is either included or re-queues.
@@ -343,26 +310,16 @@ impl Reactor {
         {
             let mut g = st.sse_subs.lock().unwrap();
             let list = g.get_or_insert_with(|| {
-                Box::new(StreamSubs {
-                    subs: Vec::new(),
-                    wake_pending: std::sync::atomic::AtomicBool::new(false),
-                })
+                Box::new(StreamSubs { subs: Vec::new(), wake_pending: std::sync::atomic::AtomicBool::new(false) })
             });
-            list.subs.push(SubHandle {
-                shard: self.shard_idx,
-                key,
-                gen,
-            });
+            list.subs.push(SubHandle { shard: self.shard_idx, key, gen });
             // A gen-stale wake (subscriber closed between queue and drain) is
             // dropped without clearing the latch; reset it on every register so
             // a fresh subscriber can never inherit a stale-set latch.
             list.wake_pending.store(false, Ordering::Release);
         }
         // Watch for peer close/errors; EPOLLOUT is armed lazily by flush().
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLRDHUP as u32,
-            u64: key as u64,
-        };
+        let mut ev = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: key as u64 };
         unsafe {
             libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_ADD, reg.fd, &mut ev);
         }
@@ -382,12 +339,7 @@ impl Reactor {
         loop {
             let (file, file_base, tail, closed) = {
                 let s = sub.st.shared.read().unwrap();
-                (
-                    s.file.clone(),
-                    s.file_base,
-                    s.durable_tail,
-                    s.closed_durable,
-                )
+                (s.file.clone(), s.file_base, s.durable_tail, s.closed_durable)
             };
             if tail > sub.write_off {
                 if sub.write_off < file_base {
@@ -403,9 +355,7 @@ impl Reactor {
                 // delivered as several data/control pairs (with `up_to_date`
                 // false until the last one), and `backlog(sub) > PENDING_CAP`
                 // still governs a subscriber that cannot keep up.
-                let Some((end, data)) =
-                    read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding)
-                else {
+                let Some((end, data)) = read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding) else {
                     sub.done = true;
                     frame_terminator(&mut sub.pending);
                     return;
@@ -527,10 +477,7 @@ impl Reactor {
         }
         sub.epollout_armed = true;
         let fd = sub.fd;
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLRDHUP as u32 | libc::EPOLLOUT as u32,
-            u64: key as u64,
-        };
+        let mut ev = libc::epoll_event { events: libc::EPOLLRDHUP as u32 | libc::EPOLLOUT as u32, u64: key as u64 };
         unsafe {
             libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev);
         }
@@ -543,10 +490,7 @@ impl Reactor {
         }
         sub.epollout_armed = false;
         let fd = sub.fd;
-        let mut ev = libc::epoll_event {
-            events: libc::EPOLLRDHUP as u32,
-            u64: key as u64,
-        };
+        let mut ev = libc::epoll_event { events: libc::EPOLLRDHUP as u32, u64: key as u64 };
         unsafe {
             libc::epoll_ctl(self.epfd, libc::EPOLL_CTL_MOD, fd, &mut ev);
         }
@@ -603,8 +547,7 @@ impl Reactor {
         {
             let mut g = sub.st.sse_subs.lock().unwrap();
             if let Some(list) = g.as_mut() {
-                list.subs
-                    .retain(|h| !(h.shard == shard_idx && h.key == key));
+                list.subs.retain(|h| !(h.shard == shard_idx && h.key == key));
                 if list.subs.is_empty() {
                     *g = None;
                 }
@@ -667,11 +610,7 @@ fn read_capped_frame(
     let remaining = tail - write_off;
     let cap = crate::handlers::max_chunk_bytes();
     let json = matches!(encoding, SseEncoding::Json);
-    let mut window = if cap == 0 {
-        remaining
-    } else {
-        cap.min(remaining)
-    };
+    let mut window = if cap == 0 { remaining } else { cap.min(remaining) };
     loop {
         let end = write_off + window;
         let mut data = vec![0u8; window as usize];

@@ -24,9 +24,7 @@ mod imp {
     use opentelemetry::metrics::{Counter, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::{MetricExporter, SpanExporter};
-    use opentelemetry_sdk::metrics::{
-        Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality,
-    };
+    use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality};
     use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
     use opentelemetry_sdk::Resource;
     use tracing_subscriber::layer::SubscriberExt;
@@ -34,9 +32,7 @@ mod imp {
     use tracing_subscriber::{fmt, EnvFilter};
 
     /// Latency histogram bucket boundaries (seconds).
-    const LATENCY_BUCKETS: &[f64] = &[
-        0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-    ];
+    const LATENCY_BUCKETS: &[f64] = &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
     /// Batch-size histogram bucket boundaries (count).
     const BATCH_BUCKETS: &[f64] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0];
 
@@ -93,9 +89,7 @@ mod imp {
                     .build(),
                 read_chunk_capped: meter
                     .u64_counter("ds.read.chunk_capped")
-                    .with_description(
-                        "Read responses truncated by the maximum chunk size, by live mode.",
-                    )
+                    .with_description("Read responses truncated by the maximum chunk size, by live mode.")
                     .build(),
                 read_offload_wait: meter
                     .f64_histogram("ds.read.offload.wait")
@@ -153,12 +147,8 @@ mod imp {
     /// Parent-based sampler from OTEL_TRACES_SAMPLER / OTEL_TRACES_SAMPLER_ARG.
     /// Defaults to parentbased_traceidratio with ratio 1.0 (sample everything).
     fn build_sampler() -> Sampler {
-        let kind = std::env::var("OTEL_TRACES_SAMPLER")
-            .unwrap_or_else(|_| "parentbased_traceidratio".to_string());
-        let arg: f64 = std::env::var("OTEL_TRACES_SAMPLER_ARG")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0);
+        let kind = std::env::var("OTEL_TRACES_SAMPLER").unwrap_or_else(|_| "parentbased_traceidratio".to_string());
+        let arg: f64 = std::env::var("OTEL_TRACES_SAMPLER_ARG").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
         match kind.as_str() {
             "always_on" => Sampler::AlwaysOn,
             "always_off" => Sampler::AlwaysOff,
@@ -171,20 +161,15 @@ mod imp {
     }
 
     /// Explicit-bucket view for the named instrument (boundaries in `buckets`).
-    fn bucket_view(
-        name: &'static str,
-        buckets: &'static [f64],
-    ) -> impl Fn(&Instrument) -> Option<Stream> {
+    fn bucket_view(name: &'static str, buckets: &'static [f64]) -> impl Fn(&Instrument) -> Option<Stream> {
         move |i: &Instrument| {
             if i.name() == name {
                 Some(
                     Stream::builder()
-                        .with_aggregation(
-                            opentelemetry_sdk::metrics::Aggregation::ExplicitBucketHistogram {
-                                boundaries: buckets.to_vec(),
-                                record_min_max: true,
-                            },
-                        )
+                        .with_aggregation(opentelemetry_sdk::metrics::Aggregation::ExplicitBucketHistogram {
+                            boundaries: buckets.to_vec(),
+                            record_min_max: true,
+                        })
                         .build()
                         .unwrap(),
                 )
@@ -218,30 +203,27 @@ mod imp {
         };
 
         // ---- metrics ----
-        let meter_provider = match MetricExporter::builder()
-            .with_tonic()
-            .with_temporality(Temporality::Cumulative)
-            .build()
-        {
-            Ok(exporter) => {
-                let reader = PeriodicReader::builder(exporter).build();
-                let provider = SdkMeterProvider::builder()
-                    .with_resource(resource)
-                    .with_reader(reader)
-                    .with_view(bucket_view("ds.append.fsync.duration", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.append.lock_wait.duration", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.append.duration", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.read.duration", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.read.offload.wait", LATENCY_BUCKETS))
-                    .with_view(bucket_view("ds.append.fsync.batch_size", BATCH_BUCKETS))
-                    .build();
-                Some(provider)
-            }
-            Err(e) => {
-                eprintln!("telemetry: metric exporter init failed: {e}; metrics disabled");
-                None
-            }
-        };
+        let meter_provider =
+            match MetricExporter::builder().with_tonic().with_temporality(Temporality::Cumulative).build() {
+                Ok(exporter) => {
+                    let reader = PeriodicReader::builder(exporter).build();
+                    let provider = SdkMeterProvider::builder()
+                        .with_resource(resource)
+                        .with_reader(reader)
+                        .with_view(bucket_view("ds.append.fsync.duration", LATENCY_BUCKETS))
+                        .with_view(bucket_view("ds.append.lock_wait.duration", LATENCY_BUCKETS))
+                        .with_view(bucket_view("ds.append.duration", LATENCY_BUCKETS))
+                        .with_view(bucket_view("ds.read.duration", LATENCY_BUCKETS))
+                        .with_view(bucket_view("ds.read.offload.wait", LATENCY_BUCKETS))
+                        .with_view(bucket_view("ds.append.fsync.batch_size", BATCH_BUCKETS))
+                        .build();
+                    Some(provider)
+                }
+                Err(e) => {
+                    eprintln!("telemetry: metric exporter init failed: {e}; metrics disabled");
+                    None
+                }
+            };
 
         // ---- global providers + tracing subscriber ----
         let registry = tracing_subscriber::registry()
@@ -263,23 +245,14 @@ mod imp {
             let _ = METRICS.set(Metrics::new(&global::meter(env!("CARGO_PKG_NAME"))));
         }
 
-        Guard {
-            tracer_provider,
-            meter_provider,
-        }
+        Guard { tracer_provider, meter_provider }
     }
 
     // ---- record functions (no-ops until init() resolves the instruments) ----
 
     pub fn record_request(method: &'static str, status_class: &'static str) {
         if let Some(m) = metrics() {
-            m.http_requests.add(
-                1,
-                &[
-                    KeyValue::new("method", method),
-                    KeyValue::new("status_class", status_class),
-                ],
-            );
+            m.http_requests.add(1, &[KeyValue::new("method", method), KeyValue::new("status_class", status_class)]);
         }
     }
 
@@ -298,13 +271,7 @@ mod imp {
 
     pub fn record_append(secs: f64, outcome: &'static str, is_json: bool) {
         if let Some(m) = metrics() {
-            m.append_duration.record(
-                secs,
-                &[
-                    KeyValue::new("outcome", outcome),
-                    KeyValue::new("is_json", is_json),
-                ],
-            );
+            m.append_duration.record(secs, &[KeyValue::new("outcome", outcome), KeyValue::new("is_json", is_json)]);
         }
     }
 
@@ -312,23 +279,15 @@ mod imp {
         if let Some(m) = metrics() {
             m.read_duration.record(
                 secs,
-                &[
-                    KeyValue::new("live", live),
-                    KeyValue::new("cache", if cache_hit { "hit" } else { "miss" }),
-                ],
+                &[KeyValue::new("live", live), KeyValue::new("cache", if cache_hit { "hit" } else { "miss" })],
             );
         }
     }
 
     pub fn record_tail_cache(hit: bool, live: &'static str) {
         if let Some(m) = metrics() {
-            m.read_tail_cache.add(
-                1,
-                &[
-                    KeyValue::new("result", if hit { "hit" } else { "miss" }),
-                    KeyValue::new("live", live),
-                ],
-            );
+            m.read_tail_cache
+                .add(1, &[KeyValue::new("result", if hit { "hit" } else { "miss" }), KeyValue::new("live", live)]);
         }
     }
 
@@ -424,6 +383,6 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_chunk_capped, record_fsync,
-    record_offload_wait, record_read, record_request, record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_chunk_capped, record_fsync, record_offload_wait, record_read,
+    record_request, record_tail_cache, Guard, Timer,
 };

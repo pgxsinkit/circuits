@@ -287,9 +287,7 @@ pub struct TierState {
 
 impl Default for TierState {
     fn default() -> Self {
-        TierState {
-            manifest: Mutex::new(Manifest::default()),
-        }
+        TierState { manifest: Mutex::new(Manifest::default()) }
     }
 }
 
@@ -311,22 +309,10 @@ impl TierState {
                     // reconcile flags it; keep a placeholder path.
                     (None, None) => (Placement::Local(segments_dir.join("__missing__")), false),
                 };
-                SegmentEntry {
-                    logical_start: m.logical_start,
-                    len: m.len,
-                    placement,
-                    remote,
-                }
+                SegmentEntry { logical_start: m.logical_start, len: m.len, placement, remote }
             })
             .collect();
-        TierState {
-            manifest: Mutex::new(Manifest {
-                segments,
-                sealed_offset,
-                offloading: false,
-                deleted: false,
-            }),
-        }
+        TierState { manifest: Mutex::new(Manifest { segments, sealed_offset, offloading: false, deleted: false }) }
     }
 }
 
@@ -344,21 +330,13 @@ impl TierState {
 /// every stream incarnation / fork separately, mirroring stratovolt's
 /// `{streamId}/{streamHash}/{chunkSeq}`.
 fn segment_key(prefix: &str, st: &StreamState, logical_start: u64) -> String {
-    let fname = st
-        .file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("stream");
+    let fname = st.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("stream");
     format!("{prefix}{fname}/{logical_start:016}")
 }
 
 /// Local staged chunk-file name for a sealed segment.
 fn segment_file_name(st: &StreamState, logical_start: u64) -> String {
-    let fname = st
-        .file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("stream");
+    let fname = st.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("stream");
     format!("{fname}.seg.{logical_start:016}")
 }
 
@@ -386,10 +364,7 @@ impl Store {
 
     /// A lightweight clone of just what an offload background task needs.
     fn clone_for_task(&self) -> TierTask {
-        TierTask {
-            tier_config: self.tier_config.clone(),
-            blobstore: self.blobstore.clone(),
-        }
+        TierTask { tier_config: self.tier_config.clone(), blobstore: self.blobstore.clone() }
     }
 
     /// Seal as many full `segment_bytes`-sized prefixes off the live tail as are
@@ -414,11 +389,7 @@ impl Store {
         // Reclaim the redundant sealed prefix from the live file once it crosses
         // the threshold. Inside the same guarded window as sealing, so the two
         // never touch the live file or `file_base` concurrently.
-        let compact_res = if res.is_ok() {
-            self.maybe_compact(st).await
-        } else {
-            Ok(())
-        };
+        let compact_res = if res.is_ok() { self.maybe_compact(st).await } else { Ok(()) };
         {
             let mut m = st.tier.manifest.lock().unwrap();
             m.offloading = false;
@@ -441,13 +412,7 @@ impl Store {
             return Ok(());
         }
         // Separate acquisitions (never nest manifest+shared — see seal_loop note).
-        let sealed = st
-            .tier
-            .manifest
-            .lock()
-            .unwrap()
-            .sealed_offset
-            .max(st.base_offset);
+        let sealed = st.tier.manifest.lock().unwrap().sealed_offset.max(st.base_offset);
         let file_base = st.shared.read().unwrap().file_base;
         if sealed <= file_base || sealed - file_base < threshold {
             return Ok(());
@@ -498,15 +463,10 @@ impl Store {
 
         // 2) Persist the compaction intent BEFORE the destructive rename, so a
         //    crash anywhere after this is recoverable (tail is frozen).
-        *st.compaction.lock().unwrap() = Some(crate::store::PendingCompaction {
-            new_file_base: cut,
-            tail,
-        });
+        *st.compaction.lock().unwrap() = Some(crate::store::PendingCompaction { new_file_base: cut, tail });
         {
             let stc = st.clone();
-            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
-                .await
-                .map_err(std::io::Error::other)??;
+            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await.map_err(std::io::Error::other)??;
         }
 
         // 3) Atomic content swap, made crash-durable. In-flight readers keep the
@@ -525,12 +485,7 @@ impl Store {
         // 4) Open the compacted file and publish (file, file_base) for readers as
         //    one consistent swap; repoint the appender's write handle. Under the
         //    appender lock, so no append observes a half-swapped state.
-        let new_file = Arc::new(
-            OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&live_path)?,
-        );
+        let new_file = Arc::new(OpenOptions::new().read(true).append(true).open(&live_path)?);
         {
             let mut s = st.shared.write().unwrap();
             s.file = new_file.clone();
@@ -543,9 +498,7 @@ impl Store {
         *st.compaction.lock().unwrap() = None;
         {
             let stc = st.clone();
-            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
-                .await
-                .map_err(std::io::Error::other)??;
+            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await.map_err(std::io::Error::other)??;
         }
         Ok(())
     }
@@ -658,9 +611,7 @@ impl Store {
                 m.sealed_offset = seg_start + seg_len;
             }
             let stc = st.clone();
-            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
-                .await
-                .map_err(std::io::Error::other)??;
+            tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await.map_err(std::io::Error::other)??;
 
             // NOTE: the live data file's sealed region is intentionally NOT
             // reclaimed here. A sealed segment is served from its chunk file /
@@ -729,9 +680,7 @@ impl Store {
         // Persist the flip durably BEFORE unlinking the local file (so recovery
         // never sees a Local entry whose file we already removed).
         let stc = st.clone();
-        tokio::task::spawn_blocking(move || write_meta_sync(&stc, true))
-            .await
-            .map_err(std::io::Error::other)??;
+        tokio::task::spawn_blocking(move || write_meta_sync(&stc, true)).await.map_err(std::io::Error::other)??;
         // Now the local chunk file is reclaimable. unlink is safe even with
         // in-flight reads (open fds stay valid after unlink on Unix).
         if let Some(p) = local_path {
@@ -758,13 +707,7 @@ impl Store {
         // Deterministic on-disk prefix for this stream's chunk files
         // (`<fname>.seg.<start>`), used as a GC backstop for chunks staged on disk
         // but not yet in the manifest snapshot.
-        let file_prefix = format!(
-            "{}.seg.",
-            st.file_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("stream")
-        );
+        let file_prefix = format!("{}.seg.", st.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("stream"));
         let st = st.clone();
         tokio::spawn(async move {
             // Wait out any pass that was already inside its offloading window so we
@@ -784,11 +727,7 @@ impl Store {
             // was never uploaded is a harmless no-op.
             let (keys, local_paths): (Vec<String>, Vec<std::path::PathBuf>) = {
                 let m = st.tier.manifest.lock().unwrap();
-                let keys = m
-                    .segments
-                    .iter()
-                    .map(|s| segment_key(&prefix, &st, s.logical_start))
-                    .collect();
+                let keys = m.segments.iter().map(|s| segment_key(&prefix, &st, s.logical_start)).collect();
                 let local = m
                     .segments
                     .iter()
@@ -815,11 +754,7 @@ impl Store {
             // when a seal pass was cut short, or a leftover `.tmp` write.
             if let Ok(mut rd) = tokio::fs::read_dir(&seg_dir).await {
                 while let Ok(Some(entry)) = rd.next_entry().await {
-                    if entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|n| n.starts_with(&file_prefix))
-                    {
+                    if entry.file_name().to_str().is_some_and(|n| n.starts_with(&file_prefix)) {
                         let _ = tokio::fs::remove_file(entry.path()).await;
                     }
                 }
@@ -993,11 +928,7 @@ pub fn resolve_range(st: &Arc<StreamState>, start: u64, end: u64, out: &mut Vec<
             let s = st.shared.read().unwrap();
             (s.file.clone(), s.file_base)
         };
-        out.push(ResolvedSlice::Local(Segment {
-            file,
-            file_start: live_lo - file_base,
-            len: end - live_lo,
-        }));
+        out.push(ResolvedSlice::Local(Segment { file, file_start: live_lo - file_base, len: end - live_lo }));
     }
 }
 
@@ -1027,31 +958,20 @@ fn resolve_sealed(st: &Arc<StreamState>, lo: u64, hi: u64, out: &mut Vec<Resolve
                 // (and the fd stays valid after unlink). Do not move the open
                 // outside the lock: that reintroduces an open-vs-unlink race.
                 match OpenOptions::new().read(true).open(path) {
-                    Ok(f) => out.push(ResolvedSlice::Local(Segment {
-                        file: Arc::new(f),
-                        file_start: off_in_seg,
-                        len,
-                    })),
+                    Ok(f) => out.push(ResolvedSlice::Local(Segment { file: Arc::new(f), file_start: off_in_seg, len })),
                     Err(e) => {
                         // NEVER silently omit a slice: Content-Length is computed
                         // from the resolved slices, so a dropped slice produces a
                         // well-formed 200 that is simply MISSING interior bytes —
                         // the client's next offset then skips them forever.
                         // Surface a poison slice so the read errors instead.
-                        eprintln!(
-                            "ERROR: sealed chunk {} unreadable ({e}) — failing the read",
-                            path.display()
-                        );
+                        eprintln!("ERROR: sealed chunk {} unreadable ({e}) — failing the read", path.display());
                         out.push(ResolvedSlice::Missing);
                     }
                 }
             }
             Placement::Remote(key) => {
-                out.push(ResolvedSlice::Remote {
-                    key: key.clone(),
-                    offset: off_in_seg,
-                    len,
-                });
+                out.push(ResolvedSlice::Remote { key: key.clone(), offset: off_in_seg, len });
             }
         }
         cur = e;
@@ -1119,10 +1039,7 @@ mod tests {
         // limit before the trailing comma -> no boundary (don't split mid-value).
         assert_eq!(last_json_value_boundary(data, 10), 0);
         // full -> boundary at the end.
-        assert_eq!(
-            last_json_value_boundary(data, data.len() as u64),
-            data.len() as u64
-        );
+        assert_eq!(last_json_value_boundary(data, data.len() as u64), data.len() as u64);
     }
 
     #[test]

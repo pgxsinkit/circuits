@@ -57,8 +57,7 @@ use crate::wal::walset::WalSet;
 /// Lets a test assert the repair was made crash-durable (HIGH fix) without
 /// observing the kernel page cache directly.
 #[cfg(test)]
-pub(crate) static RECOVERY_FSYNCS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static RECOVERY_FSYNCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Replay every shard's WAL (in parallel) and repair each touched stream's
 /// per-stream-file tail to the durable frontier. See the module docs / spec §9.
@@ -82,12 +81,8 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     // their frontier, so the seeding adds no boot I/O for untouched streams.
     let mut index: HashMap<u64, Arc<StreamState>> = HashMap::new();
     let mut seeds: Vec<HashMap<u64, u64>> = vec![HashMap::new(); wal.shards().len()];
-    let shard_pos: HashMap<*const crate::wal::shard::Shard, usize> = wal
-        .shards()
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (Arc::as_ptr(s), i))
-        .collect();
+    let shard_pos: HashMap<*const crate::wal::shard::Shard, usize> =
+        wal.shards().iter().enumerate().map(|(i, s)| (Arc::as_ptr(s), i)).collect();
     for entry in store.streams.iter() {
         let st = entry.value().clone();
         let proof = {
@@ -108,9 +103,7 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     for (shard, seed) in wal.shards().iter().zip(seeds) {
         let shard = Arc::clone(shard);
         let index = Arc::clone(&index);
-        handles.push(std::thread::spawn(move || {
-            recover_shard(&shard, &index, seed)
-        }));
+        handles.push(std::thread::spawn(move || recover_shard(&shard, &index, seed)));
     }
     for h in handles {
         // A panicked recovery thread is a bug (poisoned state); surface it.
@@ -212,9 +205,7 @@ fn recover_shard(
         pre_replay_end.entry(stream_id).or_insert_with(|| {
             // Logical end of the per-stream file before replay writes to it —
             // the durable prefix the replayed records must tile onto.
-            let len = std::fs::metadata(&st.file_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let len = std::fs::metadata(&st.file_path).map(|m| m.len()).unwrap_or(0);
             file_base + len
         });
         if let Err(e) = write_at(st, file_pos, payload) {
@@ -286,9 +277,9 @@ fn recover_shard(
         // by anything durable — a gap kept silently. Fail loudly in tests.
         #[cfg(debug_assertions)]
         debug_assert!(
-            min_applied.get(stream_id).map_or(true, |&lo| {
-                pre_replay_end.get(stream_id).is_some_and(|&pre| lo <= pre)
-            }),
+            min_applied
+                .get(stream_id)
+                .map_or(true, |&lo| { pre_replay_end.get(stream_id).is_some_and(|&pre| lo <= pre) }),
             "WAL replay hole: stream {stream_id}: first replayed record at {:?} is past \
              the pre-replay file end {:?}",
             min_applied.get(stream_id),
@@ -313,21 +304,13 @@ fn write_at(st: &StreamState, file_pos: u64, payload: &[u8]) -> io::Result<()> {
         // SAFETY: `fd` is a valid open fd for the lifetime of `f`; `buf` is a live
         // slice; the kernel writes at the explicit offset (no cursor / append).
         let n = unsafe {
-            libc::pwrite(
-                fd,
-                buf.as_ptr() as *const libc::c_void,
-                buf.len(),
-                (file_pos + written as u64) as libc::off_t,
-            )
+            libc::pwrite(fd, buf.as_ptr() as *const libc::c_void, buf.len(), (file_pos + written as u64) as libc::off_t)
         };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
         if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "pwrite returned 0",
-            ));
+            return Err(io::Error::new(io::ErrorKind::WriteZero, "pwrite returned 0"));
         }
         written += n as usize;
     }
@@ -374,10 +357,7 @@ fn reconcile_tail(st: &StreamState, logical_tail: u64) -> io::Result<()> {
     };
     // Refresh the reader-notification watch so any future subscriber observes the
     // reconciled tail (not the stale, possibly-torn boot value the sidecar seeded).
-    st.tail_tx.send_replace(crate::store::Tail {
-        bytes: logical_tail,
-        closed,
-    });
+    st.tail_tx.send_replace(crate::store::Tail { bytes: logical_tail, closed });
     if let Ok(mut ap) = st.appender.try_lock() {
         ap.written = file_len;
     } else {
@@ -405,10 +385,7 @@ fn write_meta_durable(st: &StreamState) -> io::Result<()> {
 /// Open a fresh read-write (non-append) handle to a stream's per-stream data file
 /// for positioned writes / truncation during recovery.
 fn open_rw(st: &StreamState) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&st.file_path)
+    std::fs::OpenOptions::new().read(true).write(true).open(&st.file_path)
 }
 
 #[cfg(test)]
@@ -435,23 +412,8 @@ mod tests {
 
     /// Encode an `Append` record for `(stream_id, stream_offset, payload)` at `lsn`
     /// and append its framed bytes to `buf`.
-    fn append_record(
-        buf: &mut Vec<u8>,
-        lsn: u64,
-        stream_id: u64,
-        stream_offset: u64,
-        payload: &[u8],
-    ) {
-        encode_into(
-            buf,
-            &Record {
-                lsn,
-                kind: RecordKind::Append,
-                stream_id,
-                stream_offset,
-                payload,
-            },
-        );
+    fn append_record(buf: &mut Vec<u8>, lsn: u64, stream_id: u64, stream_offset: u64, payload: &[u8]) {
+        encode_into(buf, &Record { lsn, kind: RecordKind::Append, stream_id, stream_offset, payload });
     }
 
     #[tokio::test]
@@ -484,10 +446,7 @@ mod tests {
         // WAL. (We must reconcile this 4th away.)
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&st.file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&st.file_path).unwrap();
             f.write_all(r1).unwrap();
             f.write_all(r2).unwrap();
             f.write_all(r3).unwrap();
@@ -516,11 +475,7 @@ mod tests {
             CreateResult::Created(s) => s,
             _ => panic!("create st2 failed"),
         };
-        assert_eq!(
-            st2.shared.read().unwrap().file_base,
-            K,
-            "seeded file_base = K"
-        );
+        assert_eq!(st2.shared.read().unwrap().file_base, K, "seeded file_base = K");
         let id2 = st2.id;
         // st2's live file is empty (file_base = K, tail = K, 0 bytes on disk).
         // A WAL record below the frontier (stream_offset = 10 < K) must be SKIPPED.
@@ -569,29 +524,11 @@ mod tests {
         expect.extend_from_slice(r1);
         expect.extend_from_slice(r2);
         expect.extend_from_slice(r3);
-        assert_eq!(
-            std::fs::read(&st_file_path).unwrap(),
-            expect,
-            "recovered bytes are r1‖r2‖r3 exactly"
-        );
+        assert_eq!(std::fs::read(&st_file_path).unwrap(), expect, "recovered bytes are r1‖r2‖r3 exactly");
         // In-memory tail reconciled to the durable frontier.
-        let st = store
-            .streams
-            .iter()
-            .find(|e| e.value().id == id)
-            .unwrap()
-            .value()
-            .clone();
-        assert_eq!(
-            st.shared.read().unwrap().tail,
-            durable_len as u64,
-            "Shared.tail == durable frontier"
-        );
-        assert_eq!(
-            st.appender.lock().await.written,
-            durable_len as u64,
-            "appender.written reconciled"
-        );
+        let st = store.streams.iter().find(|e| e.value().id == id).unwrap().value().clone();
+        assert_eq!(st.shared.read().unwrap().tail, durable_len as u64, "Shared.tail == durable frontier");
+        assert_eq!(st.appender.lock().await.written, durable_len as u64, "appender.written reconciled");
 
         // (c) the below-frontier record (stream_offset 10 < K) was SKIPPED — the
         //     no-loss record at file_pos 0 IS restored, and nothing was written out
@@ -602,27 +539,13 @@ mod tests {
             st2_bytes, r_noloss,
             "below-frontier record skipped; the in-range no-loss record restored at file_pos 0"
         );
-        let st2 = store
-            .streams
-            .iter()
-            .find(|e| e.value().id == id2)
-            .unwrap()
-            .value()
-            .clone();
-        assert_eq!(
-            st2.shared.read().unwrap().tail,
-            K + r_noloss.len() as u64,
-            "st2 tail = file_base + restored len"
-        );
+        let st2 = store.streams.iter().find(|e| e.value().id == id2).unwrap().value().clone();
+        assert_eq!(st2.shared.read().unwrap().tail, K + r_noloss.len() as u64, "st2 tail = file_base + restored len");
     }
 
     /// Write `checkpoint_lsn` into a 1-shard WAL's `<dir>/wal/0/checkpoint`.
     fn write_checkpoint(dir: &std::path::Path, lsn: u64) {
-        std::fs::write(
-            dir.join("wal").join("0").join("checkpoint"),
-            lsn.to_string(),
-        )
-        .unwrap();
+        std::fs::write(dir.join("wal").join("0").join("checkpoint"), lsn.to_string()).unwrap();
     }
 
     /// CRITICAL (C1): a stream whose ONLY post-`checkpoint_lsn` append is TORN —
@@ -660,10 +583,7 @@ mod tests {
         // The per-stream file as a crash left it: r1‖r2 (durable) + torn tail.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&st.file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&st.file_path).unwrap();
             f.write_all(r1).unwrap();
             f.write_all(r2).unwrap();
             f.write_all(r_torn).unwrap(); // un-acked torn page-cache tail
@@ -715,13 +635,7 @@ mod tests {
             expect,
             "recovered bytes are exactly the durable prefix r1‖r2"
         );
-        let st = store
-            .streams
-            .iter()
-            .find(|e| e.value().id == id)
-            .unwrap()
-            .value()
-            .clone();
+        let st = store.streams.iter().find(|e| e.value().id == id).unwrap().value().clone();
         assert_eq!(
             st.shared.read().unwrap().tail,
             durable_len as u64,
@@ -755,10 +669,7 @@ mod tests {
 
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&st.file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&st.file_path).unwrap();
             f.write_all(r1).unwrap();
             f.write_all(r_torn).unwrap(); // un-acked torn tail to be truncated
             f.sync_all().unwrap();
@@ -786,10 +697,7 @@ mod tests {
         let before = RECOVERY_FSYNCS.load(std::sync::atomic::Ordering::SeqCst);
         recover(&store, &wal).unwrap();
         let after = RECOVERY_FSYNCS.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            after > before,
-            "reconcile_tail must sync_data the repaired per-stream file (HIGH durability fix)"
-        );
+        assert!(after > before, "reconcile_tail must sync_data the repaired per-stream file (HIGH durability fix)");
         assert_eq!(
             std::fs::metadata(&st_file_path).unwrap().len() as usize,
             durable_len,
@@ -805,13 +713,7 @@ mod tests {
         let store2 = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let store2 = std::sync::Arc::new(store2);
         // (No store2.wal / no recover() call — pure on-disk observation.)
-        let st2 = store2
-            .streams
-            .iter()
-            .find(|e| e.value().id == id)
-            .unwrap()
-            .value()
-            .clone();
+        let st2 = store2.streams.iter().find(|e| e.value().id == id).unwrap().value().clone();
         assert_eq!(
             st2.shared.read().unwrap().tail,
             durable_len as u64,
@@ -862,10 +764,7 @@ mod tests {
         // torn r2 page-cache tail (its written prefix) past the durable frontier.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&st.file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&st.file_path).unwrap();
             f.write_all(r1).unwrap();
             f.write_all(&vec![0xCDu8; r2_written]).unwrap();
             f.sync_all().unwrap();
@@ -914,18 +813,8 @@ mod tests {
             durable_len,
             "file reconciled to the r1 durable frontier; torn checksummed r2 discarded"
         );
-        assert_eq!(
-            std::fs::read(&st_file_path).unwrap(),
-            r1,
-            "on-disk bytes are exactly r1 (no zero-padded torn r2)"
-        );
-        let st = store
-            .streams
-            .iter()
-            .find(|e| e.value().id == id)
-            .unwrap()
-            .value()
-            .clone();
+        assert_eq!(std::fs::read(&st_file_path).unwrap(), r1, "on-disk bytes are exactly r1 (no zero-padded torn r2)");
+        let st = store.streams.iter().find(|e| e.value().id == id).unwrap().value().clone();
         assert_eq!(
             st.shared.read().unwrap().tail,
             durable_len as u64,
@@ -935,9 +824,7 @@ mod tests {
 
     /// Drive a real shard so the committer makes records durable. Used by the 11b
     /// tests to checkpoint (recording per-stream durable tails) and roll/recycle.
-    fn spawn_committer(
-        shard: &std::sync::Arc<crate::wal::shard::Shard>,
-    ) -> crate::wal::shard::CommitterHandle {
+    fn spawn_committer(shard: &std::sync::Arc<crate::wal::shard::Shard>) -> crate::wal::shard::CommitterHandle {
         shard.spawn_committer()
     }
 
@@ -991,12 +878,8 @@ mod tests {
             x.shared.write().unwrap().tail = x_durable_len as u64;
         }
         shard.register_dirty(x_id, std::sync::Arc::clone(&x));
-        let l1 = shard
-            .reserve_and_stage(RecordKind::Append, x_id, 0, r1)
-            .unwrap();
-        let l2 = shard
-            .reserve_and_stage(RecordKind::Append, x_id, r1.len() as u64, r2)
-            .unwrap();
+        let l1 = shard.reserve_and_stage(RecordKind::Append, x_id, 0, r1).unwrap();
+        let l2 = shard.reserve_and_stage(RecordKind::Append, x_id, r1.len() as u64, r2).unwrap();
         let _ = l1;
         shard.wait_durable(l2).await;
 
@@ -1017,9 +900,7 @@ mod tests {
         let filler = vec![b'f'; 256];
         let mut last = l2;
         for i in 0..60u64 {
-            last = shard
-                .reserve_and_stage(RecordKind::Append, f_id, i * 256, &filler)
-                .unwrap();
+            last = shard.reserve_and_stage(RecordKind::Append, f_id, i * 256, &filler).unwrap();
         }
         shard.wait_durable(last).await;
 
@@ -1038,24 +919,17 @@ mod tests {
                 }
             })
             .unwrap();
-        assert_eq!(
-            x_records_in_wal, 0,
-            "X's WAL records were all recycled (no retained record for X)"
-        );
+        assert_eq!(x_records_in_wal, 0, "X's WAL records were all recycled (no retained record for X)");
 
         // Now simulate the un-acked post-checkpoint append: write a torn tail into
         // X's per-stream file past its durable boundary, then fsync the file (the
         // bytes reached disk but the append never acked).
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&x_file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&x_file_path).unwrap();
             // Position at the durable end, then append the torn bytes.
             use std::io::Seek;
-            f.seek(std::io::SeekFrom::Start(x_durable_len as u64))
-                .unwrap();
+            f.seek(std::io::SeekFrom::Start(x_durable_len as u64)).unwrap();
             f.write_all(r_torn).unwrap();
             f.sync_all().unwrap();
         }
@@ -1095,13 +969,7 @@ mod tests {
             expect,
             "X's bytes are exactly the durable prefix r1‖r2 (no torn JSON)"
         );
-        let x = store
-            .streams
-            .iter()
-            .find(|e| e.value().id == x_id)
-            .unwrap()
-            .value()
-            .clone();
+        let x = store.streams.iter().find(|e| e.value().id == x_id).unwrap().value().clone();
         assert_eq!(
             x.shared.read().unwrap().tail,
             x_durable_len as u64,
@@ -1150,18 +1018,11 @@ mod tests {
             x.shared.write().unwrap().tail = after_r2;
         }
         shard.register_dirty(x_id, std::sync::Arc::clone(&x));
-        shard
-            .reserve_and_stage(RecordKind::Append, x_id, 0, r1)
-            .unwrap();
-        let l2 = shard
-            .reserve_and_stage(RecordKind::Append, x_id, r1.len() as u64, r2)
-            .unwrap();
+        shard.reserve_and_stage(RecordKind::Append, x_id, 0, r1).unwrap();
+        let l2 = shard.reserve_and_stage(RecordKind::Append, x_id, r1.len() as u64, r2).unwrap();
         shard.wait_durable(l2).await;
         shard.checkpoint().await.unwrap();
-        assert_eq!(
-            shard.read_durable_tails().get(&x_id).copied(),
-            Some(after_r2)
-        );
+        assert_eq!(shard.read_durable_tails().get(&x_id).copied(), Some(after_r2));
 
         // r3 appended AFTER the checkpoint: durable in the WAL (RETAINED — its
         // segment is the active one, not recycled) and written to the file.
@@ -1171,19 +1032,14 @@ mod tests {
             (&*f).write_all(r3).unwrap();
             x.shared.write().unwrap().tail = after_r3;
         }
-        let l3 = shard
-            .reserve_and_stage(RecordKind::Append, x_id, after_r2, r3)
-            .unwrap();
+        let l3 = shard.reserve_and_stage(RecordKind::Append, x_id, after_r2, r3).unwrap();
         shard.wait_durable(l3).await;
         h.stop();
 
         // Torn page-cache tail past r3 (un-acked).
         {
             use std::io::{Seek, Write};
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&x_file_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().write(true).open(&x_file_path).unwrap();
             f.seek(std::io::SeekFrom::Start(after_r3)).unwrap();
             f.write_all(r_torn).unwrap();
             f.sync_all().unwrap();
@@ -1211,10 +1067,6 @@ mod tests {
         expect.extend_from_slice(r1);
         expect.extend_from_slice(r2);
         expect.extend_from_slice(r3);
-        assert_eq!(
-            std::fs::read(&x_file_path).unwrap(),
-            expect,
-            "bytes are r1‖r2‖r3"
-        );
+        assert_eq!(std::fs::read(&x_file_path).unwrap(), expect, "bytes are r1‖r2‖r3");
     }
 }

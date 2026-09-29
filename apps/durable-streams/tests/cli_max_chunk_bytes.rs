@@ -17,18 +17,11 @@ fn server() -> Command {
 /// deletes its tree on drop, so a panicking assertion cleans up too — a trailing
 /// `remove_dir_all` runs only when every assertion passed.
 fn tmp_dir(tag: &str) -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix(&format!("ds-test-max-chunk-{tag}-"))
-        .tempdir()
-        .expect("create test temp dir")
+    tempfile::Builder::new().prefix(&format!("ds-test-max-chunk-{tag}-")).tempdir().expect("create test temp dir")
 }
 
 fn unused_local_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("reserve test port")
-        .local_addr()
-        .unwrap()
-        .port()
+    TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port").local_addr().unwrap().port()
 }
 
 fn http_response(port: u16, request: &str) -> String {
@@ -41,9 +34,7 @@ fn http_response(port: u16, request: &str) -> String {
                 stream.read_to_end(&mut response).expect("read response");
                 return String::from_utf8_lossy(&response).into_owned();
             }
-            Err(_) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(25))
-            }
+            Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
             Err(error) => panic!("server did not listen: {error}"),
         }
     }
@@ -67,26 +58,16 @@ fn first_page_end(child: &mut Child, port: u16, payload_len: usize) -> u64 {
         ),
     );
     assert!(appended.contains(" 204"), "append: {appended}");
-    let read = http_response(
-        port,
-        "GET /chunked HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-    );
+    let read = http_response(port, "GET /chunked HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     let _ = child.kill();
     let _ = child.wait();
     let offset = read
         .lines()
         .find_map(|line| {
-            line.to_ascii_lowercase()
-                .strip_prefix("stream-next-offset:")
-                .map(|value| value.trim().to_string())
+            line.to_ascii_lowercase().strip_prefix("stream-next-offset:").map(|value| value.trim().to_string())
         })
         .unwrap_or_else(|| panic!("no Stream-Next-Offset in: {read}"));
-    offset
-        .rsplit('_')
-        .next()
-        .unwrap()
-        .parse()
-        .expect("numeric offset")
+    offset.rsplit('_').next().unwrap().parse().expect("numeric offset")
 }
 
 /// The environment fallback configures the cap when no flag is given.
@@ -116,13 +97,7 @@ fn flag_overrides_the_environment_fallback() {
     let dir = tmp_dir("flag-wins");
     let port = unused_local_port();
     let mut child = server()
-        .args([
-            "--durability",
-            "memory",
-            "--max-chunk-bytes",
-            "1024",
-            "--port",
-        ])
+        .args(["--durability", "memory", "--max-chunk-bytes", "1024", "--port"])
         .arg(port.to_string())
         .arg("--data-dir")
         .arg(dir.path())
@@ -132,11 +107,7 @@ fn flag_overrides_the_environment_fallback() {
         .spawn()
         .expect("spawn");
 
-    assert_eq!(
-        first_page_end(&mut child, port, 4000),
-        1024,
-        "the flag must win over DS_MAX_CHUNK_BYTES"
-    );
+    assert_eq!(first_page_end(&mut child, port, 4000), 1024, "the flag must win over DS_MAX_CHUNK_BYTES");
 }
 
 /// An unusable environment value is a misconfiguration, not something to ignore
@@ -154,8 +125,5 @@ fn invalid_env_value_refuses_to_start() {
 
     assert_eq!(out.status.code(), Some(2), "an invalid value must exit 2");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("DS_MAX_CHUNK_BYTES"),
-        "the refusal must name the variable that fixes it; got: {stderr}"
-    );
+    assert!(stderr.contains("DS_MAX_CHUNK_BYTES"), "the refusal must name the variable that fixes it; got: {stderr}");
 }
