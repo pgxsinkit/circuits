@@ -5,8 +5,9 @@
 # The build context is the repository root:
 #   podman build -f container/Containerfile.engine -t localhost/circuits-engine:dev .
 #
-# The engine speaks plain HTTP to the durable-streams server (reqwest is built with no TLS
-# backend), so the runtime image needs no OpenSSL — just certs-free debian slim.
+# The engine speaks plain HTTP to the durable-streams server, so the runtime image needs no OpenSSL
+# and no CA certificates — just debian slim. (reqwest does carry rustls, statically linked, because
+# dbsp's storage crate enables it; `ds::http_client` keeps the engine booting without CA roots.)
 
 # Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
 # builds use (and rustup has nothing to download).

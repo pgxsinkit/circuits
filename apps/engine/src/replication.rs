@@ -378,25 +378,27 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
         "" => user.clone(),
         s => percent_decode(s),
     };
-    Ok(ReplicationConfig {
-        host: u.host_str().unwrap_or("127.0.0.1").to_string(),
-        port: u.port().unwrap_or(5432),
+    // `ReplicationConfig` is `#[non_exhaustive]`, so it is built from `new` and the `with_*` setters.
+    // Everything not set here keeps the library's default: no stop LSN, text (not binary) tuples,
+    // no startup `options`.
+    Ok(ReplicationConfig::new(
+        u.host_str().unwrap_or("127.0.0.1"),
         user,
-        password: u.password().map(percent_decode).unwrap_or_default(),
+        u.password().map(percent_decode).unwrap_or_default(),
         database,
-        tls: TlsConfig::default(),
-        slot: slot.to_string(),
-        publication: publication.to_string(),
-        // 0/0: the server streams from the slot's confirmed_flush_lsn when asked for an older
-        // position, which is exactly "resume where we left off".
-        start_lsn: Lsn::ZERO,
-        stop_at_lsn: None,
-        // How often acknowledged progress is flushed to the server. Bounds the duplicate window
-        // after a reconnect (the tailer de-duplicates anyway).
-        status_interval: std::time::Duration::from_secs(1),
-        idle_wakeup_interval: std::time::Duration::from_secs(10),
-        buffer_events: 8192,
-    })
+        slot,
+        publication,
+    )
+    .with_port(u.port().unwrap_or(5432))
+    .with_tls(TlsConfig::default())
+    // 0/0: the server streams from the slot's confirmed_flush_lsn when asked for an older
+    // position, which is exactly "resume where we left off".
+    .with_start_lsn(Lsn::ZERO)
+    // How often acknowledged progress is flushed to the server. Bounds the duplicate window
+    // after a reconnect (the tailer de-duplicates anyway).
+    .with_status_interval(std::time::Duration::from_secs(1))
+    .with_wakeup_interval(std::time::Duration::from_secs(10))
+    .with_buffer_size(8192))
 }
 
 fn percent_decode(s: &str) -> String {

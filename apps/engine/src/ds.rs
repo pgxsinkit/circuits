@@ -356,9 +356,28 @@ struct HttpDurableStreamsStore {
     http: reqwest::Client,
 }
 
+/// The HTTP client the log-server adapter sends its requests with.
+///
+/// The engine speaks plain HTTP to the log server, but its reqwest carries rustls all the same:
+/// dbsp's storage crate (through `object_store`) enables it, and cargo builds one reqwest for the
+/// whole binary. Since reqwest 0.13, rustls loads the system's CA roots when a client is BUILT and
+/// refuses to build with none, so `reqwest::Client::new()` panics at boot on a host without a CA
+/// bundle — and the engine image is Debian slim without `ca-certificates`. There the client falls
+/// back to an empty root store: plain HTTP is unaffected, and an `https://` log-server URL fails its
+/// handshake when used, which is what it did on such a host before reqwest 0.13.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder().build().unwrap_or_else(|e| {
+        tracing::debug!("log-server HTTP client: no system CA roots ({e}); https would verify against none");
+        reqwest::Client::builder()
+            .tls_certs_only(Vec::<reqwest::Certificate>::new())
+            .build()
+            .expect("an HTTP client with an empty CA root store")
+    })
+}
+
 impl HttpDurableStreamsStore {
     fn new(base: String) -> Self {
-        Self { base, http: reqwest::Client::new() }
+        Self { base, http: http_client() }
     }
 
     fn stream_url(&self, path: &str) -> String {

@@ -33,31 +33,33 @@ feldera-macros = "0.357.0"
 # every `DBData` type needs since dbsp 0.357) for that crate's `OrderedFloat` only. rkyv_64
 # matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
 ordered-float = { version = "4.6.0", features = ["rkyv_64", "rkyv_ck"] }
-anyhow = "1"
+anyhow = "1.0.104"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
 # BroadcastStream adapter for the /trace SSE endpoint.
-tokio-stream = { version = "0.1", features = ["sync"] }
-axum = "0.8"
-# http to a localhost durable-streams server only -> no TLS backend needed.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-thiserror = "2"
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+axum = "0.8.9"
+# Plain HTTP to the durable-streams server. `rustls` is not for that: dbsp's storage crate enables
+# it on the same reqwest anyway, and `ds::http_client` needs its TLS API to build a client on a host
+# with no CA roots (naming the feature here makes that dependency explicit; the build is the same).
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+thiserror = "2.0.21"
 # Postgres source: logical-replication slot polling (test_decoding) + backfill queries.
 # with-serde_json-1 lets us read `to_jsonb(row)` straight into serde_json::Value.
-tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-memory-stats = "1"
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["metrics"] }
-opentelemetry-prometheus = "0.27"
-prometheus = "0.13"
-pgwire-replication = { version = "0.3.2", default-features = false, features = ["scram"] }
-url = "2"
-libc = "0.2.186"
+tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+memory-stats = "1.2.0"
+opentelemetry = "0.33.0"
+opentelemetry_sdk = { version = "0.33.0", features = ["metrics"] }
+opentelemetry-prometheus = "0.33.0"
+prometheus = "0.14.0"
+pgwire-replication = { version = "0.4.1", default-features = false, features = ["scram"] }
+url = "2.5.8"
+libc = "0.2.189"
 # Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): `FeedSet` holds each shape's feed
 # membership as a `HashMap<feed_id, RoaringBitmap>` keyed by `u32` pk-id — the delete gate is a
 # synchronous `remove()`-returns-`true` check, no longer an in-circuit relation. Already in the
@@ -67,4 +69,4 @@ roaring = "0.11.4"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the HTTP endpoint tests.
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }
