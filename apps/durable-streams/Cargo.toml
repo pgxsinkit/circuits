@@ -64,11 +64,11 @@ default = []
 # Enable OTLP span + metric export over gRPC (tonic). Endpoint/protocol/timeout
 # and sampling are configured entirely via the standard OTEL_* env vars.
 telemetry = [
-    "dep:opentelemetry",
-    "dep:opentelemetry_sdk",
-    "dep:opentelemetry-otlp",
-    "dep:opentelemetry-semantic-conventions",
-    "dep:tracing-opentelemetry",
+  "dep:opentelemetry",
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry-semantic-conventions",
+  "dep:tracing-opentelemetry",
 ]
 # S3-compatible cold-storage tier (--tier s3). Pulls in `object_store` with its
 # AWS/S3 transport, which works against any S3-compatible endpoint (AWS, R2,

@@ -1,15 +1,15 @@
 {
   "name": "@circuits/durable-streams",
   "version": "0.1.5",
+  "private": true,
   "description": "The Durable Streams protocol conformance suite, run against the Rust log server in this directory.",
   "license": "Apache-2.0",
-  "type": "module",
-  "private": true,
   "repository": {
     "type": "git",
     "url": "git+https://github.com/pgxsinkit/circuits.git",
     "directory": "apps/durable-streams"
   },
+  "type": "module",
   "scripts": {
     "test:conformance": "vitest run --config conformance/vitest.config.ts"
   },

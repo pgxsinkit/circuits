@@ -22,7 +22,7 @@ new query is an act of registration, not construction.
 
 ## 2. What a circuit is
 
-A **circuit** is a small, fixed set of generic, always-on dataflows — one per *kind* of query, not
+A **circuit** is a small, fixed set of generic, always-on dataflows — one per _kind_ of query, not
 one per query:
 
 - one for **membership** — which rows a user, tenant, or filter currently makes visible;
@@ -56,7 +56,7 @@ circuit structure:
   Stream**, ref-counted. The circuit does the work once and every subscriber rides the same
   Stream.
 
-So the circuit's size is fixed by the *kinds* of query your app runs — a handful — not by the
+So the circuit's size is fixed by the _kinds_ of query your app runs — a handful — not by the
 number of live queries, parameters, or users running through it, which can be unbounded. Add a
 whole new user, a whole new parameter, a whole new live query of a kind the circuit already knows,
 and nothing new gets built: it's data flowing through a dataflow that's already there.
@@ -65,7 +65,7 @@ and nothing new gets built: it's data flowing through a dataflow that's already 
 
 A circuit holds only what's shared and small: the distinct values that decide membership, and a
 live count per group. It does not hold your rows. Rows stay in Postgres — the circuit decides
-*what changed for whom* and streams the difference.
+_what changed for whom_ and streams the difference.
 
 Take the per-user visibility case: the membership circuit maintains, per user, the small set of
 keys (project ids, say) that decide what that user can see — not the issues themselves. When that
@@ -73,8 +73,8 @@ set changes for a user — a membership row is added or removed and a key flips 
 set — the engine does **one pooled query-back to Postgres** to fetch the rows now entering or
 leaving that user's scope, and emits exactly those as upserts or deletes on the user's Stream.
 
-That's a deliberate design choice: the circuit only ever reaches into Postgres for the *inner* side
-of a membership check (the small set of keys), never to materialize the *outer* side (the
+That's a deliberate design choice: the circuit only ever reaches into Postgres for the _inner_ side
+of a membership check (the small set of keys), never to materialize the _outer_ side (the
 potentially large set of rows those keys select). Rows are fetched on demand, in a pooled batch,
 only for what just changed — never held speculatively, never duplicated per subscriber.
 
@@ -105,7 +105,7 @@ new parameter, a brand-new predicate the circuit has never seen, and it's served
 redeploy required.
 
 Aggregation is the one place where that isn't the whole story yet. The aggregation circuit is
-real and generic in the same sense as the others — one dataflow per aggregate *family*, shared
+real and generic in the same sense as the others — one dataflow per aggregate _family_, shared
 across every query of that kind — but today, which groupings it maintains is **configured per
 deployment**, not discovered on the fly from whatever queries your app happens to run. A live
 count you didn't configure ahead of time still works, just outside the circuit's fast path, and

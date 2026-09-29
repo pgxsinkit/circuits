@@ -1,23 +1,23 @@
 {
   "name": "@circuits/conformance",
-  "description": "End-to-end conformance suite: asserts the real stack (Postgres, engine, wire protocol) agrees with the oracle on every shape.",
   "version": "0.0.0",
   "private": true,
+  "description": "End-to-end conformance suite: asserts the real stack (Postgres, engine, wire protocol) agrees with the oracle on every shape.",
   "type": "module",
   "scripts": {
     "test": "vitest run"
   },
   "dependencies": {
-    "@circuits/protocol": "workspace:*",
-    "@circuits/oracle": "workspace:*",
     "@circuits/api": "workspace:*",
     "@circuits/client": "workspace:*",
     "@circuits/ds-rust": "workspace:*",
+    "@circuits/oracle": "workspace:*",
+    "@circuits/protocol": "workspace:*",
     "@durable-streams/client": "0.2.6",
     "@durable-streams/state": "0.3.1",
-    "@tanstack/db": "0.6.12",
     "@electric-sql/pglite": "0.5.3",
     "@faker-js/faker": "10.5.0",
+    "@tanstack/db": "0.6.12",
     "@trpc/client": "11.18.0",
     "pg": "8.22.0",
     "zod": "4.4.3"

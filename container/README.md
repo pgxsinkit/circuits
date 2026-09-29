@@ -3,9 +3,9 @@
 Two images, one per program. Both are built with the repository root as the build context, because
 the engine and the log server are members of one Cargo workspace.
 
-| Image | Build file | Program | Port |
-|---|---|---|---|
-| `ghcr.io/pgxsinkit/circuits/engine` | `container/Containerfile.engine` | the engine | 7010 |
+| Image                                        | Build file                                | Program        | Port |
+| -------------------------------------------- | ----------------------------------------- | -------------- | ---- |
+| `ghcr.io/pgxsinkit/circuits/engine`          | `container/Containerfile.engine`          | the engine     | 7010 |
 | `ghcr.io/pgxsinkit/circuits/durable-streams` | `container/Containerfile.durable-streams` | the log server | 4437 |
 
 ```bash
@@ -21,10 +21,10 @@ engine with cargo's default release profile.
 
 `.github/workflows/images.yml` publishes both from one commit, with the same tags:
 
-| Trigger | Tags |
-|---|---|
-| push to `develop` | `sha-<short sha>`, `dev` |
-| semver tag | `<tag>`, `latest`, `sha-<short sha>` |
+| Trigger           | Tags                                 |
+| ----------------- | ------------------------------------ |
+| push to `develop` | `sha-<short sha>`, `dev`             |
+| semver tag        | `<tag>`, `latest`, `sha-<short sha>` |
 
 Pin the pair with one value, for example `sha-0123abc` for both.
 
@@ -34,12 +34,12 @@ The engine is configured through `CIRCUITS_*` environment variables; the full li
 [apps/engine/README.md](../apps/engine/README.md) and
 [docs/deployment-postgres.md](../docs/deployment-postgres.md). The ones every deployment sets:
 
-| Variable | Meaning |
-|---|---|
-| `CIRCUITS_DS_URL` | the log server's URL, as the engine reaches it |
-| `CIRCUITS_PG_URL` | the Postgres connection string |
-| `CIRCUITS_PG_TABLES` | the tables to ingest |
-| `CIRCUITS_BIND` | the address the control plane listens on (the image defaults to `0.0.0.0:7010`) |
+| Variable             | Meaning                                                                         |
+| -------------------- | ------------------------------------------------------------------------------- |
+| `CIRCUITS_DS_URL`    | the log server's URL, as the engine reaches it                                  |
+| `CIRCUITS_PG_URL`    | the Postgres connection string                                                  |
+| `CIRCUITS_PG_TABLES` | the tables to ingest                                                            |
+| `CIRCUITS_BIND`      | the address the control plane listens on (the image defaults to `0.0.0.0:7010`) |
 
 The replication slot is `circuits` unless `CIRCUITS_PG_SLOT` names another. The engine introspects
 its tables at start-up: create them first, or restart the engine after a migration.

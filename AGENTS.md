@@ -15,17 +15,17 @@ compatibility with Electric.
 
 ## Layout
 
-| Path | What |
-|---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `sql.rs` (predicate → SQL), `ds.rs` (streams client incl. `append_reliable`). |
-| `apps/durable-streams` | The log server (crate `durable-streams`, binary `durable-streams-server`): `store.rs` the stream store, `wal/` the group-commit write-ahead log, `handlers.rs` the protocol, `http1.rs` + `engine_raw.rs` + `sse_reactor.rs` its own HTTP serving. `conformance/` runs the Durable Streams protocol suite against it. |
-| `apps/api` | tRPC API (`router.ts`) over the engine + the log server (`core.ts`). The test harness drives the engine through it. |
-| `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
-| `packages/client` | The harness client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
-| `packages/conformance` | The real test suite — engine vs oracle, incl. live replication, fuzz, NULLs, concurrency, shape sharing. |
-| `packages/oracle` | Reference implementation shapes are checked against. |
-| `packages/ds-rust` | Starts the log server built in this workspace for a test (one process, fresh data directory and port per test). |
-| `container/` | The two image builds: `Containerfile.engine`, `Containerfile.durable-streams`. |
+| Path                   | What                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/engine`          | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `sql.rs` (predicate → SQL), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/durable-streams` | The log server (crate `durable-streams`, binary `durable-streams-server`): `store.rs` the stream store, `wal/` the group-commit write-ahead log, `handlers.rs` the protocol, `http1.rs` + `engine_raw.rs` + `sse_reactor.rs` its own HTTP serving. `conformance/` runs the Durable Streams protocol suite against it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `apps/api`             | tRPC API (`router.ts`) over the engine + the log server (`core.ts`). The test harness drives the engine through it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `packages/protocol`    | Shared types + the change-event envelope (`types.ts`, `envelope.ts`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `packages/client`      | The harness client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `packages/conformance` | The real test suite — engine vs oracle, incl. live replication, fuzz, NULLs, concurrency, shape sharing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `packages/oracle`      | Reference implementation shapes are checked against.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `packages/ds-rust`     | Starts the log server built in this workspace for a test (one process, fresh data directory and port per test).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `container/`           | The two image builds: `Containerfile.engine`, `Containerfile.durable-streams`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 ## Docs (read these before designing)
 
@@ -47,10 +47,10 @@ compatibility with Electric.
 
 The load-bearing mental model: **pipelines are few and fixed; shapes are many and dynamic —
 and the fan-out between them lives outside the circuit.** A pipeline's output is keyed by
-*cohort groups* (project, (project, status), aggregate group, …). A shape is a selection or
+_cohort groups_ (project, (project, status), aggregate group, …). A shape is a selection or
 union over those groups, materialized as a per-shape stream at the delivery edge. Shape
 cardinality can vastly exceed pipeline cardinality: a subquery shape filtering issues exists
-per *combination* of projects a client asks for, yet every combination is fed from the same
+per _combination_ of projects a client asks for, yet every combination is fed from the same
 `issues_by_project` pipeline — the circuit never grows with shape count, only the routing
 table does. If a design makes the circuit's structure scale with shapes, users, or parameter
 combinations, it is wrong (the circuit-per-shape trap: structure must never scale with
@@ -58,7 +58,7 @@ subscriptions).
 
 The recipe for capturing an app's query set in one circuit:
 
-1. **Enumerate call sites → collapse to templates.** Parameters become *data* (keys in the
+1. **Enumerate call sites → collapse to templates.** Parameters become _data_ (keys in the
    output index, rows in an input relation) — never circuit structure.
 2. **Find the access cohort** (in an issue tracker: the project) and key every pipeline output by it,
    never by user or shape. Per-shape work happens only at the fan-out edge: a shape = the set
@@ -142,7 +142,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
 
 - **Postgres is the system of record; the engine's hot path holds no table copy.** Backfills read
   matching rows in a `REPEATABLE READ` snapshot. (The always-on circuit tier
-  holds disk-spillable *derived* state — table arrangements + counts pipelines — rebuildable,
+  holds disk-spillable _derived_ state — table arrangements + counts pipelines — rebuildable,
   with Postgres fallback for lookups, never the record of truth; see `ARCHITECTURE.md` §6b.)
 - **Backfill↔live is fenced by xid visibility, NOT by LSN.** Every seeded structure carries a
   `pg::SnapshotGate` (from `pg_current_snapshot()`); a replicated change is skipped iff its xid was
@@ -154,7 +154,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   weights are NOT idempotent under duplicates — never bypass the highwater.
 - **Live shape appends must not drop, and a registered shape's batch is never advanced past without
   either LANDING it or RETIRING the shape.** Use `ds.append_reliable` (retry/backoff). A terminal
-  answer — 404/410/`stream-closed` — is *reconciled*, never taken on trust: `append_reliable` asks
+  answer — 404/410/`stream-closed` — is _reconciled_, never taken on trust: `append_reliable` asks
   the engine (`Engine::reconcile_gone_shape_stream`, installed on the `DsClient` at construction),
   which retries when the shape is still registered AND `HEAD` finds its stream (the 404 was a proxy's,
   not storage's), and otherwise retires the shape (`Dropped` + close-then-delete + deregister) before
@@ -215,7 +215,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   re-delivery cannot become an exit loop. Never serve stale: no additive tolerance, no whole-engine
   reset.
 - **The replication slot is bound to a catalog epoch** (ADR 0004; `engine/epoch.rs`). A `SlotBound
-  { system_identifier, timeline_id, slot }` record in the durable catalog names the epoch every shape
+{ system_identifier, timeline_id, slot }` record in the durable catalog names the epoch every shape
   belongs to, and the slot is verified against it before **every** connection — boot and each ingestor
   reconnect. Slot gone, `wal_status = 'lost'`, foreign output plugin, or a different cluster
   `system_identifier` = **epoch break**: the gap cannot be filled, so either every shape is retired
@@ -251,7 +251,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).
-- **The catalog writer never drops an event, and the two records a client is *promised* are durable
+- **The catalog writer never drops an event, and the two records a client is _promised_ are durable
   before it is answered** (`engine/catalog.rs`). A failed append is classified with
   `ds::is_unavailable`: transport/timeout/5xx retries THAT event in place, forever, with backoff
   (100 ms → 5 s) — the queue is ordered and single-consumer, so everything behind it waits, which is
@@ -303,10 +303,10 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   succeeds), backfill alongside rows the new predicate never matched, and then let the pending
   retirement close and delete the LIVE shape's stream — leaving a registered shape whose every append
   is `Gone`.
-- **Subqueries: emit outer membership *absolutely*** — per touched pk, `upsert` if the row matches
-  *now* else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
+- **Subqueries: emit outer membership _absolutely_** — per touched pk, `upsert` if the row matches
+  _now_ else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
   (out of commit order relative to the sequencer), so delta-based emission would miss move-outs.
-  Symptom when wrong: op-by-op converges, *batched* mutations diverge.
+  Symptom when wrong: op-by-op converges, _batched_ mutations diverge.
 - **NULL flips re-derive any dependent whose `IN` leaf is negated OR under a `Not{…}`** (edge
   `null_sensitive`). Plain-`IN` dependents can't change (monotonicity over FALSE<UNKNOWN<TRUE).
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
@@ -348,13 +348,13 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   `CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide
   the table. A plain shape appends each chunk to its still-pending stream; an aggregate folds each
   chunk into an `AggSeed` (via the same `fold_agg_row` the live path uses) and drops the rows. The
-  ONLY legitimate `BackfillReader::collect` callers are the ones whose *result* is an in-memory set
+  ONLY legitimate `BackfillReader::collect` callers are the ones whose _result_ is an in-memory set
   with nothing to stream it to — a subquery inner-set node's seed, a membership query-back's
   candidate rows. If you add a backfill site, take chunks; if you find yourself building a
   `Vec<Row>` of a whole table, that is the bug.
 - **`SIGTERM` drains; it never retires anything** (`src/shutdown.rs`). Order: `/ready` → 503
   `shutting_down` FIRST (so a load balancer drains) and the port stays open for the drain window;
-  stop accepting; the ingestor completes a commit it is *appending* and records its position
+  stop accepting; the ingestor completes a commit it is _appending_ and records its position
   LOCALLY — the wire ack rides the replication client's status interval (1 s) and is not forced on
   the way out, so the last second's commits are re-delivered and de-duplicated by the sequencer
   highwater; mid-transaction it just stops, having appended nothing. **Shutdown never advances the
@@ -366,7 +366,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   a task that must reach a safe point, register a `party`.
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
-  offset captured *before* the page snapshot.
+  offset captured _before_ the page snapshot.
 - **Aggregations follow SQL NULL semantics** (ignore NULLs; `COUNT(col)` = non-NULLs; empty
   SUM/AVG/MIN/MAX = NULL).
 - Branch before committing if on the default branch.
@@ -391,14 +391,14 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   the byte-identity above). The slot is `pgoutput`-plugin; a publication `<slot>_pub` (FOR ALL
   TABLES, needs superuser) is created at setup.
 - **Read raw stream envelopes, not stream-db's reconciled view, when you need every delta.** A
-  subset's live feed must apply *move-outs*; stream-db no-ops a delete for a key it never inserted.
+  subset's live feed must apply _move-outs_; stream-db no-ops a delete for a key it never inserted.
   (`packages/client/subset.ts` reads raw `StreamEnvelope`s.)
 - **Deletes must leave tombstones across the page/live seam.** An in-flight `loadMore` whose
   snapshot predates a delete would resurrect the row (or insert a ghost for a never-seen pk) unless
   the per-pk watermark survives the delete. (`subset.ts` keeps LSN tombstones, pruned when no page
   is in flight.)
 - **Shape rows stringify the primary key** (TanStack DB keys are strings); non-pk ints stay numbers
-  *unless they exceed 2^53* (see below). Normalize ids when cross-referencing shape rows against
+  _unless they exceed 2^53_ (see below). Normalize ids when cross-referencing shape rows against
   query-back rows.
 - **The envelope `key` must be an injective encoding of the primary-key tuple.** Single-column keys
   are the bare value string; composite keys escape each component (`\` → `\\`, U+001F → `\x1f`) before

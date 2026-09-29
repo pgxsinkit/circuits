@@ -19,161 +19,161 @@
 //      would trip the same 1 ms timeout and prove nothing.);
 //   3. unset (the default), the same create works.
 
-import type { Row, Schema } from '@circuits/protocol'
-import { afterEach, describe, expect, it } from 'vitest'
-import { bootHarness, type BootOptions, drainEngine, type Harness } from './harness.js'
-import { foldStream, pgQuery, waitFor } from './engine-native.js'
+import type { Row, Schema } from "@circuits/protocol";
+import { afterEach, describe, expect, it } from "vitest";
+
+import { foldStream, pgQuery, waitFor } from "./engine-native.js";
+import { bootHarness, type BootOptions, drainEngine, type Harness } from "./harness.js";
 
 const schema: Schema = {
   tables: {
     items: {
-      columns: { id: { type: 'int' }, n: { type: 'int' }, label: { type: 'text' } },
-      primaryKey: 'id',
+      columns: { id: { type: "int" }, n: { type: "int" }, label: { type: "text" } },
+      primaryKey: "id",
     },
   },
-}
+};
 
 /** Enough rows that a 64 KiB append budget is crossed many times over. */
-const ROWS = 20000
+const ROWS = 20000;
 
-const matchAll = { col: 'n', op: 'gte', value: 0 }
+const matchAll = { col: "n", op: "gte", value: 0 };
 
-let h: Harness | undefined
+let h: Harness | undefined;
 afterEach(async () => {
-  await h?.shutdown()
-  h = undefined
-})
+  await h?.shutdown();
+  h = undefined;
+});
 
 async function boot(opts: BootOptions = {}): Promise<Harness> {
-  h = await bootHarness(schema, opts)
-  return h
+  h = await bootHarness(schema, opts);
+  return h;
 }
 
-const pg = (sql: string, params: unknown[] = []) => pgQuery(h!, sql, params)
+const pg = (sql: string, params: unknown[] = []) => pgQuery(h!, sql, params);
 
 async function seedRows(): Promise<void> {
   await pg(`INSERT INTO items (id, n, label) SELECT g, g, 'label-for-row-' || g FROM generate_series(1, $1) AS g`, [
     ROWS,
-  ])
+  ]);
 }
 
 interface ShapeResp {
-  shapeId: string
-  streamPath: string
-  streamUrl: string
+  shapeId: string;
+  streamPath: string;
+  streamUrl: string;
 }
 
 async function createShapeRaw(body: unknown): Promise<{ ok: boolean; status: number; text: string }> {
   const res = await fetch(`${h!.engineUrl}/shapes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  })
-  return { ok: res.ok, status: res.status, text: await res.text() }
+  });
+  return { ok: res.ok, status: res.status, text: await res.text() };
 }
 
 async function createShape(body: unknown): Promise<ShapeResp> {
-  const r = await createShapeRaw(body)
-  if (!r.ok) throw new Error(`POST /shapes -> ${r.status} ${r.text}`)
-  return JSON.parse(r.text) as ShapeResp
+  const r = await createShapeRaw(body);
+  if (!r.ok) throw new Error(`POST /shapes -> ${r.status} ${r.text}`);
+  return JSON.parse(r.text) as ShapeResp;
 }
 
 async function counter(name: string): Promise<number> {
-  const res = await fetch(`${h!.engineUrl}/metrics`)
-  if (!res.ok) throw new Error(`GET /metrics -> ${res.status}`)
-  return Number(((await res.json()) as { counters: Record<string, number> }).counters[name] ?? 0)
+  const res = await fetch(`${h!.engineUrl}/metrics`);
+  if (!res.ok) throw new Error(`GET /metrics -> ${res.status}`);
+  return Number(((await res.json()) as { counters: Record<string, number> }).counters[name] ?? 0);
 }
 
 async function readyStatus(): Promise<{ code: number; status: string }> {
-  const res = await fetch(`${h!.engineUrl}/ready`)
-  return { code: res.status, status: ((await res.json()) as { status: string }).status }
+  const res = await fetch(`${h!.engineUrl}/ready`);
+  return { code: res.status, status: ((await res.json()) as { status: string }).status };
 }
 
-describe('streamed backfills', () => {
-  it('writes a large snapshot in several appends and still equals Postgres', async () => {
-    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
-    await seedRows()
+describe("streamed backfills", () => {
+  it("writes a large snapshot in several appends and still equals Postgres", async () => {
+    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: "65536" } });
+    await seedRows();
 
     // The stream's offset must advance in STEPS while the create runs — proof that the snapshot
     // reached storage progressively rather than in one body at the end.
-    const before = await counter('backfill_chunked_appends_total')
-    const shape = await createShape({ table: 'items', where: matchAll })
-    const after = await counter('backfill_chunked_appends_total')
+    const before = await counter("backfill_chunked_appends_total");
+    const shape = await createShape({ table: "items", where: matchAll });
+    const after = await counter("backfill_chunked_appends_total");
     // A lower bound from the data, not a token "> 1": each row's envelope carries its key, its id,
     // its n and a `label-for-row-N` string — comfortably over 60 bytes serialized — so 20k rows is
     // >1.2 MB and a 64 KiB budget cannot cover it in fewer than ~18 appends. Anything much below
     // that would mean the budget is not really bounding the bodies.
-    expect(
-      after - before,
-      'a 20k-row snapshot under a 64 KiB budget must take many appends, not one',
-    ).toBeGreaterThan(10)
+    expect(after - before, "a 20k-row snapshot under a 64 KiB budget must take many appends, not one").toBeGreaterThan(
+      10,
+    );
 
-    const rows = await foldStream(shape.streamUrl)
-    expect(rows.size).toBe(ROWS)
-    const oracle = (await pg('SELECT id, n, label FROM items ORDER BY id')) as Row[]
-    expect(oracle.length).toBe(ROWS)
+    const rows = await foldStream(shape.streamUrl);
+    expect(rows.size).toBe(ROWS);
+    const oracle = (await pg("SELECT id, n, label FROM items ORDER BY id")) as Row[];
+    expect(oracle.length).toBe(ROWS);
     for (const r of oracle) {
-      expect(rows.get(String(r.id))).toMatchObject({ id: r.id, n: r.n, label: r.label })
+      expect(rows.get(String(r.id))).toMatchObject({ id: r.id, n: r.n, label: r.label });
     }
 
     // Chunking must not have cost the engine its health.
-    expect(await readyStatus()).toEqual({ code: 200, status: 'active' })
+    expect(await readyStatus()).toEqual({ code: 200, status: "active" });
 
     // The same counter must be on the Prometheus exposition, not only the JSON one: /metrics/prometheus
     // used to carry the memory/cardinality gauges alone, which made it half a scrape target.
-    const prom = await (await fetch(`${h!.engineUrl}/metrics/prometheus`)).text()
-    const value = (name: string) => Number(prom.match(new RegExp(`^${name}\\{[^}]*\\} (\\S+)`, 'm'))?.[1] ?? NaN)
-    expect(value('engine_backfill_chunked_appends_total')).toBe(after)
+    const prom = await (await fetch(`${h!.engineUrl}/metrics/prometheus`)).text();
+    const value = (name: string) => Number(prom.match(new RegExp(`^${name}\\{[^}]*\\} (\\S+)`, "m"))?.[1] ?? NaN);
+    expect(value("engine_backfill_chunked_appends_total")).toBe(after);
     // ...along with the ops gauges this slice added.
-    expect(value('engine_sequencer_held_run')).toBe(0)
-    expect(value('engine_shutdown_in_progress')).toBe(0)
-    expect(prom).toMatch(/^engine_replication_slot_retained_wal_bytes\{/m)
-    expect(prom).toMatch(/^engine_replication_confirmed_flush_lag_bytes\{/m)
-    expect(prom).toMatch(/^engine_replication_slot_active\{/m)
-  })
+    expect(value("engine_sequencer_held_run")).toBe(0);
+    expect(value("engine_shutdown_in_progress")).toBe(0);
+    expect(prom).toMatch(/^engine_replication_slot_retained_wal_bytes\{/m);
+    expect(prom).toMatch(/^engine_replication_confirmed_flush_lag_bytes\{/m);
+    expect(prom).toMatch(/^engine_replication_slot_active\{/m);
+  });
 
-  it('a 1ms statement timeout fails that create with a clear error and leaves the engine healthy', async () => {
+  it("a 1ms statement timeout fails that create with a clear error and leaves the engine healthy", async () => {
     await boot({
       engineEnv: {
-        CIRCUITS_BACKFILL_APPEND_BYTES: '65536',
-        CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS: '1',
+        CIRCUITS_BACKFILL_APPEND_BYTES: "65536",
+        CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS: "1",
       },
-    })
-    await seedRows()
+    });
+    await seedRows();
 
-    const r = await createShapeRaw({ table: 'items', where: matchAll })
-    expect(r.ok, `expected the create to fail under a 1ms statement timeout, got ${r.status} ${r.text}`).toBe(false)
+    const r = await createShapeRaw({ table: "items", where: matchAll });
+    expect(r.ok, `expected the create to fail under a 1ms statement timeout, got ${r.status} ${r.text}`).toBe(false);
     // Postgres's own words, carried through: "canceling statement due to statement timeout".
-    expect(r.text.toLowerCase()).toContain('statement timeout')
+    expect(r.text.toLowerCase()).toContain("statement timeout");
 
     // Nothing was retired and nothing was purged — and that has to be shown against the ENGINE.
     // (Asking Postgres whether a row landed says nothing at all about the engine: Postgres would
     // answer that with the engine dead.)
     //
     // 1. it is still ready;
-    expect(await readyStatus()).toEqual({ code: 200, status: 'active' })
+    expect(await readyStatus()).toEqual({ code: 200, status: "active" });
     // 2. the ingest path still carries a write end to end — `drainEngine` bumps the sentinel row
     //    and waits for the ENGINE to report having processed it, so it exercises the walsender, the
     //    ingestor, the change log and the sequencer;
-    await drainEngine(h!)
+    await drainEngine(h!);
     // 3. and a shape created after the failure still receives changes. It has to be a `changesOnly`
     //    feed: the 1 ms guard is process-wide, so anything that takes a backfill would trip the
     //    same timeout, and the point here is the engine's health, not the guard a second time.
-    const live = await createShape({ table: 'items', where: matchAll, changesOnly: true })
-    await pg('INSERT INTO items (id, n, label) VALUES ($1, 1, $2)', [ROWS + 1, 'after-the-timeout'])
+    const live = await createShape({ table: "items", where: matchAll, changesOnly: true });
+    await pg("INSERT INTO items (id, n, label) VALUES ($1, 1, $2)", [ROWS + 1, "after-the-timeout"]);
     await waitFor(
       async () => (await foldStream(live.streamUrl)).has(String(ROWS + 1)),
-      'a write after a timed-out backfill to reach a shape the engine created afterwards',
-    )
+      "a write after a timed-out backfill to reach a shape the engine created afterwards",
+    );
     expect((await foldStream(live.streamUrl)).get(String(ROWS + 1))).toMatchObject({
-      label: 'after-the-timeout',
-    })
-  })
+      label: "after-the-timeout",
+    });
+  });
 
-  it('the same create works with the guard unset (the default)', async () => {
-    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
-    await seedRows()
-    const shape = await createShape({ table: 'items', where: matchAll })
-    expect((await foldStream(shape.streamUrl)).size).toBe(ROWS)
-  })
-})
+  it("the same create works with the guard unset (the default)", async () => {
+    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: "65536" } });
+    await seedRows();
+    const shape = await createShape({ table: "items", where: matchAll });
+    expect((await foldStream(shape.streamUrl)).size).toBe(ROWS);
+  });
+});

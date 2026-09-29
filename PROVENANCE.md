@@ -5,21 +5,21 @@ started and no longer maintains. It is maintained here, and tracks neither.
 
 ## The engine (`apps/engine`, and the test harness in `packages/` and `apps/api`)
 
-| | |
-|---|---|
-| Came from | `pgxsinkit/electric-circuits` at `64ebd28c39056744a07e5a258c7163a5d5cbc042` |
+|              |                                                                                             |
+| ------------ | ------------------------------------------------------------------------------------------- |
+| Came from    | `pgxsinkit/electric-circuits` at `64ebd28c39056744a07e5a258c7163a5d5cbc042`                 |
 | Which forked | `electric-sql/electric-circuits` at `b784aaf83b4951215ef58cfdb56660c496b9cf43` (2026-07-23) |
-| Licence | MIT or Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) |
+| Licence      | MIT or Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`)                                         |
 
 The history up to `64ebd28` is that repository's, unchanged: upstream's commits, then 47 of ours.
 
 ## The log server (`apps/durable-streams`)
 
-| | |
-|---|---|
-| Came from | `pgxsinkit/durable-streams-rust` at `ab1a84bad9d4d34912db3f4bedea19f5e79b1bba` |
+|                          |                                                                                                             |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Came from                | `pgxsinkit/durable-streams-rust` at `ab1a84bad9d4d34912db3f4bedea19f5e79b1bba`                              |
 | Which was extracted from | `electric-sql/electric` at `dc07a1e6c8ff459b59ce407cdb6bf2f7fd068f36`, path `packages/durable-streams-rust` |
-| Licence | Apache-2.0 (`apps/durable-streams/LICENSE`, `apps/durable-streams/NOTICE`) |
+| Licence                  | Apache-2.0 (`apps/durable-streams/LICENSE`, `apps/durable-streams/NOTICE`)                                  |
 
 Its 30 commits were replayed on top of the engine's history, each with its files placed under
 `apps/durable-streams/`. Authors and author dates are the originals. Each replayed commit names the

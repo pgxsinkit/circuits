@@ -49,14 +49,14 @@ A capped page:
   walks forward in cap-sized windows so an oversize value is located without
   re-reading what it already scanned.
 - reports the aligned end as `Stream-Next-Offset`, omits `Stream-Up-To-Date`, and
-  omits `Stream-Closed` (a closed stream is closed *to the reader* only once the
+  omits `Stream-Closed` (a closed stream is closed _to the reader_ only once the
   page that reaches the tail is delivered). The `ETag` covers the range actually
   returned, so a partial page and a later full-tail page never share a validator.
 
 Two invariants the cut depends on:
 
 - **A read range starts on a value boundary.** Server-minted offsets, tier cuts
-  and fork points all do. `Stream-Fork-Sub-Offset` counts *messages*, so it is
+  and fork points all do. `Stream-Fork-Sub-Offset` counts _messages_, so it is
   resolved with the same top-level value scanner rather than by counting raw
   commas — a comma inside a string or a nested array is not a message boundary,
   and a fork point placed inside a value would make every later read of that

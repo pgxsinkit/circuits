@@ -9,7 +9,7 @@
  * `int` covers Postgres `bigint`, whose range exceeds what a JSON number survives in JavaScript, so
  * an `int` cell is `number | string` on the wire — see {@link Value}.
  */
-export type ColumnType = 'int' | 'text' | 'bool' | 'float'
+export type ColumnType = "int" | "text" | "bool" | "float";
 
 /**
  * A scalar cell value. `null` is permitted for absent values.
@@ -21,34 +21,34 @@ export type ColumnType = 'int' | 'text' | 'bool' | 'float'
  * and MIN/MAX over an int column (`docs/ARCHITECTURE.md` §2). Use `BigInt(v)` for arithmetic at that
  * scale; `String(v)` is always the exact decimal, whichever form arrived.
  */
-export type Value = number | string | boolean | null
+export type Value = number | string | boolean | null;
 
 export interface ColumnDef {
-  type: ColumnType
+  type: ColumnType;
 }
 
 export interface TableDef {
-  columns: Record<string, ColumnDef>
+  columns: Record<string, ColumnDef>;
   /** Name of the primary-key column. Must be a key of `columns`. */
-  primaryKey: string
+  primaryKey: string;
 }
 
 export interface Schema {
-  tables: Record<string, TableDef>
+  tables: Record<string, TableDef>;
 }
 
 /** A row is a flat record of column name -> value. */
-export type Row = Record<string, Value>
+export type Row = Record<string, Value>;
 
 // --- Predicate AST -----------------------------------------------------------
 
 /** Comparison operators for a leaf predicate. */
-export type LeafOp = 'eq' | 'neq' | 'lt' | 'lte' | 'gt' | 'gte'
+export type LeafOp = "eq" | "neq" | "lt" | "lte" | "gt" | "gte";
 
 export interface LeafPredicate {
-  col: string
-  op: LeafOp
-  value: Value
+  col: string;
+  op: LeafOp;
+  value: Value;
 }
 
 /**
@@ -57,20 +57,20 @@ export interface LeafPredicate {
  * under three-valued logic. Two-valued (never UNKNOWN), so it composes soundly under `not`.
  */
 export interface IsNullPredicate {
-  col: string
-  isNull: boolean
+  col: string;
+  isNull: boolean;
 }
 
 export interface AndPredicate {
-  and: Predicate[]
+  and: Predicate[];
 }
 
 export interface OrPredicate {
-  or: Predicate[]
+  or: Predicate[];
 }
 
 export interface NotPredicate {
-  not: Predicate
+  not: Predicate;
 }
 
 /**
@@ -79,9 +79,9 @@ export interface NotPredicate {
  * composite `(a,b) IN (…)` is out of scope.
  */
 export interface SubqueryRef {
-  table: string
-  project: string
-  where?: Predicate
+  table: string;
+  project: string;
+  where?: Predicate;
 }
 
 /**
@@ -90,9 +90,9 @@ export interface SubqueryRef {
  * referencing the same subquery). `col` references the *outer* table; `in.project`/`in.where` the inner.
  */
 export interface InSubqueryPredicate {
-  col: string
-  in: SubqueryRef
-  negated?: boolean
+  col: string;
+  in: SubqueryRef;
+  negated?: boolean;
 }
 
 /**
@@ -105,62 +105,62 @@ export type Predicate =
   | AndPredicate
   | OrPredicate
   | NotPredicate
-  | InSubqueryPredicate
+  | InSubqueryPredicate;
 
 export function isLeaf(p: Predicate): p is LeafPredicate {
-  return 'col' in p && 'op' in p
+  return "col" in p && "op" in p;
 }
 export function isIsNull(p: Predicate): p is IsNullPredicate {
-  return 'col' in p && 'isNull' in p
+  return "col" in p && "isNull" in p;
 }
 export function isAnd(p: Predicate): p is AndPredicate {
-  return 'and' in p
+  return "and" in p;
 }
 export function isOr(p: Predicate): p is OrPredicate {
-  return 'or' in p
+  return "or" in p;
 }
 export function isNot(p: Predicate): p is NotPredicate {
-  return 'not' in p
+  return "not" in p;
 }
 export function isInSubquery(p: Predicate): p is InSubqueryPredicate {
-  return 'in' in p && 'col' in p
+  return "in" in p && "col" in p;
 }
 
 // --- Shapes ------------------------------------------------------------------
 
 /** A shape is one table + an optional predicate over that table's columns. */
 export interface ShapeDef {
-  table: string
+  table: string;
   /** Omitted/undefined predicate means "all rows of the table". */
-  where?: Predicate
+  where?: Predicate;
   /**
    * Output projection: the columns to sync to the client. Omitted = the full row. The primary key is
    * always included (the client keys rows by it). Use this to keep large unused columns out of a
    * shape's stream (e.g. a list view that never reads a big `description`). The predicate may still
    * reference columns outside this set — projection only affects what is emitted, not what is matched.
    */
-  columns?: string[]
+  columns?: string[];
 }
 
 /** Handle returned when a shape is registered; the client materializes from `streamPath`. */
 export interface ShapeHandle {
-  shapeId: string
-  table: string
+  shapeId: string;
+  table: string;
   /** Stream path on the durable-streams server, e.g. `shape/<shapeId>`. */
-  streamPath: string
+  streamPath: string;
   /**
    * The **subscription** this handle's claim was recorded under (ADR-0008) — the id the caller sent,
    * or one the engine minted. Repeating the create with it renews the lease and returns this same
    * handle; releasing with it is idempotent, so a lost response can safely be retried. Absent only
    * on a handle read back with `shapes.get`, which belongs to no subscriber.
    */
-  subscription?: string
+  subscription?: string;
   /**
    * How long the subscription may go unrenewed before the engine releases it, in seconds
    * (`CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse). The renewal cadence is the
    * server's to set — read it from here rather than assuming one.
    */
-  leaseSeconds?: number
+  leaseSeconds?: number;
 }
 
 // --- Subset queries ----------------------------------------------------------
@@ -175,8 +175,8 @@ export interface ShapeHandle {
 
 /** Order key for a subset query. The engine appends the primary key as a tiebreaker (total order). */
 export interface SubsetOrderBy {
-  col: string
-  desc?: boolean
+  col: string;
+  desc?: boolean;
 }
 
 /**
@@ -185,39 +185,39 @@ export interface SubsetOrderBy {
  * `where`, or a higher `offset`) to page. Compare with [`ShapeDef`], which is materialized + live.
  */
 export interface SubsetDef {
-  table: string
+  table: string;
   /** Filter over the table's columns. Omitted = all rows. */
-  where?: Predicate
+  where?: Predicate;
   /** Output projection (pk always included). Omitted = the full row. */
-  columns?: string[]
+  columns?: string[];
   /** Order for the window; required when `limit`/`offset` are set (for a deterministic page). */
-  orderBy?: SubsetOrderBy
+  orderBy?: SubsetOrderBy;
   /** Max rows to return (the page size). */
-  limit?: number
+  limit?: number;
   /** Rows to skip before the page (keyset cursors via `where` are preferred over large offsets). */
-  offset?: number
+  offset?: number;
 }
 
 /** Result of a subset query: the page rows, plus the Postgres snapshot LSN they were read at (so a
  * live tail can be followed from exactly that point with no gap or duplicate). */
 export interface SubsetResult {
-  rows: Row[]
+  rows: Row[];
   /** `pg_current_wal_lsn()` at the read snapshot. */
-  lsn: string
+  lsn: string;
 }
 
 /** Scalar aggregation functions. */
-export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max'
+export type AggFn = "count" | "sum" | "avg" | "min" | "max";
 
 /** A scalar aggregation over a filtered set, maintained incrementally by the engine and streamed as a
  * single value that updates as rows enter/leave the predicate. `col` is required for all but `count`. */
 export interface AggregateDef {
-  table: string
+  table: string;
   /** Filter over the table's columns (no subqueries). Omitted = all rows. */
-  where?: Predicate
-  fn: AggFn
+  where?: Predicate;
+  fn: AggFn;
   /** The column to aggregate — required for sum/avg/min/max, ignored for count. */
-  col?: string
+  col?: string;
 }
 
 // --- Change events (the unit on every stream) --------------------------------
@@ -227,7 +227,7 @@ export interface AggregateDef {
  * the engine and the oracle trivially in sync regardless of which label a caller uses.
  * `delete` removes by pk (idempotent no-op if absent).
  */
-export type Op = 'insert' | 'update' | 'delete'
+export type Op = "insert" | "update" | "delete";
 
 /**
  * A change on a table or shape stream.
@@ -238,9 +238,9 @@ export type Op = 'insert' | 'update' | 'delete'
  * leave (delete), or update.
  */
 export interface ChangeEvent {
-  op: Op
-  pk: Value
-  row?: Row
+  op: Op;
+  pk: Value;
+  row?: Row;
 }
 
 /**
@@ -249,14 +249,13 @@ export interface ChangeEvent {
  * nothing can resume inside them, so there is no un-suffixed `changes` stream — always address a
  * segment. Which one is current comes from the engine (`GET /replication/lsn` -> `changes.segment`).
  */
-export const CHANGES_PREFIX = 'changes'
+export const CHANGES_PREFIX = "changes";
 
 /** Stream path of change-log segment `n`. */
 export function changesSegmentPath(n: number): string {
-  return `${CHANGES_PREFIX}/${n}`
+  return `${CHANGES_PREFIX}/${n}`;
 }
 
-
 export function shapeStreamPath(shapeId: string): string {
-  return `shape/${shapeId}`
+  return `shape/${shapeId}`;
 }

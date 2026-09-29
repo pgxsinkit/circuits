@@ -4,12 +4,12 @@ The shared contract of [Circuits](../../README.md): the JSON types and compilers
 API/oracle/client and the Rust engine (which mirrors them with serde) all agree on. Zero runtime
 dependencies. Four modules, re-exported from the package root:
 
-| Module | Contents |
-|---|---|
-| `types.ts` | `Schema`/`TableDef`/`ColumnType` (`int` `text` `bool` `float`), `Row`/`Value`, the **Predicate AST**, `ShapeDef`/`ShapeHandle` (incl. the handle's `subscription` + `leaseSeconds` — ADR-0008), `SubsetDef`/`SubsetResult`, `AggregateDef`/`AggFn`, `ChangeEvent`, stream-path helpers |
-| `predicate.ts` | reference **evaluator** (`evaluate`) + `validatePredicate` |
-| `sql.ts` | predicate → SQL compiler (`predicateToSql`), DDL (`tableDDL`), DML (`changeEventToDML`), `shapeSelectSql` |
-| `envelope.ts` | `StreamEnvelope` — the State-Protocol change envelope on every table/shape durable stream (`type`, `key`, `value`, `headers.operation/txid/lsn/seq`) |
+| Module         | Contents                                                                                                                                                                                                                                                                               |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `types.ts`     | `Schema`/`TableDef`/`ColumnType` (`int` `text` `bool` `float`), `Row`/`Value`, the **Predicate AST**, `ShapeDef`/`ShapeHandle` (incl. the handle's `subscription` + `leaseSeconds` — ADR-0008), `SubsetDef`/`SubsetResult`, `AggregateDef`/`AggFn`, `ChangeEvent`, stream-path helpers |
+| `predicate.ts` | reference **evaluator** (`evaluate`) + `validatePredicate`                                                                                                                                                                                                                             |
+| `sql.ts`       | predicate → SQL compiler (`predicateToSql`), DDL (`tableDDL`), DML (`changeEventToDML`), `shapeSelectSql`                                                                                                                                                                              |
+| `envelope.ts`  | `StreamEnvelope` — the State-Protocol change envelope on every table/shape durable stream (`type`, `key`, `value`, `headers.operation/txid/lsn/seq`)                                                                                                                                   |
 
 ## Scalar values on the wire
 
@@ -60,11 +60,11 @@ inner table).
 ## SQL compilers
 
 ```ts
-predicateToSql(pred)          // -> { text: '"priority" >= $1', params: [3] }  (parameterized)
-tableDDL('todos', def)        // -> CREATE TABLE "todos" (…, PRIMARY KEY ("id"))
-changeEventToDML('todos', def, ev)  // insert/update -> upsert by pk (partial update -> plain UPDATE
-                                    // of provided columns); delete -> DELETE by pk
-shapeSelectSql('todos', where)      // -> SELECT * FROM "todos" WHERE <pred>
+predicateToSql(pred); // -> { text: '"priority" >= $1', params: [3] }  (parameterized)
+tableDDL("todos", def); // -> CREATE TABLE "todos" (…, PRIMARY KEY ("id"))
+changeEventToDML("todos", def, ev); // insert/update -> upsert by pk (partial update -> plain UPDATE
+// of provided columns); delete -> DELETE by pk
+shapeSelectSql("todos", where); // -> SELECT * FROM "todos" WHERE <pred>
 ```
 
 These compilers are what [`@circuits/oracle`](../oracle/README.md) is built from — the same

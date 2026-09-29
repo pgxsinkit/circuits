@@ -8,13 +8,17 @@ Carried over on 2026-09-29 from issue #12 of `pgxsinkit/electric-circuits`, the 
 came from. Checked against the code on that day: still true.
 
 ## The fact
+
 A crash in the window between a `TRUNCATE`'s append to the change log and the slot acknowledgement of that commit (≤ 1 s, the status interval) re-delivers the TRUNCATE at the next boot, and the engine **re-retires** that table's shapes — including shapes created after the restart that already reflect the truncation.
 
 ## Consequence
+
 One spurious resync of that table's shapes (their streams are closed then deleted; clients re-subscribe and get fresh snapshots). Correct, wasteful, and rare: it needs a crash inside a one-second window that contains a TRUNCATE.
 
 ## Fix direction
+
 Retirement on TRUNCATE should only apply to shapes whose snapshot predates the TRUNCATE's position. That needs the shape's `SnapshotGate` (or its seed LSN) on the catalog record so the retirement can be fenced, or a sequencer round-trip during retirement. ADR-0005 notes the window.
 
 ## Not now because
+
 Rare and self-correcting. Surfaced in the slice-2b review (`docs/notes/2026-08-21-upstream-issue-triage.md`, follow-ups).

@@ -3,8 +3,9 @@
 // `docs/ARCHITECTURE.md` §7 (subset queries and client positioning).
 // Plus subscription lifecycle (one-shot close, feed cleanup on error) against a fake tRPC.
 
-import { describe, expect, it, vi } from 'vitest'
-import type { Row, Schema } from '@circuits/protocol'
+import type { Row, Schema } from "@circuits/protocol";
+import { describe, expect, it, vi } from "vitest";
+
 import {
   cmpCodePoints,
   createSubset,
@@ -15,366 +16,373 @@ import {
   startLeaseRenewal,
   type SubsetDeps,
   type SubsetView,
-} from './subset.js'
+} from "./subset.js";
 
 // The lifecycle tests never need a real durable stream; an empty tail is enough.
-vi.mock('@durable-streams/client', () => ({
+vi.mock("@durable-streams/client", () => ({
   stream: async () => ({ jsonStream: async function* () {} }),
-}))
+}));
 
-type Env = Parameters<typeof mergeFeedDelta>[1]
+type Env = Parameters<typeof mergeFeedDelta>[1];
 
 function upsert(id: number, lsn: string | undefined, extra: Record<string, unknown> = {}): Env {
   return {
-    type: 'issues',
+    type: "issues",
     key: String(id),
     value: { id, ...extra } as Row,
-    headers: { operation: 'upsert', ...(lsn ? { lsn } : {}) },
-  }
+    headers: { operation: "upsert", ...(lsn ? { lsn } : {}) },
+  };
 }
 function del(id: number, lsn: string | undefined): Env {
-  return { type: 'issues', key: String(id), headers: { operation: 'delete', ...(lsn ? { lsn } : {}) } }
+  return { type: "issues", key: String(id), headers: { operation: "delete", ...(lsn ? { lsn } : {}) } };
 }
 
 /** A fresh view seeded with a page read at `snapshotLsn`, window = everything (inView always true). */
 function viewSeededWith(pageIds: number[], snapshotLsn: bigint, inView: (r: Row) => boolean = () => true): SubsetView {
-  const present = new Set<string>()
-  const applied = new Map<string, bigint>()
+  const present = new Set<string>();
+  const applied = new Map<string, bigint>();
   for (const id of pageIds) {
-    present.add(String(id))
-    applied.set(String(id), snapshotLsn)
+    present.add(String(id));
+    applied.set(String(id), snapshotLsn);
   }
-  return { snapshotLsn, present, applied, inView }
+  return { snapshotLsn, present, applied, inView };
 }
 
-describe('lsnToU64', () => {
-  it('mirrors the engine pg::lsn_to_u64 ((hi<<32)|lo, hex)', () => {
-    expect(lsnToU64('0/0')).toBe(0n)
-    expect(lsnToU64('0/2A')).toBe(42n)
-    expect(lsnToU64('1/0')).toBe(1n << 32n)
-    expect(lsnToU64('0/FF')).toBe(255n)
-    expect(lsnToU64('16/0')).toBe(0x16n << 32n)
-    expect(lsnToU64(undefined)).toBeNull()
-    expect(lsnToU64('')).toBeNull()
-  })
+describe("lsnToU64", () => {
+  it("mirrors the engine pg::lsn_to_u64 ((hi<<32)|lo, hex)", () => {
+    expect(lsnToU64("0/0")).toBe(0n);
+    expect(lsnToU64("0/2A")).toBe(42n);
+    expect(lsnToU64("1/0")).toBe(1n << 32n);
+    expect(lsnToU64("0/FF")).toBe(255n);
+    expect(lsnToU64("16/0")).toBe(0x16n << 32n);
+    expect(lsnToU64(undefined)).toBeNull();
+    expect(lsnToU64("")).toBeNull();
+  });
 
-  it('returns null (never throws) on a malformed LSN — a throw would kill the feed tail', () => {
-    expect(lsnToU64('garbage')).toBeNull() // no slash
-    expect(lsnToU64('zz/zz')).toBeNull() // non-hex halves
-    expect(lsnToU64('0/')).toBeNull() // empty lo
-    expect(lsnToU64('/0')).toBeNull() // empty hi
+  it("returns null (never throws) on a malformed LSN — a throw would kill the feed tail", () => {
+    expect(lsnToU64("garbage")).toBeNull(); // no slash
+    expect(lsnToU64("zz/zz")).toBeNull(); // non-hex halves
+    expect(lsnToU64("0/")).toBeNull(); // empty lo
+    expect(lsnToU64("/0")).toBeNull(); // empty hi
     // and mergeFeedDelta treats such deltas as fresh (the null-LSN library-mode path)
-    const view = viewSeededWith([1], lsnToU64('0/100')!)
-    expect(mergeFeedDelta(view, upsert(1, 'not-an-lsn', { t: 'x' }))).toEqual({
-      type: 'update',
-      value: { id: 1, t: 'x' },
-    })
-  })
-})
+    const view = viewSeededWith([1], lsnToU64("0/100")!);
+    expect(mergeFeedDelta(view, upsert(1, "not-an-lsn", { t: "x" }))).toEqual({
+      type: "update",
+      value: { id: 1, t: "x" },
+    });
+  });
+});
 
-describe('mergeFeedDelta — LSN positioning', () => {
-  const S = lsnToU64('0/100')! // snapshot at LSN 0x100
+describe("mergeFeedDelta — LSN positioning", () => {
+  const S = lsnToU64("0/100")!; // snapshot at LSN 0x100
 
-  it('drops an overlap delta already reflected in the page (commit LSN < snapshot) — no double-count', () => {
-    const view = viewSeededWith([1], S)
+  it("drops an overlap delta already reflected in the page (commit LSN < snapshot) — no double-count", () => {
+    const view = viewSeededWith([1], S);
     // A delta for the page row that committed BEFORE the snapshot is already in the page → drop.
-    expect(mergeFeedDelta(view, upsert(1, '0/80'))).toBeNull()
+    expect(mergeFeedDelta(view, upsert(1, "0/80"))).toBeNull();
     // A genuine live update AFTER the snapshot is applied as an update (not a second insert).
-    expect(mergeFeedDelta(view, upsert(1, '0/120', { title: 'new' }))).toEqual({
-      type: 'update',
-      value: { id: 1, title: 'new' },
-    })
-  })
+    expect(mergeFeedDelta(view, upsert(1, "0/120", { title: "new" }))).toEqual({
+      type: "update",
+      value: { id: 1, title: "new" },
+    });
+  });
 
-  it('never re-inserts a row already in the page; only inserts when absent (no double-count under churn)', () => {
+  it("never re-inserts a row already in the page; only inserts when absent (no double-count under churn)", () => {
     // A single feed is strictly monotonic in commit LSN (one tailer, commit-ordered table stream), so
     // the realistic sequence is non-decreasing. The invariant: no insert is ever emitted for a pk that
     // is currently present (that would double-count the page row); inserts happen only when absent.
-    const view = viewSeededWith([1], S)
+    const view = viewSeededWith([1], S);
     const seq: Env[] = [
-      upsert(1, '0/90'), // overlap (< snapshot) → already in page → drop
-      upsert(1, '0/110'), // live update
-      del(1, '0/130'), // leaves
-      upsert(1, '0/140'), // genuinely re-created after the delete → one insert
-    ]
-    const wasPresent: boolean[] = []
+      upsert(1, "0/90"), // overlap (< snapshot) → already in page → drop
+      upsert(1, "0/110"), // live update
+      del(1, "0/130"), // leaves
+      upsert(1, "0/140"), // genuinely re-created after the delete → one insert
+    ];
+    const wasPresent: boolean[] = [];
     const actions = seq.map((e) => {
-      wasPresent.push(view.present.has(e.key))
-      return mergeFeedDelta(view, e)
-    })
+      wasPresent.push(view.present.has(e.key));
+      return mergeFeedDelta(view, e);
+    });
     // No insert was emitted while the key was already present.
     actions.forEach((a, i) => {
-      if (a && a.type === 'insert') expect(wasPresent[i]).toBe(false)
-    })
+      if (a && a.type === "insert") expect(wasPresent[i]).toBe(false);
+    });
     expect(actions).toEqual([
       null,
-      { type: 'update', value: { id: 1 } },
-      { type: 'delete', key: '1' },
-      { type: 'insert', value: { id: 1 } },
-    ])
-  })
+      { type: "update", value: { id: 1 } },
+      { type: "delete", key: "1" },
+      { type: "insert", value: { id: 1 } },
+    ]);
+  });
 
-  it('does not admit a pre-snapshot row that was outside the first page (floor = snapshot)', () => {
-    const view = viewSeededWith([1], S)
+  it("does not admit a pre-snapshot row that was outside the first page (floor = snapshot)", () => {
+    const view = viewSeededWith([1], S);
     // id=2 not in page; a delta from before the snapshot belongs to a later page (loadMore), not live.
-    expect(mergeFeedDelta(view, upsert(2, '0/80'))).toBeNull()
-    expect(view.present.has('2')).toBe(false)
+    expect(mergeFeedDelta(view, upsert(2, "0/80"))).toBeNull();
+    expect(view.present.has("2")).toBe(false);
     // A move-in after the snapshot is admitted exactly once.
-    expect(mergeFeedDelta(view, upsert(2, '0/140'))).toEqual({ type: 'insert', value: { id: 2 } })
-    expect(mergeFeedDelta(view, upsert(2, '0/150'))).toEqual({ type: 'update', value: { id: 2 } })
-  })
+    expect(mergeFeedDelta(view, upsert(2, "0/140"))).toEqual({ type: "insert", value: { id: 2 } });
+    expect(mergeFeedDelta(view, upsert(2, "0/150"))).toEqual({ type: "update", value: { id: 2 } });
+  });
 
-  it('drops a stale delete older than the row watermark (loadMore-vs-feed race)', () => {
-    const L2 = lsnToU64('0/200')!
-    const view = viewSeededWith([1], S)
-    view.applied.set('1', L2) // row was refreshed by a loadMore page at 0x200
-    expect(mergeFeedDelta(view, del(1, '0/180'))).toBeNull() // stale delete → drop, row stays
-    expect(view.present.has('1')).toBe(true)
-    expect(mergeFeedDelta(view, del(1, '0/210'))).toEqual({ type: 'delete', key: '1' }) // newer → applied
-    expect(view.present.has('1')).toBe(false)
-  })
+  it("drops a stale delete older than the row watermark (loadMore-vs-feed race)", () => {
+    const L2 = lsnToU64("0/200")!;
+    const view = viewSeededWith([1], S);
+    view.applied.set("1", L2); // row was refreshed by a loadMore page at 0x200
+    expect(mergeFeedDelta(view, del(1, "0/180"))).toBeNull(); // stale delete → drop, row stays
+    expect(view.present.has("1")).toBe(true);
+    expect(mergeFeedDelta(view, del(1, "0/210"))).toEqual({ type: "delete", key: "1" }); // newer → applied
+    expect(view.present.has("1")).toBe(false);
+  });
 
-  it('emits a move-out delete when an in-view row updates out of the window', () => {
-    let cutoff = 1000
-    const view = viewSeededWith([1], S, (r) => Number(r.id) <= cutoff)
+  it("emits a move-out delete when an in-view row updates out of the window", () => {
+    let cutoff = 1000;
+    const view = viewSeededWith([1], S, (r) => Number(r.id) <= cutoff);
     // id=1 stays in view on a normal update
-    expect(mergeFeedDelta(view, upsert(1, '0/110'))).toEqual({ type: 'update', value: { id: 1 } })
+    expect(mergeFeedDelta(view, upsert(1, "0/110"))).toEqual({ type: "update", value: { id: 1 } });
     // now shrink the window; an update that places id=1 outside → move-out delete
-    cutoff = 0
-    expect(mergeFeedDelta(view, upsert(1, '0/120', { id: 1 }))).toEqual({ type: 'delete', key: '1' })
-    expect(view.present.has('1')).toBe(false)
-  })
+    cutoff = 0;
+    expect(mergeFeedDelta(view, upsert(1, "0/120", { id: 1 }))).toEqual({ type: "delete", key: "1" });
+    expect(view.present.has("1")).toBe(false);
+  });
 
-  it('keeps a tombstone watermark on delete so a stale in-flight loadMore page cannot resurrect the row', () => {
-    const view = viewSeededWith([1], S)
-    const D = lsnToU64('0/150')!
-    expect(mergeFeedDelta(view, del(1, '0/150'))).toEqual({ type: 'delete', key: '1' })
-    expect(view.present.has('1')).toBe(false)
+  it("keeps a tombstone watermark on delete so a stale in-flight loadMore page cannot resurrect the row", () => {
+    const view = viewSeededWith([1], S);
+    const D = lsnToU64("0/150")!;
+    expect(mergeFeedDelta(view, del(1, "0/150"))).toEqual({ type: "delete", key: "1" });
+    expect(view.present.has("1")).toBe(false);
     // The watermark survives as a tombstone: absent + watermark w = "deleted at ≥ w".
-    expect(view.applied.get('1')).toBe(D)
+    expect(view.applied.get("1")).toBe(D);
     // The loadMore guard (`pageLsn < w` → skip) then drops a page snapshotted before the delete…
-    const stalePageLsn = lsnToU64('0/120')!
-    const w = view.applied.get('1')
-    expect(w !== undefined && stalePageLsn < w).toBe(true) // row stays deleted
+    const stalePageLsn = lsnToU64("0/120")!;
+    const w = view.applied.get("1");
+    expect(w !== undefined && stalePageLsn < w).toBe(true); // row stays deleted
     // …while a page at/after the delete (row genuinely re-created) is admitted.
-    const freshPageLsn = lsnToU64('0/160')!
-    expect(w !== undefined && freshPageLsn < w).toBe(false)
-  })
+    const freshPageLsn = lsnToU64("0/160")!;
+    expect(w !== undefined && freshPageLsn < w).toBe(false);
+  });
 
-  it('records a tombstone for a delete of a never-seen pk (no write, but no ghost from a stale page)', () => {
-    const view = viewSeededWith([1], S)
+  it("records a tombstone for a delete of a never-seen pk (no write, but no ghost from a stale page)", () => {
+    const view = viewSeededWith([1], S);
     // pk 2 was never loaded: the delete emits nothing, but the watermark is recorded so an in-flight
     // older page (pageLsn < 0x150) cannot insert the row the feed already saw deleted.
-    expect(mergeFeedDelta(view, del(2, '0/150'))).toBeNull()
-    expect(view.present.has('2')).toBe(false)
-    expect(view.applied.get('2')).toBe(lsnToU64('0/150')!)
+    expect(mergeFeedDelta(view, del(2, "0/150"))).toBeNull();
+    expect(view.present.has("2")).toBe(false);
+    expect(view.applied.get("2")).toBe(lsnToU64("0/150")!);
     // A pre-snapshot delete for an unseen pk is not fresh → still dropped with no tombstone.
-    expect(mergeFeedDelta(view, del(3, '0/80'))).toBeNull()
-    expect(view.applied.has('3')).toBe(false)
-  })
+    expect(mergeFeedDelta(view, del(3, "0/80"))).toBeNull();
+    expect(view.applied.has("3")).toBe(false);
+  });
 
-  it('keeps a tombstone watermark on a move-out delete too', () => {
-    const view = viewSeededWith([1], S, () => false) // window rejects everything
-    expect(mergeFeedDelta(view, upsert(1, '0/120'))).toEqual({ type: 'delete', key: '1' })
-    expect(view.present.has('1')).toBe(false)
-    expect(view.applied.get('1')).toBe(lsnToU64('0/120')!)
-  })
+  it("keeps a tombstone watermark on a move-out delete too", () => {
+    const view = viewSeededWith([1], S, () => false); // window rejects everything
+    expect(mergeFeedDelta(view, upsert(1, "0/120"))).toEqual({ type: "delete", key: "1" });
+    expect(view.present.has("1")).toBe(false);
+    expect(view.applied.get("1")).toBe(lsnToU64("0/120")!);
+  });
 
-  it('library mode (no LSN on deltas) falls back to idempotent-by-pk apply', () => {
-    const view = viewSeededWith([1], 0n)
-    expect(mergeFeedDelta(view, upsert(1, undefined, { t: 'x' }))).toEqual({ type: 'update', value: { id: 1, t: 'x' } })
-    expect(mergeFeedDelta(view, upsert(2, undefined))).toEqual({ type: 'insert', value: { id: 2 } })
-    expect(mergeFeedDelta(view, del(2, undefined))).toEqual({ type: 'delete', key: '2' })
-  })
-})
+  it("library mode (no LSN on deltas) falls back to idempotent-by-pk apply", () => {
+    const view = viewSeededWith([1], 0n);
+    expect(mergeFeedDelta(view, upsert(1, undefined, { t: "x" }))).toEqual({
+      type: "update",
+      value: { id: 1, t: "x" },
+    });
+    expect(mergeFeedDelta(view, upsert(2, undefined))).toEqual({ type: "insert", value: { id: 2 } });
+    expect(mergeFeedDelta(view, del(2, undefined))).toEqual({ type: "delete", key: "2" });
+  });
+});
 
 // --- subscription lifecycle (fake tRPC; the durable-streams client is mocked to an empty tail) ---
 
 const testSchema: Schema = {
-  tables: { issues: { columns: { id: { type: 'int' }, title: { type: 'text' } }, primaryKey: 'id' } },
-}
+  tables: { issues: { columns: { id: { type: "int" }, title: { type: "text" } }, primaryKey: "id" } },
+};
 
 function fakeDeps(opts: { queryError?: Error } = {}) {
-  const deleted: string[] = []
+  const deleted: string[] = [];
   const trpc = {
     subset: {
       live: {
         // The HEAD probe against this unroutable URL fails fast and falls back to the origin offset.
-        mutate: async () => ({ shapeId: 'feed-1', streamPath: 'streams/feed-1', streamUrl: 'http://127.0.0.1:9/streams/feed-1' }),
+        mutate: async () => ({
+          shapeId: "feed-1",
+          streamPath: "streams/feed-1",
+          streamUrl: "http://127.0.0.1:9/streams/feed-1",
+        }),
       },
       query: {
         query: async () => {
-          if (opts.queryError) throw opts.queryError
-          return { rows: [], lsn: '0/100' }
+          if (opts.queryError) throw opts.queryError;
+          return { rows: [], lsn: "0/100" };
         },
       },
     },
     shapes: {
       delete: {
         mutate: async ({ id }: { id: string }) => {
-          deleted.push(id)
-          return { ok: true as const }
+          deleted.push(id);
+          return { ok: true as const };
         },
       },
     },
-  }
+  };
   const deps: SubsetDeps = {
-    trpc: trpc as unknown as SubsetDeps['trpc'],
+    trpc: trpc as unknown as SubsetDeps["trpc"],
     schema: testSchema,
     resolveStreamUrl: (h) => h.streamUrl,
-  }
-  return { deps, deleted }
+  };
+  return { deps, deleted };
 }
 
-describe('createSubset lifecycle', () => {
-  it('close() deletes the server-side feed exactly once (double/concurrent close is a no-op)', async () => {
-    const { deps, deleted } = fakeDeps()
-    const sub = await createSubset(deps, { table: 'issues' })
-    await Promise.all([sub.close(), sub.close()]) // concurrent double-close
-    await sub.close() // and a late third
-    expect(deleted).toEqual(['feed-1']) // exactly one refcount decrement
-  })
+describe("createSubset lifecycle", () => {
+  it("close() deletes the server-side feed exactly once (double/concurrent close is a no-op)", async () => {
+    const { deps, deleted } = fakeDeps();
+    const sub = await createSubset(deps, { table: "issues" });
+    await Promise.all([sub.close(), sub.close()]); // concurrent double-close
+    await sub.close(); // and a late third
+    expect(deleted).toEqual(["feed-1"]); // exactly one refcount decrement
+  });
 
-  it('deletes the feed before rethrowing when the page query-back fails (no feed leak)', async () => {
-    const { deps, deleted } = fakeDeps({ queryError: new Error('boom') })
-    await expect(createSubset(deps, { table: 'issues' })).rejects.toThrow('boom')
-    expect(deleted).toEqual(['feed-1'])
-  })
-})
+  it("deletes the feed before rethrowing when the page query-back fails (no feed leak)", async () => {
+    const { deps, deleted } = fakeDeps({ queryError: new Error("boom") });
+    await expect(createSubset(deps, { table: "issues" })).rejects.toThrow("boom");
+    expect(deleted).toEqual(["feed-1"]);
+  });
+});
 
-describe('deleteShapeWithRetry', () => {
+describe("deleteShapeWithRetry", () => {
   it('treats "not found" as success (shape already dropped) without retrying', async () => {
-    let calls = 0
+    let calls = 0;
     const trpc = {
       shapes: {
         delete: {
           mutate: async () => {
-            calls++
-            throw Object.assign(new Error('shape x not found'), { data: { code: 'NOT_FOUND', httpStatus: 404 } })
+            calls++;
+            throw Object.assign(new Error("shape x not found"), { data: { code: "NOT_FOUND", httpStatus: 404 } });
           },
         },
       },
-    }
-    await deleteShapeWithRetry(trpc as never, 'x')
-    expect(calls).toBe(1)
-  })
+    };
+    await deleteShapeWithRetry(trpc as never, "x");
+    expect(calls).toBe(1);
+  });
 
-  it('retries a transient failure with backoff until the delete lands', async () => {
-    let calls = 0
+  it("retries a transient failure with backoff until the delete lands", async () => {
+    let calls = 0;
     const trpc = {
       shapes: {
         delete: {
           mutate: async () => {
-            calls++
-            if (calls === 1) throw new Error('ECONNRESET')
+            calls++;
+            if (calls === 1) throw new Error("ECONNRESET");
           },
         },
       },
-    }
-    await deleteShapeWithRetry(trpc as never, 'x')
-    expect(calls).toBe(2)
-  })
-})
+    };
+    await deleteShapeWithRetry(trpc as never, "x");
+    expect(calls).toBe(2);
+  });
+});
 
-describe('window ordering agrees with the engine, not with UTF-16', () => {
+describe("window ordering agrees with the engine, not with UTF-16", () => {
   it('compares strings by code point, where the page (COLLATE "C") puts them', () => {
     // The reproduction: JavaScript's `<` compares UTF-16 code units, so the emoji's leading
     // surrogate (D83D) sorts before U+E000 — while PostgreSQL, the engine's evaluator and this
     // comparator all put U+1F600 after it.
-    expect('\u{1F600}' < '\uE000').toBe(true)
-    expect(cmpCodePoints('\uE000', '\u{1F600}')).toBeLessThan(0)
-    expect(cmpCodePoints('\u{1F600}', '\uE000')).toBeGreaterThan(0)
-  })
+    expect("\u{1F600}" < "\uE000").toBe(true);
+    expect(cmpCodePoints("\uE000", "\u{1F600}")).toBeLessThan(0);
+    expect(cmpCodePoints("\u{1F600}", "\uE000")).toBeGreaterThan(0);
+  });
 
-  it('is a total order: equality, prefixes, and the ordinary ASCII case', () => {
-    expect(cmpCodePoints('', '')).toBe(0)
-    expect(cmpCodePoints('abc', 'abc')).toBe(0)
-    expect(cmpCodePoints('ab', 'abc')).toBeLessThan(0)
-    expect(cmpCodePoints('abc', 'ab')).toBeGreaterThan(0)
-    expect(cmpCodePoints('', 'a')).toBeLessThan(0)
-    expect(cmpCodePoints('a', 'b')).toBeLessThan(0)
-  })
+  it("is a total order: equality, prefixes, and the ordinary ASCII case", () => {
+    expect(cmpCodePoints("", "")).toBe(0);
+    expect(cmpCodePoints("abc", "abc")).toBe(0);
+    expect(cmpCodePoints("ab", "abc")).toBeLessThan(0);
+    expect(cmpCodePoints("abc", "ab")).toBeGreaterThan(0);
+    expect(cmpCodePoints("", "a")).toBeLessThan(0);
+    expect(cmpCodePoints("a", "b")).toBeLessThan(0);
+  });
 
-  it('orders rows by code point on a text column', () => {
-    const cmp = makeCmp('id', { col: 'label' }, () => 'text')
-    const first: Row = { id: 1, label: '\uE000' }
-    const second: Row = { id: 2, label: '\u{1F600}' }
-    expect(cmp(first, second)).toBeLessThan(0)
-    expect(cmp(second, first)).toBeGreaterThan(0)
-  })
+  it("orders rows by code point on a text column", () => {
+    const cmp = makeCmp("id", { col: "label" }, () => "text");
+    const first: Row = { id: 1, label: "\uE000" };
+    const second: Row = { id: 2, label: "\u{1F600}" };
+    expect(cmp(first, second)).toBeLessThan(0);
+    expect(cmp(second, first)).toBeGreaterThan(0);
+  });
 
-  it('orders an int column numerically whichever wire form each value arrived in', () => {
+  it("orders an int column numerically whichever wire form each value arrived in", () => {
     // An `int` cell is `number | string`: a bigint past 2^53 arrives as an exact decimal string.
     // The COLUMN TYPE decides the comparison, so a mixed pair still compares numerically...
-    const cmp = makeCmp('id', { col: 'amount' }, () => 'int')
-    const small: Row = { id: 1, amount: 9 }
-    const big: Row = { id: 2, amount: '9007199254740993' }
-    const bigger: Row = { id: 3, amount: '9007199254740994' }
-    expect(cmp(small, big)).toBeLessThan(0)
-    expect(cmp(big, bigger)).toBeLessThan(0)
-    expect(cmp(bigger, big)).toBeGreaterThan(0)
+    const cmp = makeCmp("id", { col: "amount" }, () => "int");
+    const small: Row = { id: 1, amount: 9 };
+    const big: Row = { id: 2, amount: "9007199254740993" };
+    const bigger: Row = { id: 3, amount: "9007199254740994" };
+    expect(cmp(small, big)).toBeLessThan(0);
+    expect(cmp(big, bigger)).toBeLessThan(0);
+    expect(cmp(bigger, big)).toBeGreaterThan(0);
     // Same row identity and same value: a tie all the way through the pk tiebreaker.
-    expect(cmp(big, { id: 2, amount: '9007199254740993' })).toBe(0)
+    expect(cmp(big, { id: 2, amount: "9007199254740993" })).toBe(0);
 
     // ...where a code-point comparison would order '10' before '9'.
-    expect(cmp({ id: 5, amount: 10 }, { id: 6, amount: '9' })).toBeGreaterThan(0)
-  })
+    expect(cmp({ id: 5, amount: 10 }, { id: 6, amount: "9" })).toBeGreaterThan(0);
+  });
 
   it('a text column holding digits is still text: "10" sorts before "9"', () => {
-    const cmp = makeCmp('id', { col: 'label' }, () => 'text')
-    expect(cmp({ id: 1, label: '10' }, { id: 2, label: '9' })).toBeLessThan(0)
-  })
-})
+    const cmp = makeCmp("id", { col: "label" }, () => "text");
+    expect(cmp({ id: 1, label: "10" }, { id: 2, label: "9" })).toBeLessThan(0);
+  });
+});
 
 // A renewal is a create, so one still in flight when `close()` releases the subscription would land
 // after it and re-take the claim — a subscription nothing will ever release again, pinning the
 // shared shape until its lease lapses. `stop()` is what closes that window (ADR-0008).
-describe('lease renewal keeper', () => {
-  it('stop() waits for a renewal already in flight, so a close cannot be overtaken', async () => {
-    const events: string[] = []
-    let settle: (() => void) | undefined
+describe("lease renewal keeper", () => {
+  it("stop() waits for a renewal already in flight, so a close cannot be overtaken", async () => {
+    const events: string[] = [];
+    let settle: (() => void) | undefined;
     const keeper = startLeaseRenewal(0, () => {
-      events.push('renew:start')
+      events.push("renew:start");
       return new Promise<void>((resolve) => {
         settle = () => {
-          events.push('renew:done')
-          resolve()
-        }
-      })
-    })
+          events.push("renew:done");
+          resolve();
+        };
+      });
+    });
 
-    const renewing = keeper.renew()
-    const stopping = keeper.stop().then(() => events.push('stopped'))
+    const renewing = keeper.renew();
+    const stopping = keeper.stop().then(() => events.push("stopped"));
     // Nothing has finished yet: `stop()` must still be waiting on the in-flight renewal.
-    await new Promise((r) => setTimeout(r, 10))
-    expect(events).toEqual(['renew:start'])
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events).toEqual(["renew:start"]);
 
-    settle!()
-    await Promise.all([renewing, stopping])
-    expect(events, 'the release may only proceed once the renewal has landed').toEqual([
-      'renew:start',
-      'renew:done',
-      'stopped',
-    ])
-  })
+    settle!();
+    await Promise.all([renewing, stopping]);
+    expect(events, "the release may only proceed once the renewal has landed").toEqual([
+      "renew:start",
+      "renew:done",
+      "stopped",
+    ]);
+  });
 
-  it('renew() after stop() is a no-op: a closed materialization does not resurrect its claim', async () => {
-    let calls = 0
+  it("renew() after stop() is a no-op: a closed materialization does not resurrect its claim", async () => {
+    let calls = 0;
     const keeper = startLeaseRenewal(0, async () => {
-      calls += 1
-    })
-    await keeper.renew()
-    expect(calls).toBe(1)
+      calls += 1;
+    });
+    await keeper.renew();
+    expect(calls).toBe(1);
 
-    await keeper.stop()
-    await keeper.renew()
-    await keeper.renew()
-    expect(calls, 'every renewal after the close is dropped').toBe(1)
-  })
+    await keeper.stop();
+    await keeper.renew();
+    await keeper.renew();
+    expect(calls, "every renewal after the close is dropped").toBe(1);
+  });
 
-  it('a failing renewal never rejects stop(): the close path must not inherit it', async () => {
-    const keeper = startLeaseRenewal(0, () => Promise.reject(new Error('storage is down')))
-    await expect(keeper.renew()).rejects.toThrow('storage is down')
-    await expect(keeper.stop()).resolves.toBeUndefined()
-  })
-})
+  it("a failing renewal never rejects stop(): the close path must not inherit it", async () => {
+    const keeper = startLeaseRenewal(0, () => Promise.reject(new Error("storage is down")));
+    await expect(keeper.renew()).rejects.toThrow("storage is down");
+    await expect(keeper.stop()).resolves.toBeUndefined();
+  });
+});

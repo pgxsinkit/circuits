@@ -11,9 +11,9 @@ non-harness consumer of `@circuits/client`'s lease keeper.
 
 - Every full conformance run — locally and in CI (run 34820964885, 2026-09-14) — prints 40–90 lines of
   `client: subscription renewal failed: TRPCClientError: Unexpected token 's', "shape crea"... is not
-  valid JSON`, in bursts of ~25 at ~330 ms, inside tests that PASS. vitest attributes the first burst
+valid JSON`, in bursts of ~25 at ~330 ms, inside tests that PASS. vitest attributes the first burst
   to `conformance-native-subscription-ambiguity.test.ts > adopts the fresh handle returned when a late
-  renewal recreates an evicted shape`; later bursts sit inside `conformance-retention.test.ts`.
+renewal recreates an evicted shape`; later bursts sit inside `conformance-retention.test.ts`.
 - The cadence is the lease keeper's floor: `subset.ts` renews every `max(leaseSeconds/3, 250 ms)` and
   on failure only `console.warn`s and waits for the next tick — by design "a failed renewal is not
   fatal". The tests hold shapes with short leases and retire them (eviction, purge), so the keeper

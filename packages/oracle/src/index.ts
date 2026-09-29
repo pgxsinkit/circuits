@@ -2,7 +2,6 @@
 // and answers `SELECT * WHERE <predicate>` for any shape. The conformance invariant is that
 // Circuits' materialized shape set equals this oracle's result set for the same op stream.
 
-import { PGlite } from '@electric-sql/pglite'
 import {
   type ChangeEvent,
   changeEventToDML,
@@ -13,55 +12,56 @@ import {
   type ShapeDef,
   shapeSelectSql,
   tableDDL,
-} from '@circuits/protocol'
-import pgpkg from 'pg'
+} from "@circuits/protocol";
+import { PGlite } from "@electric-sql/pglite";
+import pgpkg from "pg";
 
 export interface Oracle {
   /** Apply a single change to `table` (upsert on insert/update, delete by pk). */
-  applyChange(table: string, ev: ChangeEvent): Promise<void>
+  applyChange(table: string, ev: ChangeEvent): Promise<void>;
   /** Current result set of a shape: `SELECT * FROM table WHERE <where>`. */
-  queryShape(shape: ShapeDef): Promise<Row[]>
+  queryShape(shape: ShapeDef): Promise<Row[]>;
   /** Drop all rows from every table (keeps the schema). */
-  reset(): Promise<void>
-  close(): Promise<void>
+  reset(): Promise<void>;
+  close(): Promise<void>;
 }
 
 export async function createOracle(schema: Schema): Promise<Oracle> {
-  const db = await PGlite.create('memory://')
+  const db = await PGlite.create("memory://");
   for (const [name, def] of Object.entries(schema.tables)) {
     // A non-`public` table needs its schema to exist first (a bare key is `public.<name>` sugar,
     // which always exists).
-    const ref = parseTableRef(name)
-    if (ref.schema !== 'public') await db.exec(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`)
-    await db.exec(`${tableDDL(name, def)};`)
+    const ref = parseTableRef(name);
+    if (ref.schema !== "public") await db.exec(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`);
+    await db.exec(`${tableDDL(name, def)};`);
   }
 
   return {
     async applyChange(table, ev) {
-      const def = schema.tables[table]
-      if (!def) throw new Error(`oracle: unknown table "${table}"`)
-      const { text, params } = changeEventToDML(table, def, ev)
-      await db.query(text, params)
+      const def = schema.tables[table];
+      if (!def) throw new Error(`oracle: unknown table "${table}"`);
+      const { text, params } = changeEventToDML(table, def, ev);
+      await db.query(text, params);
     },
 
     async queryShape(shape) {
-      const def = schema.tables[shape.table]
-      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`)
-      const { text, params } = shapeSelectSql(shape.table, shape.where)
-      const res = await db.query<Row>(text, params)
-      return res.rows
+      const def = schema.tables[shape.table];
+      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`);
+      const { text, params } = shapeSelectSql(shape.table, shape.where);
+      const res = await db.query<Row>(text, params);
+      return res.rows;
     },
 
     async reset() {
       for (const name of Object.keys(schema.tables)) {
-        await db.exec(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`)
+        await db.exec(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`);
       }
     },
 
     async close() {
-      await db.close()
+      await db.close();
     },
-  }
+  };
 }
 
 // --- Real Postgres backend -------------------------------------------------------------------
@@ -71,53 +71,53 @@ export async function createOracle(schema: Schema): Promise<Oracle> {
 /** Create the schema's tables in Postgres with `REPLICA IDENTITY FULL` (so logical decoding carries
  * the full old row). Run before starting the engine. */
 export async function createPgTables(connectionString: string, schema: Schema): Promise<void> {
-  const client = new pgpkg.Client({ connectionString })
-  await client.connect()
+  const client = new pgpkg.Client({ connectionString });
+  await client.connect();
   try {
     for (const [name, def] of Object.entries(schema.tables)) {
       // Non-`public` tables need their schema created before the table (see `createOracle`).
-      const ref = parseTableRef(name)
-      if (ref.schema !== 'public') {
-        await client.query(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`)
+      const ref = parseTableRef(name);
+      if (ref.schema !== "public") {
+        await client.query(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`);
       }
-      await client.query(`${tableDDL(name, def)};`)
-      await client.query(`ALTER TABLE ${qualifiedIdent(name)} REPLICA IDENTITY FULL;`)
+      await client.query(`${tableDDL(name, def)};`);
+      await client.query(`ALTER TABLE ${qualifiedIdent(name)} REPLICA IDENTITY FULL;`);
     }
   } finally {
-    await client.end()
+    await client.end();
   }
 }
 
 /** A Postgres-backed oracle: applies changes as real DML (the replication source) and answers shape
  * queries with `SELECT … WHERE pred` (the comparison truth). */
 export async function createPgOracle(schema: Schema, connectionString: string): Promise<Oracle> {
-  const client = new pgpkg.Client({ connectionString })
-  await client.connect()
+  const client = new pgpkg.Client({ connectionString });
+  await client.connect();
 
   return {
     async applyChange(table, ev) {
-      const def = schema.tables[table]
-      if (!def) throw new Error(`oracle: unknown table "${table}"`)
-      const { text, params } = changeEventToDML(table, def, ev)
-      await client.query(text, params)
+      const def = schema.tables[table];
+      if (!def) throw new Error(`oracle: unknown table "${table}"`);
+      const { text, params } = changeEventToDML(table, def, ev);
+      await client.query(text, params);
     },
 
     async queryShape(shape) {
-      const def = schema.tables[shape.table]
-      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`)
-      const { text, params } = shapeSelectSql(shape.table, shape.where)
-      const res = await client.query(text, params)
-      return res.rows as Row[]
+      const def = schema.tables[shape.table];
+      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`);
+      const { text, params } = shapeSelectSql(shape.table, shape.where);
+      const res = await client.query(text, params);
+      return res.rows as Row[];
     },
 
     async reset() {
       for (const name of Object.keys(schema.tables)) {
-        await client.query(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`)
+        await client.query(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`);
       }
     },
 
     async close() {
-      await client.end()
+      await client.end();
     },
-  }
+  };
 }

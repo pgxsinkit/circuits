@@ -40,7 +40,7 @@ The engine sets everything else up for you on startup, per configured table:
 - `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
   compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
 - `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
-  ALL TABLES` (superuser) — the replication slot and its publication, created once
+ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.
 
 > **Each table needs a single-column primary key.** The engine introspects columns, types, and the pk
@@ -69,26 +69,26 @@ the replication ingestor, and begins serving the control API on `CIRCUITS_BIND`.
 
 ### Configuration reference
 
-| Variable                  | Required | Default          | Meaning |
-|---------------------------|:--------:|------------------|---------|
-| `CIRCUITS_DS_URL`    | yes      | —                | durable-streams base URL. |
-| `CIRCUITS_PG_URL`    | yes¹     | —                | Postgres connection string. Setting it enables Postgres mode. |
-| `CIRCUITS_PG_TABLES` | yes¹     | (empty)          | Comma-separated tables to watch: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` / `*` for every table with a primary key in that schema. `*` and an empty setting both mean `public.*` — never every schema. |
-| `CIRCUITS_PG_SLOT`   | no       | `circuits`  | Logical replication slot name (unique per engine). |
-| `CIRCUITS_PG_POLL_MS`| no       | —                | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery). |
-| `CIRCUITS_BIND`      | no       | `127.0.0.1:0`    | Address for the control/HTTP API. |
-| `CIRCUITS_LOG`       | no       | `info`           | Log filter (`error`, `warn`, `info`, `debug`). |
-| `CIRCUITS_RESET_ON_SLOT_LOSS` | no | `true`      | Policy when the replication slot can no longer be trusted: `true` retires every shape and starts a new epoch; `false` refuses (fail-closed) until `POST /epoch/reset`. See "Losing the replication slot" below. |
-| `CIRCUITS_CHANGES_SEGMENT_BYTES` | no | `1073741824` | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below. |
-| `CIRCUITS_CHANGES_SEGMENT_SECS` | no | `86400` | Change-log segment age before rotation (`0` disables the age criterion). |
-| `CIRCUITS_CHANGES_RETAIN_SECS` | no | `604800` | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever). |
-| `CIRCUITS_TXN_MEMORY_BYTES` | no | `134217728` | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below. |
-| `CIRCUITS_CHANGES_APPEND_BYTES` | no | `67108864` | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot. |
-| `CIRCUITS_TXN_SPILL_DIR` | no | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines. |
-| `CIRCUITS_BACKFILL_APPEND_BYTES` | no | `16777216` | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below. |
-| `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | no | `0` (off) | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected. |
-| `CIRCUITS_SHUTDOWN_GRACE_SECS` | no | `25` | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
-| `CIRCUITS_SHUTDOWN_DRAIN_SECS` | no | `2` | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once. |
+| Variable                                 | Required | Default                               | Meaning                                                                                                                                                                                                                                     |
+| ---------------------------------------- | :------: | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CIRCUITS_DS_URL`                        |   yes    | —                                     | durable-streams base URL.                                                                                                                                                                                                                   |
+| `CIRCUITS_PG_URL`                        |   yes¹   | —                                     | Postgres connection string. Setting it enables Postgres mode.                                                                                                                                                                               |
+| `CIRCUITS_PG_TABLES`                     |   yes¹   | (empty)                               | Comma-separated tables to watch: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` / `*` for every table with a primary key in that schema. `*` and an empty setting both mean `public.*` — never every schema.               |
+| `CIRCUITS_PG_SLOT`                       |    no    | `circuits`                            | Logical replication slot name (unique per engine).                                                                                                                                                                                          |
+| `CIRCUITS_PG_POLL_MS`                    |    no    | —                                     | Legacy; accepted but unused (the ingestor streams pgoutput, push delivery).                                                                                                                                                                 |
+| `CIRCUITS_BIND`                          |    no    | `127.0.0.1:0`                         | Address for the control/HTTP API.                                                                                                                                                                                                           |
+| `CIRCUITS_LOG`                           |    no    | `info`                                | Log filter (`error`, `warn`, `info`, `debug`).                                                                                                                                                                                              |
+| `CIRCUITS_RESET_ON_SLOT_LOSS`            |    no    | `true`                                | Policy when the replication slot can no longer be trusted: `true` retires every shape and starts a new epoch; `false` refuses (fail-closed) until `POST /epoch/reset`. See "Losing the replication slot" below.                             |
+| `CIRCUITS_CHANGES_SEGMENT_BYTES`         |    no    | `1073741824`                          | Change-log segment size before rotation (`0` disables the size criterion). See "Change-log disk" below.                                                                                                                                     |
+| `CIRCUITS_CHANGES_SEGMENT_SECS`          |    no    | `86400`                               | Change-log segment age before rotation (`0` disables the age criterion).                                                                                                                                                                    |
+| `CIRCUITS_CHANGES_RETAIN_SECS`           |    no    | `604800`                              | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted and the segment deleted (`0` = pin forever).                                                                                                 |
+| `CIRCUITS_TXN_MEMORY_BYTES`              |    no    | `134217728`                           | In-memory bytes of ONE transaction (the changes actually held: inline size plus owned heap, not the size they would serialize to) before the ingestor spills the rest to disk (`0` = never spill). See "Large transactions" below.          |
+| `CIRCUITS_CHANGES_APPEND_BYTES`          |    no    | `67108864`                            | Byte budget for one append when a large commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — outside that, the engine refuses to boot.                                                                      |
+| `CIRCUITS_TXN_SPILL_DIR`                 |    no    | `<temp dir>/circuits-txn-spill-<uid>` | Where a spilled transaction's temporary file goes (created 0700, files 0600). Must have room for your largest transaction, must be writable at boot, and must not be shared between engines.                                                |
+| `CIRCUITS_BACKFILL_APPEND_BYTES`         |    no    | `16777216`                            | Byte budget for one backfill append. A backfill is streamed and appended chunk by chunk, so engine memory per backfill is one chunk. Must be > 0 and ≤ the durable-streams 1 GiB body cap. See "Backfills" below.                           |
+| `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` |    no    | `0` (off)                             | `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** shape creation with a clear error; nothing else is affected.                                                                                        |
+| `CIRCUITS_SHUTDOWN_GRACE_SECS`           |    no    | `25`                                  | How long a graceful shutdown may take before it is forced (exit `70`). Keep it below your `terminationGracePeriodSeconds`. A catalog append still being retried through a storage outage counts as work in flight (party `catalog writer`). |
+| `CIRCUITS_SHUTDOWN_DRAIN_SECS`           |    no    | `2`                                   | How long the port stays open after `SIGTERM` answering `/ready` with 503, so a load balancer drains first. Comes out of the grace, must be less than it; `0` = stop accepting at once.                                                      |
 
 ¹ Omit `CIRCUITS_PG_URL` to run in library/no-source mode (shapes start empty; used by tests).
 
@@ -98,17 +98,17 @@ The client subscribes to shapes over the engine's API and materializes them with
 Writes go to **Postgres**, not the client:
 
 ```ts
-import { createClient } from '@circuits/client'
+import { createClient } from "@circuits/client";
 
-const client = createClient({ apiUrl: 'http://engine.internal:9000', schema })
+const client = createClient({ apiUrl: "http://engine.internal:9000", schema });
 
 // Declare a shape; rows stay live as Postgres changes.
 const activeUsers = await client.shape({
-  table: 'users',
-  where: { col: 'active', op: 'eq', value: true },
-})
+  table: "users",
+  where: { col: "active", op: "eq", value: true },
+});
 
-activeUsers.subscribe((rows) => render(rows))
+activeUsers.subscribe((rows) => render(rows));
 
 // To change data, write to Postgres however you already do (psql, your ORM, etc.):
 //   UPDATE users SET active = false WHERE id = 42;
@@ -218,7 +218,7 @@ Two caveats worth knowing rather than discovering:
   `changes_segments_deleted_total` and the `changes_segments_retained` gauge.
 - **Large transactions spill to disk, they do not blow up the ingestor's memory.** A transaction is
   only appendable once its commit arrives, so the ingestor has to hold it — and a bulk
-  `UPDATE`/`DELETE` under `REPLICA IDENTITY FULL` carries the old *and* new row for every change. Past
+  `UPDATE`/`DELETE` under `REPLICA IDENTITY FULL` carries the old _and_ new row for every change. Past
   `CIRCUITS_TXN_MEMORY_BYTES` (128 MiB of held changes) the buffer is written to one
   temporary file in `CIRCUITS_TXN_SPILL_DIR` and memory is released, so peak **ingestor**
   memory is that cap plus one append chunk whatever the transaction's size. That bound is the
@@ -241,7 +241,7 @@ Two caveats worth knowing rather than discovering:
 - **`SIGTERM` drains, it does not kill.** On the signal the engine turns `GET /ready` into
   `503 {"status":"shutting_down"}` and keeps the port open for
   `CIRCUITS_SHUTDOWN_DRAIN_SECS` (2 s) so your load balancer takes the pod out of rotation;
-  then it stops accepting, lets the ingestor finish the transaction it is *appending*, lets the
+  then it stops accepting, lets the ingestor finish the transaction it is _appending_, lets the
   sequencer finish its batch and write a final checkpoint, drains that checkpoint to
   durable-streams, and exits `0`. The ingestor's position is recorded **locally**: the
   acknowledgement Postgres sees rides the replication client's 1 s status interval and is not forced
@@ -259,7 +259,7 @@ Two caveats worth knowing rather than discovering:
   Kubernetes at those two.
 - **A boot failure is either fatal or retryable, and the engine says which.** Bad credentials, a
   missing privilege, an unknown database, `wal_level` ≠ `logical` (checked explicitly at connect —
-  it needs a Postgres *restart* to fix), a `CIRCUITS_PG_URL` the driver cannot parse (caught
+  it needs a Postgres _restart_ to fix), a `CIRCUITS_PG_URL` the driver cannot parse (caught
   while resolving the configuration, before the port is bound), an unusable
   `CIRCUITS_PG_TABLES`, a publication with a column list, or a durable catalog it could not
   read: the engine names the problem and exits **`78`** immediately, because retrying would only
@@ -268,7 +268,7 @@ Two caveats worth knowing rather than discovering:
   Postgres:** a refused connection, a timeout or a 5xx from the storage server is retryable
   (`durable-streams is unreachable` in the log, `/ready` = `waiting`), because storage coming up
   after its engine is ordinary; a malformed catalog or an unusable `CIRCUITS_DS_URL` is
-  fatal. A connection attempt that *hangs* — a firewalled host, a stale Service IP — is cut off after
+  fatal. A connection attempt that _hangs_ — a firewalled host, a stale Service IP — is cut off after
   10 s and retried rather than silently wedging the boot. A connection refused, a DNS failure, a
   timeout, or "the database system is starting up": it backs off 1 s → 30 s with jitter and keeps
   trying **forever**, answering `/ready` with `503 waiting` and logging every attempt. Its HTTP port
@@ -297,7 +297,7 @@ Two caveats worth knowing rather than discovering:
   against `max_slot_wal_keep_size`.
 - **Losing the replication slot costs a full resync — and the engine says so.** The engine records
   which slot, in which cluster (`pg_control_system().system_identifier`), it is bound to, and checks
-  that binding before *every* connection. Things that break it in practice:
+  that binding before _every_ connection. Things that break it in practice:
   `max_slot_wal_keep_size` reclaiming the WAL the slot needed (`pg_replication_slots.wal_status`
   goes to `lost`); restoring the database from a backup or a snapshot (new `system_identifier`,
   and usually no slot — slots are not part of a `pg_dump` and do not survive a PITR); a **major
@@ -317,6 +317,7 @@ Two caveats worth knowing rather than discovering:
   performs exactly the reset above. Pick `false` when an unscheduled resync is worse than an outage
   (and alert on `epoch_breaks_total`); pick the default when an unattended deployment must heal
   itself. Either way, budget `max_slot_wal_keep_size` for your worst expected engine downtime.
+
 - **A change the engine cannot process parks it — and only an operator clears that.** If the
   sequencer reaches a change-log envelope it cannot decode under the very schema it was written with
   (an engine bug or corrupt storage; schema drift is recognised and never looks like this — ADR-0010),
@@ -379,7 +380,7 @@ Two caveats worth knowing rather than discovering:
   `schema of <t> changed during creation; retry` rather than being served over the old schema.
   One exception: a table with a counts pipeline (`CIRCUITS_DBSP_COUNTS`) has no runtime
   circuit rebuild, so the engine additionally exits (code `75`) to be restarted once the retirements
-  have landed — plan migrations *and truncates* on those tables like a rolling restart.
+  have landed — plan migrations _and truncates_ on those tables like a rolling restart.
 - **Migrating while the engine is stopped works too.** Every shape record stores the fingerprint its
   table had when the shape was created; at boot the engine re-introspects and retires any shape whose
   table moved while it was down, so a restart after a migration is a resync of the affected tables,

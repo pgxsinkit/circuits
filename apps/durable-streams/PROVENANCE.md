@@ -5,14 +5,14 @@ This repository is a fork of ElectricSQL's Rust Durable Streams server, extracte
 
 ## Fork point
 
-| | |
-|---|---|
-| Upstream repo | `electric-sql/electric` |
+|                 |                                                                 |
+| --------------- | --------------------------------------------------------------- |
+| Upstream repo   | `electric-sql/electric`                                         |
 | Upstream commit | `dc07a1e6c8ff459b59ce407cdb6bf2f7fd068f36` (2026-08-21, `main`) |
-| Upstream path | `packages/durable-streams-rust` |
-| Tree hash | `af3df4adb7023db36ba8aae8d8321deab1a5c43c` |
-| Version at fork | `0.1.5` |
-| License | Apache-2.0 (see `LICENSE`, `NOTICE`) |
+| Upstream path   | `packages/durable-streams-rust`                                 |
+| Tree hash       | `af3df4adb7023db36ba8aae8d8321deab1a5c43c`                      |
+| Version at fork | `0.1.5`                                                         |
+| License         | Apache-2.0 (see `LICENSE`, `NOTICE`)                            |
 
 `main` is the extraction, byte-identical to the upstream subdirectory at that commit. History was
 rewritten with `git-filter-repo` over both the current path and its pre-rename predecessor
@@ -67,10 +67,10 @@ sibling package's `node_modules`, which never resolved outside the monorepo.
 The protocol conformance suite is this fork's contract. Measured at the fork point (release build,
 rustc 1.96.0):
 
-| suite version | result |
-|---|---|
+| suite version                                | result                              |
+| -------------------------------------------- | ----------------------------------- |
 | `0.3.5` — the last version upstream ever ran | **326 passed, 0 failed**, 6 skipped |
-| `0.3.6` — current | 329 passed, **3 failed**, 6 skipped |
+| `0.3.6` — current                            | 329 passed, **3 failed**, 6 skipped |
 
 The extraction is therefore clean: no regressions. `0.3.6` was published 2026-07-16, two days after
 the last upstream commit to this server, and `package.json` carried a caret range, so upstream CI

@@ -14,10 +14,13 @@ reopen trigger for that half, so only the `CIRCUITS_DS_URL` half remains. `GET /
 on the engine's own port is the scrape target, and it exports every engine counter and gauge.
 
 ## The fact
+
 **`CIRCUITS_DS_URL` is not parse-validated at config time** the way `CIRCUITS_PG_URL` now is (`pg::parse_pg_url` in `Config::resolve`). An unusable durable-streams URL surfaces as a fatal `reqwest` builder error on first use — still exit 78, just later and with a less direct message.
 
 ## Fix direction
+
 Validate the DS URL in `Config::resolve` and refuse with a redacted, named message.
 
 ## Not now because
+
 Cosmetic; the path already fails loudly. Surfaced in the slice-6 follow-ups (`docs/notes/2026-08-21-upstream-issue-triage.md`).

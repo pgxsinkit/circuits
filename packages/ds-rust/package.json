@@ -1,8 +1,8 @@
 {
   "name": "@circuits/ds-rust",
-  "description": "Drop-in replacement for @durable-streams/server's test server, backed by the native Rust durable-streams binary.",
   "version": "0.0.0",
   "private": true,
+  "description": "Drop-in replacement for @durable-streams/server's test server, backed by the native Rust durable-streams binary.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

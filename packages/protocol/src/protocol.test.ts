@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it } from "vitest";
+
 import {
   canonicalTable,
   changeEventToDML,
@@ -16,231 +17,256 @@ import {
   tableDDL,
   type TableDef,
   validatePredicate,
-} from './index.js'
+} from "./index.js";
 
 const users: TableDef = {
   columns: {
-    id: { type: 'int' },
-    name: { type: 'text' },
-    age: { type: 'int' },
-    active: { type: 'bool' },
-    score: { type: 'float' },
+    id: { type: "int" },
+    name: { type: "text" },
+    age: { type: "int" },
+    active: { type: "bool" },
+    score: { type: "float" },
   },
-  primaryKey: 'id',
-}
+  primaryKey: "id",
+};
 
-const alice: Row = { id: 1, name: 'Alice', age: 30, active: true, score: 9.5 }
-const bob: Row = { id: 2, name: 'Bob', age: 17, active: false, score: 3.2 }
+const alice: Row = { id: 1, name: "Alice", age: 30, active: true, score: 9.5 };
+const bob: Row = { id: 2, name: "Bob", age: 17, active: false, score: 3.2 };
 
-describe('evaluate', () => {
-  it('handles equality leaves', () => {
-    expect(evaluate({ col: 'name', op: 'eq', value: 'Alice' }, alice)).toBe(true)
-    expect(evaluate({ col: 'name', op: 'eq', value: 'Alice' }, bob)).toBe(false)
-  })
+describe("evaluate", () => {
+  it("handles equality leaves", () => {
+    expect(evaluate({ col: "name", op: "eq", value: "Alice" }, alice)).toBe(true);
+    expect(evaluate({ col: "name", op: "eq", value: "Alice" }, bob)).toBe(false);
+  });
 
-  it('handles comparison ops', () => {
-    expect(evaluate({ col: 'age', op: 'gte', value: 18 }, alice)).toBe(true)
-    expect(evaluate({ col: 'age', op: 'gte', value: 18 }, bob)).toBe(false)
-    expect(evaluate({ col: 'age', op: 'lt', value: 18 }, bob)).toBe(true)
-    expect(evaluate({ col: 'name', op: 'neq', value: 'Alice' }, bob)).toBe(true)
-  })
+  it("handles comparison ops", () => {
+    expect(evaluate({ col: "age", op: "gte", value: 18 }, alice)).toBe(true);
+    expect(evaluate({ col: "age", op: "gte", value: 18 }, bob)).toBe(false);
+    expect(evaluate({ col: "age", op: "lt", value: 18 }, bob)).toBe(true);
+    expect(evaluate({ col: "name", op: "neq", value: "Alice" }, bob)).toBe(true);
+  });
 
-  it('handles and/or/not', () => {
+  it("handles and/or/not", () => {
     const p: Predicate = {
       and: [
-        { col: 'active', op: 'eq', value: true },
-        { or: [{ col: 'age', op: 'gt', value: 25 }, { col: 'score', op: 'gt', value: 100 }] },
+        { col: "active", op: "eq", value: true },
+        {
+          or: [
+            { col: "age", op: "gt", value: 25 },
+            { col: "score", op: "gt", value: 100 },
+          ],
+        },
       ],
-    }
-    expect(evaluate(p, alice)).toBe(true)
-    expect(evaluate(p, bob)).toBe(false)
-    expect(evaluate({ not: { col: 'active', op: 'eq', value: true } }, bob)).toBe(true)
-  })
+    };
+    expect(evaluate(p, alice)).toBe(true);
+    expect(evaluate(p, bob)).toBe(false);
+    expect(evaluate({ not: { col: "active", op: "eq", value: true } }, bob)).toBe(true);
+  });
 
-  it('treats missing/null cells as non-matching', () => {
-    expect(evaluate({ col: 'missing', op: 'eq', value: 1 }, alice)).toBe(false)
-    expect(evaluate({ col: 'name', op: 'eq', value: null }, { name: null })).toBe(false)
-  })
+  it("treats missing/null cells as non-matching", () => {
+    expect(evaluate({ col: "missing", op: "eq", value: 1 }, alice)).toBe(false);
+    expect(evaluate({ col: "name", op: "eq", value: null }, { name: null })).toBe(false);
+  });
 
-  it('uses SQL three-valued logic for nulls', () => {
-    const r: Row = { id: 1, name: null, age: null, active: true, score: 1 }
+  it("uses SQL three-valued logic for nulls", () => {
+    const r: Row = { id: 1, name: null, age: null, active: true, score: 1 };
     // leaf over null -> UNKNOWN -> excluded (eq and neq alike)
-    expect(evaluate({ col: 'name', op: 'eq', value: 'Alice' }, r)).toBe(false)
-    expect(evaluate({ col: 'name', op: 'neq', value: 'Alice' }, r)).toBe(false)
+    expect(evaluate({ col: "name", op: "eq", value: "Alice" }, r)).toBe(false);
+    expect(evaluate({ col: "name", op: "neq", value: "Alice" }, r)).toBe(false);
     // NOT(eq) over null -> NOT UNKNOWN = UNKNOWN -> excluded (the fix; was true under two-valued)
-    expect(evaluate({ not: { col: 'name', op: 'eq', value: 'Alice' } }, r)).toBe(false)
+    expect(evaluate({ not: { col: "name", op: "eq", value: "Alice" } }, r)).toBe(false);
     // AND: TRUE AND UNKNOWN = UNKNOWN -> excluded
-    expect(evaluate({ and: [{ col: 'active', op: 'eq', value: true }, { col: 'age', op: 'gt', value: 18 }] }, r)).toBe(false)
+    expect(
+      evaluate(
+        {
+          and: [
+            { col: "active", op: "eq", value: true },
+            { col: "age", op: "gt", value: 18 },
+          ],
+        },
+        r,
+      ),
+    ).toBe(false);
     // OR: TRUE OR UNKNOWN = TRUE -> included
-    expect(evaluate({ or: [{ col: 'active', op: 'eq', value: true }, { col: 'age', op: 'gt', value: 18 }] }, r)).toBe(true)
-  })
-})
+    expect(
+      evaluate(
+        {
+          or: [
+            { col: "active", op: "eq", value: true },
+            { col: "age", op: "gt", value: 18 },
+          ],
+        },
+        r,
+      ),
+    ).toBe(true);
+  });
+});
 
-describe('validatePredicate', () => {
-  it('accepts valid predicates', () => {
-    expect(() => validatePredicate({ col: 'age', op: 'gt', value: 18 }, users)).not.toThrow()
-  })
-  it('rejects unknown columns', () => {
-    expect(() => validatePredicate({ col: 'nope', op: 'eq', value: 1 }, users)).toThrow(PredicateError)
-  })
-  it('rejects type mismatches', () => {
-    expect(() => validatePredicate({ col: 'age', op: 'eq', value: 'x' }, users)).toThrow(PredicateError)
-    expect(() => validatePredicate({ col: 'name', op: 'eq', value: 5 }, users)).toThrow(PredicateError)
-  })
-})
+describe("validatePredicate", () => {
+  it("accepts valid predicates", () => {
+    expect(() => validatePredicate({ col: "age", op: "gt", value: 18 }, users)).not.toThrow();
+  });
+  it("rejects unknown columns", () => {
+    expect(() => validatePredicate({ col: "nope", op: "eq", value: 1 }, users)).toThrow(PredicateError);
+  });
+  it("rejects type mismatches", () => {
+    expect(() => validatePredicate({ col: "age", op: "eq", value: "x" }, users)).toThrow(PredicateError);
+    expect(() => validatePredicate({ col: "name", op: "eq", value: 5 }, users)).toThrow(PredicateError);
+  });
+});
 
-describe('predicateToSql', () => {
-  it('compiles a leaf with a parameter', () => {
-    const f = predicateToSql({ col: 'name', op: 'eq', value: 'Alice' })
-    expect(f.text).toBe('"name" = $1')
-    expect(f.params).toEqual(['Alice'])
-  })
-  it('compiles nested and/or/not with sequential params', () => {
+describe("predicateToSql", () => {
+  it("compiles a leaf with a parameter", () => {
+    const f = predicateToSql({ col: "name", op: "eq", value: "Alice" });
+    expect(f.text).toBe('"name" = $1');
+    expect(f.params).toEqual(["Alice"]);
+  });
+  it("compiles nested and/or/not with sequential params", () => {
     const p: Predicate = {
       and: [
-        { col: 'active', op: 'eq', value: true },
-        { or: [{ col: 'age', op: 'gt', value: 25 }, { not: { col: 'name', op: 'eq', value: 'Bob' } }] },
+        { col: "active", op: "eq", value: true },
+        { or: [{ col: "age", op: "gt", value: 25 }, { not: { col: "name", op: "eq", value: "Bob" } }] },
       ],
-    }
-    const f = predicateToSql(p)
-    expect(f.text).toBe('("active" = $1 AND ("age" > $2 OR (NOT "name" = $3)))')
-    expect(f.params).toEqual([true, 25, 'Bob'])
-  })
-})
+    };
+    const f = predicateToSql(p);
+    expect(f.text).toBe('("active" = $1 AND ("age" > $2 OR (NOT "name" = $3)))');
+    expect(f.params).toEqual([true, 25, "Bob"]);
+  });
+});
 
-describe('subqueries', () => {
+describe("subqueries", () => {
   const schema: Schema = {
     tables: {
-      parent: { columns: { id: { type: 'int' }, active: { type: 'bool' } }, primaryKey: 'id' },
-      child: { columns: { id: { type: 'int' }, parent_id: { type: 'int' } }, primaryKey: 'id' },
+      parent: { columns: { id: { type: "int" }, active: { type: "bool" } }, primaryKey: "id" },
+      child: { columns: { id: { type: "int" }, parent_id: { type: "int" } }, primaryKey: "id" },
     },
-  }
+  };
   const sub: InSubqueryPredicate = {
-    col: 'parent_id',
-    in: { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } },
-  }
+    col: "parent_id",
+    in: { table: "parent", project: "id", where: { col: "active", op: "eq", value: true } },
+  };
 
-  it('recognizes an in-subquery leaf (and not as a plain leaf)', () => {
-    expect(isInSubquery(sub)).toBe(true)
-    expect(isInSubquery({ col: 'parent_id', op: 'eq', value: 1 } as Predicate)).toBe(false)
-  })
+  it("recognizes an in-subquery leaf (and not as a plain leaf)", () => {
+    expect(isInSubquery(sub)).toBe(true);
+    expect(isInSubquery({ col: "parent_id", op: "eq", value: 1 } as Predicate)).toBe(false);
+  });
 
-  it('validates the inner where against the inner table', () => {
-    expect(() => validatePredicate(sub, schema.tables.child!, schema)).not.toThrow()
+  it("validates the inner where against the inner table", () => {
+    expect(() => validatePredicate(sub, schema.tables.child!, schema)).not.toThrow();
     const badInnerCol: InSubqueryPredicate = {
-      col: 'parent_id',
-      in: { table: 'parent', project: 'id', where: { col: 'nope', op: 'eq', value: true } },
-    }
-    expect(() => validatePredicate(badInnerCol, schema.tables.child!, schema)).toThrow(PredicateError)
-    const badProject: InSubqueryPredicate = { col: 'parent_id', in: { table: 'parent', project: 'nope' } }
-    expect(() => validatePredicate(badProject, schema.tables.child!, schema)).toThrow(PredicateError)
-    const badOuterCol: InSubqueryPredicate = { col: 'nope', in: { table: 'parent', project: 'id' } }
-    expect(() => validatePredicate(badOuterCol, schema.tables.child!, schema)).toThrow(PredicateError)
-    expect(() => validatePredicate(sub, schema.tables.child!)).toThrow(/requires a schema/)
-  })
+      col: "parent_id",
+      in: { table: "parent", project: "id", where: { col: "nope", op: "eq", value: true } },
+    };
+    expect(() => validatePredicate(badInnerCol, schema.tables.child!, schema)).toThrow(PredicateError);
+    const badProject: InSubqueryPredicate = { col: "parent_id", in: { table: "parent", project: "nope" } };
+    expect(() => validatePredicate(badProject, schema.tables.child!, schema)).toThrow(PredicateError);
+    const badOuterCol: InSubqueryPredicate = { col: "nope", in: { table: "parent", project: "id" } };
+    expect(() => validatePredicate(badOuterCol, schema.tables.child!, schema)).toThrow(PredicateError);
+    expect(() => validatePredicate(sub, schema.tables.child!)).toThrow(/requires a schema/);
+  });
 
-  it('evaluate() throws on a subquery (resolved via SQL, not the row evaluator)', () => {
-    expect(() => evaluate(sub, { parent_id: 1 })).toThrow(/subquery/)
-  })
+  it("evaluate() throws on a subquery (resolved via SQL, not the row evaluator)", () => {
+    expect(() => evaluate(sub, { parent_id: 1 })).toThrow(/subquery/);
+  });
 
-  it('emits IN (SELECT …) SQL with parameterized inner literals', () => {
-    const f = predicateToSql(sub, 1)
-    expect(f.text).toBe('"parent_id" IN (SELECT "id" FROM "public"."parent" WHERE "active" = $1)')
-    expect(f.params).toEqual([true])
-  })
+  it("emits IN (SELECT …) SQL with parameterized inner literals", () => {
+    const f = predicateToSql(sub, 1);
+    expect(f.text).toBe('"parent_id" IN (SELECT "id" FROM "public"."parent" WHERE "active" = $1)');
+    expect(f.params).toEqual([true]);
+  });
 
-  it('emits NOT IN and supports an omitted inner where', () => {
-    const f = predicateToSql({ col: 'parent_id', negated: true, in: { table: 'parent', project: 'id' } }, 1)
-    expect(f.text).toBe('"parent_id" NOT IN (SELECT "id" FROM "public"."parent")')
-    expect(f.params).toEqual([])
-  })
+  it("emits NOT IN and supports an omitted inner where", () => {
+    const f = predicateToSql({ col: "parent_id", negated: true, in: { table: "parent", project: "id" } }, 1);
+    expect(f.text).toBe('"parent_id" NOT IN (SELECT "id" FROM "public"."parent")');
+    expect(f.params).toEqual([]);
+  });
 
-  it('composes inside shapeSelectSql with surrounding params', () => {
-    const where: Predicate = { and: [{ col: 'id', op: 'gt', value: 5 }, sub] }
-    const f = shapeSelectSql('child', where)
+  it("composes inside shapeSelectSql with surrounding params", () => {
+    const where: Predicate = { and: [{ col: "id", op: "gt", value: 5 }, sub] };
+    const f = shapeSelectSql("child", where);
     expect(f.text).toBe(
       'SELECT * FROM "public"."child" WHERE ("id" > $1 AND "parent_id" IN (SELECT "id" FROM "public"."parent" WHERE "active" = $2))',
-    )
-    expect(f.params).toEqual([5, true])
-  })
-})
+    );
+    expect(f.params).toEqual([5, true]);
+  });
+});
 
-describe('tableDDL', () => {
-  it('emits CREATE TABLE with a primary key', () => {
-    const ddl = tableDDL('users', users)
-    expect(ddl).toContain('CREATE TABLE "public"."users"')
-    expect(ddl).toContain('"id" INTEGER')
-    expect(ddl).toContain('"score" DOUBLE PRECISION')
-    expect(ddl).toContain('"active" BOOLEAN')
-    expect(ddl).toContain('PRIMARY KEY ("id")')
-  })
-})
+describe("tableDDL", () => {
+  it("emits CREATE TABLE with a primary key", () => {
+    const ddl = tableDDL("users", users);
+    expect(ddl).toContain('CREATE TABLE "public"."users"');
+    expect(ddl).toContain('"id" INTEGER');
+    expect(ddl).toContain('"score" DOUBLE PRECISION');
+    expect(ddl).toContain('"active" BOOLEAN');
+    expect(ddl).toContain('PRIMARY KEY ("id")');
+  });
+});
 
-describe('changeEventToDML', () => {
-  it('upserts the full row on insert', () => {
-    const f = changeEventToDML('users', users, { op: 'insert', pk: 1, row: alice })
-    expect(f.text).toContain('INSERT INTO "public"."users"')
-    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
-    expect(f.text).toContain('"name" = EXCLUDED."name"')
-    expect(f.params).toEqual([1, 'Alice', 30, true, 9.5])
-  })
-  it('updates only the columns present in the row (partial patch)', () => {
-    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: { name: 'Alicia', age: 31 } })
-    expect(f.text).toBe('UPDATE "public"."users" SET "name" = $1, "age" = $2 WHERE "id" = $3')
-    expect(f.params).toEqual(['Alicia', 31, 1])
-  })
-  it('upserts when a full row is given (an update with a new pk inserts it — Electric semantics)', () => {
-    const f = changeEventToDML('users', users, { op: 'update', pk: 1, row: alice })
-    expect(f.text).toContain('INSERT INTO "public"."users"')
-    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET')
-    expect(f.text).toContain('"name" = EXCLUDED."name"')
-    expect(f.params).toEqual([1, 'Alice', 30, true, 9.5])
-  })
-  it('deletes by pk', () => {
-    const f = changeEventToDML('users', users, { op: 'delete', pk: 2 })
-    expect(f.text).toBe('DELETE FROM "public"."users" WHERE "id" = $1')
-    expect(f.params).toEqual([2])
-  })
-})
+describe("changeEventToDML", () => {
+  it("upserts the full row on insert", () => {
+    const f = changeEventToDML("users", users, { op: "insert", pk: 1, row: alice });
+    expect(f.text).toContain('INSERT INTO "public"."users"');
+    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET');
+    expect(f.text).toContain('"name" = EXCLUDED."name"');
+    expect(f.params).toEqual([1, "Alice", 30, true, 9.5]);
+  });
+  it("updates only the columns present in the row (partial patch)", () => {
+    const f = changeEventToDML("users", users, { op: "update", pk: 1, row: { name: "Alicia", age: 31 } });
+    expect(f.text).toBe('UPDATE "public"."users" SET "name" = $1, "age" = $2 WHERE "id" = $3');
+    expect(f.params).toEqual(["Alicia", 31, 1]);
+  });
+  it("upserts when a full row is given (an update with a new pk inserts it — Electric semantics)", () => {
+    const f = changeEventToDML("users", users, { op: "update", pk: 1, row: alice });
+    expect(f.text).toContain('INSERT INTO "public"."users"');
+    expect(f.text).toContain('ON CONFLICT ("id") DO UPDATE SET');
+    expect(f.text).toContain('"name" = EXCLUDED."name"');
+    expect(f.params).toEqual([1, "Alice", 30, true, 9.5]);
+  });
+  it("deletes by pk", () => {
+    const f = changeEventToDML("users", users, { op: "delete", pk: 2 });
+    expect(f.text).toBe('DELETE FROM "public"."users" WHERE "id" = $1');
+    expect(f.params).toEqual([2]);
+  });
+});
 
-describe('shapeSelectSql', () => {
-  it('selects all without a predicate', () => {
-    expect(shapeSelectSql('users').text).toBe('SELECT * FROM "public"."users"')
-  })
-  it('selects with a where clause', () => {
-    const f = shapeSelectSql('users', { col: 'active', op: 'eq', value: true })
-    expect(f.text).toBe('SELECT * FROM "public"."users" WHERE "active" = $1')
-    expect(f.params).toEqual([true])
-  })
-})
+describe("shapeSelectSql", () => {
+  it("selects all without a predicate", () => {
+    expect(shapeSelectSql("users").text).toBe('SELECT * FROM "public"."users"');
+  });
+  it("selects with a where clause", () => {
+    const f = shapeSelectSql("users", { col: "active", op: "eq", value: true });
+    expect(f.text).toBe('SELECT * FROM "public"."users" WHERE "active" = $1');
+    expect(f.params).toEqual([true]);
+  });
+});
 
-describe('table references (ADR-0002)', () => {
-  it('reads a bare name as public sugar and a qualified one as given', () => {
-    expect(parseTableRef('items')).toEqual({ schema: 'public', name: 'items' })
-    expect(parseTableRef('other.items')).toEqual({ schema: 'other', name: 'items' })
-    expect(canonicalTable('items')).toBe('public.items')
-    expect(canonicalTable('other.items')).toBe('other.items')
+describe("table references (ADR-0002)", () => {
+  it("reads a bare name as public sugar and a qualified one as given", () => {
+    expect(parseTableRef("items")).toEqual({ schema: "public", name: "items" });
+    expect(parseTableRef("other.items")).toEqual({ schema: "other", name: "items" });
+    expect(canonicalTable("items")).toBe("public.items");
+    expect(canonicalTable("other.items")).toBe("other.items");
     // One table, one spelling: the sugar and the explicit form canonicalise identically.
-    expect(canonicalTable('items')).toBe(canonicalTable('public.items'))
-  })
+    expect(canonicalTable("items")).toBe(canonicalTable("public.items"));
+  });
 
-  it('rejects anything that is not exactly schema.name or a bare name', () => {
-    for (const bad of ['a.b.c', '', '   ', '.', 'a.', '.b', 'a..b', '"a".b', 'us"ers']) {
-      expect(() => parseTableRef(bad), bad).toThrow()
+  it("rejects anything that is not exactly schema.name or a bare name", () => {
+    for (const bad of ["a.b.c", "", "   ", ".", "a.", ".b", "a..b", '"a".b', 'us"ers']) {
+      expect(() => parseTableRef(bad), bad).toThrow();
     }
-  })
+  });
 
-  it('quotes each part of the SQL identifier form', () => {
-    expect(qualifiedIdent('items')).toBe('"public"."items"')
-    expect(qualifiedIdent('other.items')).toBe('"other"."items"')
-  })
+  it("quotes each part of the SQL identifier form", () => {
+    expect(qualifiedIdent("items")).toBe('"public"."items"');
+    expect(qualifiedIdent("other.items")).toBe('"other"."items"');
+  });
 
-  it('qualifies the DDL and DML of a non-public table', () => {
-    const def: TableDef = { columns: { id: { type: 'int' } }, primaryKey: 'id' }
-    expect(tableDDL('other.items', def)).toContain('CREATE TABLE "other"."items"')
-    expect(shapeSelectSql('other.items').text).toBe('SELECT * FROM "other"."items"')
-    expect(changeEventToDML('other.items', def, { op: 'delete', pk: 1 }).text).toBe(
+  it("qualifies the DDL and DML of a non-public table", () => {
+    const def: TableDef = { columns: { id: { type: "int" } }, primaryKey: "id" };
+    expect(tableDDL("other.items", def)).toContain('CREATE TABLE "other"."items"');
+    expect(shapeSelectSql("other.items").text).toBe('SELECT * FROM "other"."items"');
+    expect(changeEventToDML("other.items", def, { op: "delete", pk: 1 }).text).toBe(
       'DELETE FROM "other"."items" WHERE "id" = $1',
-    )
-  })
-})
+    );
+  });
+});

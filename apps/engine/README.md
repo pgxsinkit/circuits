@@ -2,7 +2,7 @@
 
 The Rust engine at the center of [Circuits](../../README.md): a durable-streams client that
 turns Postgres logical-replication changes into incrementally-maintained **shapes**, **subquery
-inner-sets**, and **scalar aggregations** — one maintained stream per *distinct* definition,
+inner-sets**, and **scalar aggregations** — one maintained stream per _distinct_ definition,
 ref-counted and shared across subscribers. It serves one HTTP surface, the **control plane**
 (`/schema`, `/shapes`, `/aggregate`, `/query`, the probes, introspection); clients read shape
 streams from the log server.
@@ -24,7 +24,7 @@ target/debug/circuits-engine
 
 The engine prints two discovery lines to **stdout** (logs go to stderr), in this order:
 
-- `ENGINE_BINDING <url>` — the HTTP port is open. It is printed *before* Postgres is contacted, on
+- `ENGINE_BINDING <url>` — the HTTP port is open. It is printed _before_ Postgres is contacted, on
   purpose: `GET /ready` is how an orchestrator learns the engine is still waiting for its database,
   and a probe it cannot reach is no probe at all.
 - `ENGINE_LISTENING <url>` — the boot has **resolved** (in Postgres mode: connected, introspected,
@@ -33,34 +33,34 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 
 ## Environment
 
-| Var | Default | Meaning |
-|---|---|---|
-| `CIRCUITS_DS_URL` | *(required)* | Durable-streams server base URL (the change log) |
-| `CIRCUITS_PG_URL` | *(unset)* | Enables **Postgres mode**: ingest via logical replication, backfill by query-back. Unset = library mode (writes arrive on table streams) |
-| `CIRCUITS_PG_TABLES` | *(empty)* | Comma list of tables to replicate: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*` (or empty) = `public.*` — never every schema (introspect-all sets `REPLICA IDENTITY FULL`, which must not touch managed system schemas) |
-| `CIRCUITS_PG_SLOT` | `circuits` | Logical replication slot name |
-| `CIRCUITS_PG_POLL_MS` | `50` | Replication-slot poll interval |
-| `CIRCUITS_PG_POOL_SIZE` | `20` | Connections in the shared Postgres pool that backfills, membership query-backs and subset queries draw from. `0` or an unparseable value keeps the default |
-| `CIRCUITS_BIND` | `0.0.0.0:3000` in Postgres mode, `127.0.0.1:0` in library mode | Bind address (`:0` = ephemeral port) |
-| `CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `circuits_engine=debug`) |
-| `CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |
-| `CIRCUITS_SHAPE_IDLE_SECS` | `1800` | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both |
-| `CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer |
-| `CIRCUITS_MAX_SHAPES` | `10000` | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited |
-| `CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted |
-| `CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Retention: background sweep interval (also drives change-log segment deletion) |
-| `CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion |
-| `CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log) |
-| `CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever |
-| `CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM) |
-| `CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
-| `CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines |
-| `CIRCUITS_BACKFILL_APPEND_BYTES` | `16777216` (16 MiB) | Backfill: byte budget for one snapshot append. A shape's backfill is **streamed** from a `REPEATABLE READ` cursor and appended chunk by chunk, so engine memory per backfill is one chunk whatever the table's size. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot |
-| `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | `0` (off) | Backfill: when > 0, `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** create with a clear, retryable error (`canceling statement due to statement timeout`); nothing is retired and nothing is purged, and the client may simply try again |
-| `CIRCUITS_SHUTDOWN_GRACE_SECS` | `25` | Graceful shutdown: how long the whole drain may take before it is forced (exit `70`). Below a typical Kubernetes `terminationGracePeriodSeconds: 30`, so the engine finishes on its own terms rather than being `SIGKILL`ed part-way. Must be > 0 |
-| `CIRCUITS_SHUTDOWN_DRAIN_SECS` | `2` | Graceful shutdown: how long the HTTP port stays open after the signal, answering `GET /ready` with 503, so a load balancer's readiness probe observes the drain before the socket closes. Set it to at least your probe's `periodSeconds` × `failureThreshold`, or the socket closes while the poller still thinks the pod is ready. Comes **out of** the grace period, not on top of it; `0` = stop accepting at once. Must be < the grace |
-| `CIRCUITS_SCHEMA_RECONCILE_SECS` | `60` | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire) |
-| `CIRCUITS_RESET_ON_SLOT_LOSS` | `true` | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery |
+| Var                                      | Default                                                        | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ---------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CIRCUITS_DS_URL`                        | _(required)_                                                   | Durable-streams server base URL (the change log)                                                                                                                                                                                                                                                                                                                                                                                            |
+| `CIRCUITS_PG_URL`                        | _(unset)_                                                      | Enables **Postgres mode**: ingest via logical replication, backfill by query-back. Unset = library mode (writes arrive on table streams)                                                                                                                                                                                                                                                                                                    |
+| `CIRCUITS_PG_TABLES`                     | _(empty)_                                                      | Comma list of tables to replicate: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*` (or empty) = `public.*` — never every schema (introspect-all sets `REPLICA IDENTITY FULL`, which must not touch managed system schemas)                                                                                                                                           |
+| `CIRCUITS_PG_SLOT`                       | `circuits`                                                     | Logical replication slot name                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `CIRCUITS_PG_POLL_MS`                    | `50`                                                           | Replication-slot poll interval                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `CIRCUITS_PG_POOL_SIZE`                  | `20`                                                           | Connections in the shared Postgres pool that backfills, membership query-backs and subset queries draw from. `0` or an unparseable value keeps the default                                                                                                                                                                                                                                                                                  |
+| `CIRCUITS_BIND`                          | `0.0.0.0:3000` in Postgres mode, `127.0.0.1:0` in library mode | Bind address (`:0` = ephemeral port)                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `CIRCUITS_LOG`                           | `info`                                                         | `tracing` EnvFilter (e.g. `warn`, `circuits_engine=debug`)                                                                                                                                                                                                                                                                                                                                                                                  |
+| `CIRCUITS_TRACE`                         | `1` (on)                                                       | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc)                                                                                                                                                                       |
+| `CIRCUITS_SHAPE_IDLE_SECS`               | `1800`                                                         | Retention: idle time (no engine-visible reads, no live subscriptions) before an active shape goes **dormant** (engine state dropped; stream + record retained). It is also the **subscription lease window** — a claim not renewed within it is released (see "Subscriptions"). `0` disables both                                                                                                                                           |
+| `CIRCUITS_SHAPE_DORMANT_TTL_SECS`        | `604800` (7 days)                                              | Retention: how long a shape may stay dormant before it is **evicted** (stream + record deleted). `0` disables the TTL layer                                                                                                                                                                                                                                                                                                                 |
+| `CIRCUITS_MAX_SHAPES`                    | `10000`                                                        | Retention: total shape-count cap; over it, least-recently-read **dormant** shapes are evicted (active shapes never are). `0` = unlimited                                                                                                                                                                                                                                                                                                    |
+| `CIRCUITS_SHAPE_DISK_BUDGET_MB`          | `0` (disabled)                                                 | Retention: cap on shape-stream bytes (engine-side accounting of appended bytes — resets on restart); over it, least-recently-read dormant shapes are evicted                                                                                                                                                                                                                                                                                |
+| `CIRCUITS_RETENTION_SWEEP_SECS`          | `60`                                                           | Retention: background sweep interval (also drives change-log segment deletion)                                                                                                                                                                                                                                                                                                                                                              |
+| `CIRCUITS_CHANGES_SEGMENT_BYTES`         | `1073741824` (1 GiB)                                           | Change log: rotate into a new `changes/<n+1>` once the current segment reaches this size. `0` disables the size criterion                                                                                                                                                                                                                                                                                                                   |
+| `CIRCUITS_CHANGES_SEGMENT_SECS`          | `86400` (1 day)                                                | Change log: rotate once the current segment is this old. `0` disables the age criterion (both `0` = never rotate, i.e. an unbounded log)                                                                                                                                                                                                                                                                                                    |
+| `CIRCUITS_CHANGES_RETAIN_SECS`           | `604800` (7 days)                                              | Change log: how long a rotated-out segment may stay pinned by a **dormant** shape before that shape is evicted and the segment deleted. `0` = a dormant shape pins its segment forever                                                                                                                                                                                                                                                      |
+| `CIRCUITS_TXN_MEMORY_BYTES`              | `134217728` (128 MiB)                                          | Large transactions: in-memory bytes of ONE transaction the ingestor may buffer before it spills the rest to disk. `0` = never spill (buffer the whole transaction in RAM)                                                                                                                                                                                                                                                                   |
+| `CIRCUITS_CHANGES_APPEND_BYTES`          | `67108864` (64 MiB)                                            | Large transactions: byte budget for one append (one request body) when a commit is appended in chunks. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot                                                                                                                                                                                                                                         |
+| `CIRCUITS_TXN_SPILL_DIR`                 | `<temp dir>/circuits-txn-spill-<uid>`                          | Large transactions: where a spilled transaction's temporary file is written (created 0700, files 0600). Needs room for the largest transaction the database can produce, must be writable at boot, and must not be shared between engines                                                                                                                                                                                                   |
+| `CIRCUITS_BACKFILL_APPEND_BYTES`         | `16777216` (16 MiB)                                            | Backfill: byte budget for one snapshot append. A shape's backfill is **streamed** from a `REPEATABLE READ` cursor and appended chunk by chunk, so engine memory per backfill is one chunk whatever the table's size. Must be > 0 and ≤ the durable-streams 1 GiB body cap — a value outside that refuses the boot                                                                                                                           |
+| `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS` | `0` (off)                                                      | Backfill: when > 0, `SET LOCAL statement_timeout` inside the backfill transaction. A timeout fails **that** create with a clear, retryable error (`canceling statement due to statement timeout`); nothing is retired and nothing is purged, and the client may simply try again                                                                                                                                                            |
+| `CIRCUITS_SHUTDOWN_GRACE_SECS`           | `25`                                                           | Graceful shutdown: how long the whole drain may take before it is forced (exit `70`). Below a typical Kubernetes `terminationGracePeriodSeconds: 30`, so the engine finishes on its own terms rather than being `SIGKILL`ed part-way. Must be > 0                                                                                                                                                                                           |
+| `CIRCUITS_SHUTDOWN_DRAIN_SECS`           | `2`                                                            | Graceful shutdown: how long the HTTP port stays open after the signal, answering `GET /ready` with 503, so a load balancer's readiness probe observes the drain before the socket closes. Set it to at least your probe's `periodSeconds` × `failureThreshold`, or the socket closes while the poller still thinks the pod is ready. Comes **out of** the grace period, not on top of it; `0` = stop accepting at once. Must be < the grace |
+| `CIRCUITS_SCHEMA_RECONCILE_SECS`         | `60`                                                           | Schema drift: how often the engine fingerprints every tracked table against the Postgres catalog, to catch DDL that no write follows. `0` disables the reconciler (the pgoutput triggers still fire)                                                                                                                                                                                                                                        |
+| `CIRCUITS_RESET_ON_SLOT_LOSS`            | `true`                                                         | What to do when the replication slot can no longer be trusted (see "Replication slot and epochs"): `true` retires every shape, binds a new epoch and carries on; `0`/`false`/`off`/`no` refuses instead — ingest stops, shape routes answer 503, and `POST /epoch/reset` is the operator's recovery                                                                                                                                         |
 
 **Backfills are streamed, never materialised.** A shape's initial rows come off a `REPEATABLE READ`
 cursor (`query_raw`) and are appended to the still-**pending** shape stream in chunks bounded by
@@ -69,7 +69,7 @@ table's size. Shape creation is already two-phase — a pending buffer, then a g
 chunking needs no protocol change: nothing reads the stream until `ActivateShape` lands, and a
 failure part-way aborts the pending shape and rolls the whole creation back exactly as before. An
 **aggregate** folds each chunk into its seed and drops the rows; a **subquery** inner-set node's seed
-is the one thing genuinely collected in memory, because that set *is* the state the node will
+is the one thing genuinely collected in memory, because that set _is_ the state the node will
 maintain. The `REPEATABLE READ` bracket and the `SnapshotGate` capture are unchanged.
 
 **An integer SUM is exact, and says so on the wire.** SUM/AVG accumulate integer values in `i128`, so
@@ -124,7 +124,7 @@ close that, and between them there is no gap:
   log from its origin and rebuilds the view in full before serving anything. (Postgres mode
   allocates none of this — there the invariant that the hot path holds no table copy is intact.)
 - **Absolute emission** for the one reader that is not at the log's head: a shape reactivating out
-  of **dormancy** replays the log from *its* resume position, where the view does not apply. Each
+  of **dormancy** replays the log from _its_ resume position, where the view does not apply. Each
   old-less envelope there states the shape's membership outright — matches the predicate now →
   `upsert`, otherwise → `delete <key>` (the rule the subquery registry uses, for the same reason).
   A delete for a key the shape never held is a deliberate, tolerated no-op; on the live path the
@@ -146,8 +146,8 @@ introspection/slot/ingest spawn — both 503 — then `{"status":"active"}` (200
 where it stopped, not restarting it). If the retries are exhausted the effects that batch was
 carrying are lost — the inner-set node moved before the query-back ran, so nothing will re-derive
 them. The engine then refuses to pretend otherwise: the batch never decrements `pendingFlips` (so
-the convergence barrier `sync caught up + offsets at tail + pendingFlips == 0` now means *every
-computed effect has landed, or the engine is degraded and says so*), `GET /replication/lsn` reports
+the convergence barrier `sync caught up + offsets at tail + pendingFlips == 0` now means _every
+computed effect has landed, or the engine is degraded and says so_), `GET /replication/lsn` reports
 a non-zero `flipFailures`, `/ready` turns `degraded` (503), and `POST /shapes`, `POST /aggregate`,
 `POST /query` and `GET /shapes/{id}(/rows|/log)` answer 503 with `{"error":"degraded: …"}`. Every
 subquery shape's durable stream is retired too — closed, then deleted — clients read
@@ -155,30 +155,30 @@ durable-streams directly, past the HTTP surface, so that is the only way they le
 releases a tailing long-poll at once with `stream-closed`. Observability (`/replication/lsn`,
 `/metrics*`, `/memory`, `/subqueries`, `/graph`, `/state`, `/trace`, `/tables/*`, `/health`) stays
 up. **Recovery is a restart**, which re-seeds every node from Postgres. A restart
-*drops* every subquery shape — their inner-node state is not persisted, so the catalog restore
+_drops_ every subquery shape — their inner-node state is not persisted, so the catalog restore
 deliberately does not restore them — and clients recreate them with `POST /shapes`. Deleting the
 streams therefore destroys nothing a restart would have kept.
 
 ## HTTP endpoints
 
-| Route | Purpose |
-|---|---|
-| `GET /health` | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating") |
-| `GET /ready` | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise |
-| `POST /schema` | define the schema (library mode only; Postgres mode self-configures by introspection and answers `409`) |
-| `POST /shapes` | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions") |
-| `POST /aggregate` | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`) |
-| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…` | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see *Durability of a create, and of a retirement*) |
-| `GET /shapes/{id}/rows` | current contents of an existing shape (folds its stream; visualizer preview) |
-| `GET /shapes/{id}/log` | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log |
-| `POST /query` | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN |
-| `GET /trace` | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers |
-| `GET /tables` | every tracked table + its schema-drift `unresolved` flag |
-| `GET /tables/{name}/offset` · `GET /tables/{name}/families` | sequencer position in the change log (`{segment, path, offset}` — compare `(segment, offset)`, never the offset alone) / routing-family stats |
-| `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…` | shared-node stats, pipeline graph, one node's live index |
-| `GET /replication/lsn` | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) + the `epoch` object (slot binding + `state`/`reason`) + `changes` (the current change-log segment and the ingestor's tail offset in it) |
-| `POST /epoch/reset` | operator recovery from a broken epoch under `CIRCUITS_RESET_ON_SLOT_LOSS=false`: retire every shape, bind a new epoch, resume ingest (409 if the epoch is not broken) |
-| `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
+| Route                                                                              | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /health`                                                                      | **liveness** — `ok`/200 while the process runs, and nothing else (see "Operating")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `GET /ready`                                                                       | **readiness** — 200 `{"status":"active"}` only when the engine can serve; 503 with `waiting`/`starting`/`degraded`/`shutting_down` otherwise                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `POST /schema`                                                                     | define the schema (library mode only; Postgres mode self-configures by introspection and answers `409`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `POST /shapes`                                                                     | create a shape (`table`, `where`, `columns`, `changesOnly`, `subscription`) — identical definitions share one stream. Repeating the create with the same `subscription` **renews** it and returns the same handle (see "Subscriptions")                                                                                                                                                                                                                                                                                                                                                |
+| `POST /aggregate`                                                                  | create a live scalar aggregation (`table`, `where`, `fn`, `col`, `subscription`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `GET /shapes/{id}` / `DELETE /shapes/{id}?subscription=…`                          | look up a shape (its retention `state` and live `subscriptions` count) / release THAT subscription — idempotent, and the shape is retained and ages through the retention lifecycle. Without `subscription` it is the legacy anonymous decrement (not retry-safe). `DELETE …?purge=true` force-drops the shape immediately (admin/debug; the visualizer's trash). Either form answers only once its catalog record is **durable**, so it blocks while storage is down and a timeout means "no answer", never "not done" — retry it (see _Durability of a create, and of a retirement_) |
+| `GET /shapes/{id}/rows`                                                            | current contents of an existing shape (folds its stream; visualizer preview)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `GET /shapes/{id}/log`                                                             | tail of a shape's stream as-is (op/key/value/lsn) — the visualizer's feed change log                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `POST /query`                                                                      | one-shot subset query: `SELECT … ORDER BY … LIMIT/OFFSET` + snapshot LSN                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GET /trace`                                                                       | SSE: per-envelope pipeline traces (hops + outcomes) and `shapeAdded`/`shapeDropped` lifecycle events; lossy by design, zero cost with no subscribers                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `GET /tables`                                                                      | every tracked table + its schema-drift `unresolved` flag                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GET /tables/{name}/offset` · `GET /tables/{name}/families`                        | sequencer position in the change log (`{segment, path, offset}` — compare `(segment, offset)`, never the offset alone) / routing-family stats                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `GET /subqueries` · `GET /graph` · `GET /graph/node?sig=…`                         | shared-node stats, pipeline graph, one node's live index                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `GET /replication/lsn`                                                             | ingestor LSN + sync status + `pendingFlips` / `flipFailures` (the convergence barrier) + the `epoch` object (slot binding + `state`/`reason`) + `changes` (the current change-log segment and the ingestor's tail offset in it)                                                                                                                                                                                                                                                                                                                                                        |
+| `POST /epoch/reset`                                                                | operator recovery from a broken epoch under `CIRCUITS_RESET_ON_SLOT_LOSS=false`: retire every shape, bind a new epoch, resume ingest (409 if the epoch is not broken)                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 **Creating a subquery shape** (`POST /shapes` with an `IN (SELECT …)` predicate) registers the
 shape's dependency edges before it reads Postgres, so a membership change can reach it mid-create:
@@ -196,10 +196,10 @@ creatable again.
 Two endpoints, two different questions. Pointing an orchestrator at the wrong one is how a pod
 gets restarted for a condition a restart does not fix.
 
-| Route | Question | Answers |
-|---|---|---|
-| `GET /health` | **liveness** — is the process alive? | `200 ok`, always, while the process runs |
-| `GET /ready` | **readiness** — should it get traffic? | `200 {"status":"active"}`, else `503` with `waiting` / `starting` / `degraded` / `shutting_down` |
+| Route         | Question                               | Answers                                                                                          |
+| ------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `GET /health` | **liveness** — is the process alive?   | `200 ok`, always, while the process runs                                                         |
+| `GET /ready`  | **readiness** — should it get traffic? | `200 {"status":"active"}`, else `503` with `waiting` / `starting` / `degraded` / `shutting_down` |
 
 `/ready` is 200 only when **every** precondition for serving holds: Postgres connected, the slot
 verified against the epoch binding, the durable catalog restored, the ingestor spawned, no lost
@@ -207,7 +207,7 @@ membership effects, no broken epoch, no shutdown in progress. The HTTP surface c
 Postgres, deliberately — a readiness probe an orchestrator cannot reach is no probe at all — so an
 engine still waiting for its database answers `503 waiting` rather than refusing connections.
 
-`/health` deliberately never fails for any of that. A kubelet restarts a pod whose *liveness* probe
+`/health` deliberately never fails for any of that. A kubelet restarts a pod whose _liveness_ probe
 fails, and neither "Postgres is not up yet" nor "the epoch is broken and an operator must post
 `/epoch/reset`" is fixed by a restart — the second is actively made worse by one.
 
@@ -221,7 +221,7 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
 2. The accept loop closes; in-flight requests finish. The sequencer's own long-poll on the change
    log returns **at once** (it joins the shutdown token in its select) instead of holding the
    termination grace for its full window.
-3. The **ingestor** finishes the transaction it is *appending*: if it is inside the chunked append
+3. The **ingestor** finishes the transaction it is _appending_: if it is inside the chunked append
    it runs to completion and records its position **locally**. The acknowledgement Postgres sees is
    a separate thing — the replication client sends standby feedback on its own status interval
    (1 s) and its stop path does not force a final one, so a commit appended in the last second or
@@ -236,7 +236,7 @@ fails, and neither "Postgres is not up yet" nor "the epoch is broken and an oper
 
 **Streams are never closed or retired on shutdown.** A shape's stream is left exactly as it is and
 the restored shape continues it — clients see nothing, and there is no backfill storm. (Closing is
-*retirement*, which means "this shape is gone; re-subscribe"; a restart is not that.) A retirement
+_retirement_, which means "this shape is gone; re-subscribe"; a restart is not that.) A retirement
 that was still being retried when the signal landed is simply left to the next boot: its `Dropped`
 record is the durable intent, and the boot re-queues it.
 
@@ -249,14 +249,14 @@ un-acknowledged commit is re-delivered (and de-duplicated) and the previous chec
 
 ### Exit codes
 
-| code | meaning |
-|---|---|
-| `0` | a graceful shutdown completed inside its grace period |
-| `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage) |
-| `71` | shutdown **incomplete**: every task finished, but the durable catalog writer did not drain in time — the final checkpoint may be missing, so the next boot may replay (de-duplicated) from an earlier one. Not corrupt, but not a clean exit either |
+| code | meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`  | a graceful shutdown completed inside its grace period                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `70` | shutdown **forced**: a second signal, or the grace elapsed with a party still running (the log names which — including `catalog writer`, when an append is still being retried through a storage outage)                                                                                                                                                                                                                                                              |
+| `71` | shutdown **incomplete**: every task finished, but the durable catalog writer did not drain in time — the final checkpoint may be missing, so the next boot may replay (de-duplicated) from an earlier one. Not corrupt, but not a clean exit either                                                                                                                                                                                                                   |
 | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered with something waiting will not change (a 4xx, an event that will not serialize), or the catalog writer task panicked. The engine's memory and its durable record disagree, and only a re-fold at boot reconciles them, so it exits rather than keep serving state the record does not describe. A transient failure — transport, timeout, 5xx — is NOT this: it is retried in place, forever |
-| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it |
-| `78` | **boot refused** (`EX_CONFIG`) — see below |
+| `75` | a counts pipeline must be rebuilt — schema drift, `TRUNCATE` or an epoch reset on a circuit-served table; restart re-seeds it                                                                                                                                                                                                                                                                                                                                         |
+| `78` | **boot refused** (`EX_CONFIG`) — see below                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 ### Subscriptions: identified, idempotent, leased
 
@@ -294,7 +294,7 @@ response carries the `subscription` it was recorded under plus `leaseSeconds`. S
 
 ### Durability of a create, and of a retirement
 
-`POST /shapes` (and a join that takes a NEW claim — a lease *renewal* promises nothing that is not
+`POST /shapes` (and a join that takes a NEW claim — a lease _renewal_ promises nothing that is not
 already in the log, so its record is queued like any other) is acknowledged only once its record has
 reached the durable catalog. The
 catalog writer never drops an event: a transient failure — transport, timeout, 5xx — retries **that**
@@ -335,7 +335,7 @@ crash loses — a `Left` that never landed comes back as a subscription whose **
 already past the idle window, so the sweeper releases it within one sweep; a `Dropped` that never landed comes back as a shape whose subscriptions are equally stale, and
 a repeated purge is a no-op.
 
-A *definite* refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
+A _definite_ refusal of a record (a 4xx, an event that will not serialize) is the pathological case —
 memory and storage disagree — and exits `74`. Note what that means for a storage front that accepts
 the `PUT` creating `meta/catalog` but 4xx's the `POST` appending to it: the engine crash-loops on 74
 rather than refusing the boot with 78. That is intentional. Until the stream has been created once,
@@ -356,13 +356,13 @@ false one leaves a registered shape permanently missing a committed change, with
 remembers it. The engine answers instead: still registered and `HEAD` finds the stream ⇒ the status
 was false, keep retrying; storage really has lost it ⇒ retire the shape (`Dropped`, close-then-delete,
 deregister) so subscribers re-subscribe, and only then discard. Symmetrically, an append whose
-*failure* is costly — activation's aggregate re-seed and the circuit-aggregate seed at restore, a
+_failure_ is costly — activation's aggregate re-seed and the circuit-aggregate seed at restore, a
 dormant shape's replay — uses `append_retrying` (transient retried with backoff, joined to the
 shutdown token), so one 503 during a boot costs neither a live subscription nor a boot attempt. Its
 budget is **30 s** (`DsClient::RESTORE_APPEND_BUDGET`): long enough to ride out a storage restart or
 a failover, short enough that a boot does not hang on a dependency that is not coming back. At
 restore an exhausted budget fails the whole restore and the boot backs off and retries it (see
-*Boot: catalog restore* below) — the aggregate is kept, not retired.
+_Boot: catalog restore_ below) — the aggregate is kept, not retired.
 
 ### Boot: fatal vs retryable
 
@@ -371,7 +371,7 @@ opposite treatment.
 
 **Fatal → exit `78` at once, with a named message.** `wal_level` ≠ `logical` (checked explicitly
 with `SHOW wal_level`, right after connecting, rather than left to surface as a slot-creation
-failure — it needs a Postgres *restart* to change); authentication refused (`28000`, `28P01`);
+failure — it needs a Postgres _restart_ to change); authentication refused (`28000`, `28P01`);
 insufficient privilege (`42501`) for `CREATE PUBLICATION`, the slot, `REPLICA IDENTITY FULL` or
 `pg_control_system()`; an unknown database (`3D000`); any other SQLSTATE outside the transient
 classes below. So are the engine's own refusals, which are not Postgres errors at all and which
@@ -392,9 +392,9 @@ in use) and `57` (operator intervention, incl. `57P03` "the database system is s
 `GET /ready` reports `503 waiting` throughout and each attempt is logged. **Durable-streams** is
 treated the same way: a refused connection, a timeout, a 5xx or a 429 while folding the catalog or opening
 the change log backs off with `durable-streams is unreachable` rather than exiting — storage that
-comes up after its engine is as ordinary as a database that does. (A *malformed* catalog, a
+comes up after its engine is as ordinary as a database that does. (A _malformed_ catalog, a
 change-log segment that is gone and an unusable `CIRCUITS_DS_URL` stay fatal: none of them
-is a transport problem. A *shape* stream that is gone is not a boot failure at all — see below.)
+is a transport problem. A _shape_ stream that is gone is not a boot failure at all — see below.)
 There is no restart in any of these cases: an orchestrator gates traffic on readiness, and
 a dependency that comes up after its engine is the normal case, not a failure. A `SIGTERM` while
 still waiting exits `0` — the whole boot is raced against the shutdown token, so it stops in
@@ -425,7 +425,7 @@ empty or partial registry over a catalog that names more. It runs in a fixed ord
 A failed restore goes through the classification above: a transient cause (and a stream that
 vanished mid-restore, which the retried attempt's check then retires) retries with `/ready`
 reporting `waiting`; a real refusal (a record this build cannot resume at all) exits `78` by name.
-Every retirement is logged with the shape, table and reason, and counted (see *Metrics*).
+Every retirement is logged with the shape, table and reason, and counted (see _Metrics_).
 
 **Nothing else touches shapes until the boot resolves.** In Postgres mode, for as long as the boot
 phase is `waiting` or `starting`, `POST /shapes`, `POST /aggregate`, `POST /query`, `GET /shapes/{id}` (and
@@ -443,21 +443,21 @@ start a sequencer the boot does not own. Library mode has no boot and no gate.
 engine counters and gauges — the Prometheus endpoint used to export only the memory/cardinality
 gauges. Alongside the existing counters, the ops-relevant ones are:
 
-| metric | kind | meaning |
-|---|---|---|
-| `replication_slot_retained_wal_bytes` | gauge | `pg_current_wal_lsn() - restart_lsn` — the WAL **Postgres is holding on disk for this engine**. The number that fills the source database's volume when the engine falls behind or stops |
-| `replication_confirmed_flush_lag_bytes` | gauge | `pg_current_wal_lsn() - confirmed_flush_lsn` — ingest lag, in bytes of WAL |
-| `replication_slot_active` | gauge | `1` while a walsender holds the slot; `0` when it does not, and when the slot is not there at all |
-| `sequencer_held_run` | gauge | `1` while the sequencer is holding an incomplete transaction (ADR-0003). A hold pins the change-log position — the restart point, the convergence barrier, the segment-deletion floor — so a hold that does not end must be visible as a level |
-| `sequencer_orphan_fragments_total` | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset) |
-| `backfill_chunked_appends_total` | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0) |
-| `shutdown_in_progress` | gauge | `1` once a graceful shutdown has begun |
-| `catalog_append_retries_total` | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage |
-| `retirements_pending` | gauge | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog |
-| `retirement_retries_total` | counter | retirement attempts that failed and were re-queued |
-| `catalog_restore_retired_<reason>_total` | counter | shape records the boot's catalog restore retired instead of resuming (ADR-0009), one per reason: `schema`, `subquery`, `table_gone`, `stream_missing`, `stream_closed`. Prometheus exports one `engine_catalog_restore_retired_total` with a `reason` attribute. `schema`/`subquery` after a boot are expected; the other three mean something outside the engine moved |
-| `sequencer_stale_schema_skipped_total` | counter | change-log envelopes consumed **without** being decoded, because a drift replaced the schema they were decoded under while the sequencer was still behind the ingestor (ADR-0010). Non-zero after a migration is expected and is bounded by the DML that migration outran; non-zero with no migrations means something is writing envelopes under a schema the engine does not have |
-| `sequencer_unknown_table_skipped_total` | counter | change-log envelopes consumed without being decoded because the engine does not compile their table at all — dropped, or parked unresolved (ADR-0005), so its dependents are retired. The other half of the same rule; a `type` that is not a canonical `schema.name` is **not** counted here, because no producer can write one — it parks the sequencer |
+| metric                                   | kind    | meaning                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `replication_slot_retained_wal_bytes`    | gauge   | `pg_current_wal_lsn() - restart_lsn` — the WAL **Postgres is holding on disk for this engine**. The number that fills the source database's volume when the engine falls behind or stops                                                                                                                                                                                            |
+| `replication_confirmed_flush_lag_bytes`  | gauge   | `pg_current_wal_lsn() - confirmed_flush_lsn` — ingest lag, in bytes of WAL                                                                                                                                                                                                                                                                                                          |
+| `replication_slot_active`                | gauge   | `1` while a walsender holds the slot; `0` when it does not, and when the slot is not there at all                                                                                                                                                                                                                                                                                   |
+| `sequencer_held_run`                     | gauge   | `1` while the sequencer is holding an incomplete transaction (ADR-0003). A hold pins the change-log position — the restart point, the convergence barrier, the segment-deletion floor — so a hold that does not end must be visible as a level                                                                                                                                      |
+| `sequencer_orphan_fragments_total`       | counter | incomplete transaction fragments discarded because a different transaction followed them (a reconnect re-delivering earlier commits first, or an epoch reset)                                                                                                                                                                                                                       |
+| `backfill_chunked_appends_total`         | counter | chunk appends made by backfills too large for one append (a backfill that fits in one contributes 0)                                                                                                                                                                                                                                                                                |
+| `shutdown_in_progress`                   | gauge   | `1` once a graceful shutdown has begun                                                                                                                                                                                                                                                                                                                                              |
+| `catalog_append_retries_total`           | counter | durable-catalog appends re-attempted because storage was unavailable. The writer never drops an event, so this is the visible cost of that promise: a climbing value with `shape_appends` flat means creates are waiting on storage                                                                                                                                                 |
+| `retirements_pending`                    | gauge   | shape streams dropped from the engine's records whose deletion storage has not yet accepted (ADR-0007). Non-zero means public stream URLs are outliving their shapes **right now**; it returns to 0 on its own, and a boot re-derives it from the catalog                                                                                                                           |
+| `retirement_retries_total`               | counter | retirement attempts that failed and were re-queued                                                                                                                                                                                                                                                                                                                                  |
+| `catalog_restore_retired_<reason>_total` | counter | shape records the boot's catalog restore retired instead of resuming (ADR-0009), one per reason: `schema`, `subquery`, `table_gone`, `stream_missing`, `stream_closed`. Prometheus exports one `engine_catalog_restore_retired_total` with a `reason` attribute. `schema`/`subquery` after a boot are expected; the other three mean something outside the engine moved             |
+| `sequencer_stale_schema_skipped_total`   | counter | change-log envelopes consumed **without** being decoded, because a drift replaced the schema they were decoded under while the sequencer was still behind the ingestor (ADR-0010). Non-zero after a migration is expected and is bounded by the DML that migration outran; non-zero with no migrations means something is writing envelopes under a schema the engine does not have |
+| `sequencer_unknown_table_skipped_total`  | counter | change-log envelopes consumed without being decoded because the engine does not compile their table at all — dropped, or parked unresolved (ADR-0005), so its dependents are retired. The other half of the same rule; a `type` that is not a canonical `schema.name` is **not** counted here, because no producer can write one — it parks the sequencer                           |
 
 While the sequencer is **parked** on a change it cannot process (ADR-0010), both metrics surfaces
 report the envelope: `GET /metrics` adds a `changeLogFailure` object and `GET /replication/lsn` carries
@@ -499,7 +499,7 @@ offset from a later segment can be lexicographically smaller than one from an ea
 Every **data** envelope on the log also carries `headers.schema`: the digest of the table schema it was
 decoded under, as 16 hex characters (`docs/adr/0010-change-log-envelopes-carry-their-schema-and-processing-fails-closed.md`).
 It is the fence that lets the sequencer — which runs behind the ingestor — tell an envelope its
-compiled schema *describes* from one encoded before a migration. A shape stream's envelopes never carry
+compiled schema _describes_ from one encoded before a migration. A shape stream's envelopes never carry
 it (it is the engine's own bookkeeping, not part of what a subscriber reads), and neither does anything
 in library mode, which has no fingerprint to digest. `GET /table/{name}/schema` reports the digest a
 table is compiled under as `schemaDigest`.
@@ -626,7 +626,7 @@ recognised by the schema digest each envelope carries, not by position (the swap
 mid-transaction, so no position separates old from new) — and counted as
 `sequencer_stale_schema_skipped_total`. That is correct precisely because every shape that could have
 wanted them was retired by the same drift. Any other envelope that will not decode parks the sequencer
-instead (see *The change log*, ADR-0010).
+instead (see _The change log_, ADR-0010).
 
 Granularity is per table: a migration on one table never resyncs another. The one exception is a
 table with a counts pipeline (`CIRCUITS_DBSP_COUNTS`) — the circuit is built and seeded once
@@ -647,7 +647,7 @@ restore runs — the setting names something that does not exist, which is an op
 
 **Unresolved tables.** If the drift cannot be settled — Postgres unreachable, a catalog read that
 errored, or an `ALTER … REPLICA IDENTITY FULL` that could not get its `ACCESS EXCLUSIVE` lock within
-5 s (the wait is bounded so one long reader cannot stall *all* ingest) — the table is parked as
+5 s (the wait is bounded so one long reader cannot stall _all_ ingest) — the table is parked as
 **unresolved**: dependents retired, its changes dropped, and `POST /shapes` / `POST /aggregate` on it
 refused with `schema of <t> is unresolved after a change; retry later`. A per-table retry task keeps
 attempting the resolution (2 s → 30 s backoff) regardless of the reconciler setting, and the first
@@ -669,7 +669,7 @@ same name is not synced again until the engine restarts (same as adding a table)
 The engine records **which slot, in which cluster, it is bound to** (`docs/adr/0004-slot-epoch-and-reset.md`).
 The first time it creates — or adopts — its slot it writes a `slotBound`
 (`system_identifier`, `timeline_id`, `slot`, `bound_at`) to the durable catalog; the last such record
-is the current **epoch**, and every shape in that catalog belongs to it. Before *every* connection —
+is the current **epoch**, and every shape in that catalog belongs to it. Before _every_ connection —
 at boot and on each ingestor reconnect, not just at boot — the slot is verified against that binding.
 
 A durable catalog the engine cannot **read** at boot is fatal, by design: it is not a catalog with no
@@ -686,7 +686,7 @@ recorded but not acted on — one primary, no promotion, per the ADR.)
 
 - **`CIRCUITS_RESET_ON_SLOT_LOSS=true`** (default): the engine **resets**.
   Every shape — active and dormant — is retired (stream closed, then deleted; ADR-0007), the slot is
-  dropped and recreated, and a new `slotBound` is written. That record *is* the new epoch. Clients see
+  dropped and recreated, and a new `slotBound` is written. That record _is_ the new epoch. Clients see
   closed streams and re-subscribe, exactly as for eviction or schema drift. An unattended deployment
   heals itself, at the cost of an unscheduled backfill storm.
 - **`…=false`**: the engine **refuses**. Ingest does not start, `/ready` reports `degraded` (503),

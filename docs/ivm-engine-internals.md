@@ -13,7 +13,7 @@ execution and cost.
 
 ## 1. The as-built model in one page
 
-Three layers, one idea — *maintain query results incrementally as the database changes*:
+Three layers, one idea — _maintain query results incrementally as the database changes_:
 
 ```
   app ──writes──▶ POSTGRES (system of record)
@@ -37,7 +37,7 @@ Three layers, one idea — *maintain query results incrementally as the database
 **The engine holds no copy of any table.** This is the single most important fact for
 reasoning about cost. State that scales with row count lives in Postgres, full stop; the
 engine keeps only per-shape metadata, the counts pipelines' (group → count) relations, and,
-for subqueries, a shared set of *inner-query result values*.
+for subqueries, a shared set of _inner-query result values_.
 Baseline engine RSS is flat with database size, whether the database has 1,000 or 100,000 rows
 (measured by the shape-memory matrix benchmark, which was not brought into this repository;
 fresh benchmarks pending).
@@ -56,20 +56,20 @@ See `ARCHITECTURE.md` §6b.
 There are deliberately **no per-shape circuits and no per-shape threads**: the routing and
 fallback tiers are plain Rust — key routing and stateless tri-valued predicate evaluation.
 A shape whose predicate an index can route (equality templates, conjunct-indexed standalone
-predicates) is *cheaper* outside the circuit: the index finds a change's shapes in
+predicates) is _cheaper_ outside the circuit: the index finds a change's shapes in
 `O(log N)`, whereas a circuit shape pays a linear scan of every delta. Circuit structure
 must never scale with shapes, users, or parameter combinations — only with the app's query
-*templates*.
+_templates_.
 
 ### A change is a Z-set delta
 
 Every table change is converted (`apply_envelope`, `engine/output.rs`) into weighted rows:
 
-| operation | delta |
-|---|---|
-| insert | `[(new, +1)]` |
-| update | `[(old, −1), (new, +1)]` |
-| delete | `[(old, −1)]` |
+| operation | delta                    |
+| --------- | ------------------------ |
+| insert    | `[(new, +1)]`            |
+| update    | `[(old, −1), (new, +1)]` |
+| delete    | `[(old, −1)]`            |
 
 `old` comes from the replication envelope (`REPLICA IDENTITY FULL` makes Postgres emit the
 prior tuple), so no local table state is needed to retract a row.
@@ -111,7 +111,7 @@ its xid was visible to that snapshot** (xids on the slot are always committed, s
 (library mode) fall back to the strict `commit_lsn < seed_lsn` comparison.
 
 Why not LSN alone: a commit's WAL record is written (and `pg_current_wal_lsn()` moves past it)
-*before* the transaction becomes visible to snapshots (`ProcArrayEndTransaction`, after the WAL
+_before_ the transaction becomes visible to snapshots (`ProcArrayEndTransaction`, after the WAL
 fsync). An LSN fence silently drops rows committed-but-invisible during the snapshot and
 duplicates at the exact boundary; the xid gate decides both cases. Guarded by
 `conformance-concurrency.test.ts` + `pg.rs` unit tests.
@@ -162,7 +162,7 @@ backfill never stalls the pipeline.
 
 ## 3. The three shape execution strategies
 
-A shape is *one table + an optional `WHERE` predicate + an optional `columns` projection*. The
+A shape is _one table + an optional `WHERE` predicate + an optional `columns` projection_. The
 **shape of the predicate** decides which of three strategies runs it. This choice is the
 backbone of the cost analysis: each strategy retains a different amount of state and pays a
 different per-change cost.
@@ -171,7 +171,7 @@ different per-change cost.
 
 If a predicate is a conjunction of non-null equality leaves on distinct columns
 (`tenant = 7 AND region = 'eu'`), `equality_template()` returns the **key columns**
-(`{tenant, region}`). All shapes sharing the same key-column *set* — regardless of the
+(`{tenant, region}`). All shapes sharing the same key-column _set_ — regardless of the
 constants — share **one `KeyRouter`** ("family"):
 
 ```
@@ -183,7 +183,7 @@ KeyRouter (per template key-column set):
   directly from Postgres (`SELECT … WHERE key = const`). No table trace is built.
 - **Live routing:** compute `old_key`/`new_key` over the template columns from the envelope.
   Because an equality predicate matches a row iff its key equals the shape's constants,
-  **key membership *is* shape membership**:
+  **key membership _is_ shape membership**:
   - insert → upsert to shapes on `new_key`;
   - delete → delete from shapes on `old_key`;
   - update, key unchanged → upsert to shapes on that key;
@@ -191,7 +191,7 @@ KeyRouter (per template key-column set):
 
 Routing a change is `O(log N)` over the index (a hashmap/btree lookup), **independent of the
 number of shapes** on other keys. Thousands of equality shapes collapse onto a handful of
-routers — one per distinct *template*, not per shape. In the shape-memory matrix, 10,000
+routers — one per distinct _template_, not per shape. In the shape-memory matrix, 10,000
 equality shapes use **3** family circuits (board-status on `status`, "my tasks" on `username`,
 per-issue comments on `issue_id`).
 
@@ -238,7 +238,7 @@ SubqueryNode {
 }
 ```
 
-Tracking contributor **pks** (not a bare count) makes maintenance *reconcile-by-identity*: set a
+Tracking contributor **pks** (not a bare count) makes maintenance _reconcile-by-identity_: set a
 row's presence to equal `match(row)` regardless of history — idempotent and order-independent.
 
 **Edges form a DAG.** Each `col IN node` leaf is an edge `(dependent, connecting_col, node,
@@ -248,7 +248,7 @@ subqueries).
 **Maintenance — one rule, applied recursively** (`on_table_delta`):
 
 1. **`table` is a node's `inner_table`:** reconcile each changed inner row's pk into the node;
-   record per-value **flips** (`∅→nonempty` = *enter*, `nonempty→∅` = *leave*).
+   record per-value **flips** (`∅→nonempty` = _enter_, `nonempty→∅` = _leave_).
 2. **For each flipped value `v` of node `N`:** for every edge on `N`, the affected dependent
    rows are exactly those with `col = v`. Query them (`SELECT … WHERE col = v`) and either
    reconcile a parent node (recurse) or re-evaluate the outer shape predicate. This propagation
@@ -266,14 +266,14 @@ subqueries).
    counts it, and the engine degrades: every membership-bearing route answers 503, `/ready`
    reports `degraded`, every subquery shape's durable stream is deleted (clients read storage
    directly, past the HTTP surface), and only a restart — which re-seeds every node from Postgres
-   — recovers. The restart *drops* every subquery shape (their inner-node state is not persisted,
+   — recovers. The restart _drops_ every subquery shape (their inner-node state is not persisted,
    so the catalog restore deliberately does not restore them); clients recreate them with
    `POST /shapes`.
    A shape whose own create is still in flight has edges (registered before its backfill) but no
    installed shape to move: that work is **queued on the pending create** and replayed against the
    shape the moment it is installed, in the same step that removes the pending entry. So an inner
    change committing after the backfill's snapshot — the window a create shares an already-live
-   node through — is never dropped. A flip that reaches a *parent node* a create is still seeding
+   node through — is never dropped. A flip that reaches a _parent node_ a create is still seeding
    is deferred the same way — queued on the node, then re-derived and walked on down the DAG once
    its seed and buffered deltas are in — because reconciling an empty pre-seed set derives nothing
    and the older seed would then be installed over the change. And because the pending entry stays
@@ -283,15 +283,15 @@ subqueries).
    `matches_ctx` (subquery leaves consult node sets) — the normal enter/leave/update path.
 
 **The critical correctness rule:** outer membership is emitted **absolutely**, not as a delta
-— `emit_shape_delta` emits each touched pk's *current* membership (`upsert` if it now matches,
+— `emit_shape_delta` emits each touched pk's _current_ membership (`upsert` if it now matches,
 else idempotent `delete` by pk). Because deferred flip propagation runs out of commit order,
 a delta-based "delete only if the old row matched" would miss move-outs. Absolute emission
 converges regardless of cross-table order, which is why we don't need Electric's LSN-buffering /
-row-tag streaming protocol — our conformance asserts *convergence after drain*, not a control-
+row-tag streaming protocol — our conformance asserts _convergence after drain_, not a control-
 message stream.
 
-Absolute emission makes *which* pk is evaluated first irrelevant, but not *which evaluation of a
-pk is last*: a query-back reads its candidate rows at one Postgres snapshot with the registry lock
+Absolute emission makes _which_ pk is evaluated first irrelevant, but not _which evaluation of a
+pk is last_: a query-back reads its candidate rows at one Postgres snapshot with the registry lock
 released, so a direct outer-row change committed after that snapshot can be evaluated and emitted
 in between, and the query-back's older row would then be the stream's last word for that pk (native
 consumers fold by durable-stream offset, so an older LSN on the envelope repairs nothing). Each
@@ -311,13 +311,13 @@ window; affected rows are fetched by a keyed query-back on flip.
 
 ### 3.4 Strategy summary
 
-| | equality (router) | standalone | subquery |
-|---|---|---|---|
-| Predicate | `a=1 AND b=2` | ranges, OR, NOT, ≠ | `col [NOT] IN (SELECT …)` |
-| State retained | `O(#shapes)` routing entries | none | `O(inner-set)` pks, **shared** |
-| Shared across shapes? | yes — 1 router / template | no (but no state to share) | yes — 1 node / `sig` |
-| Per-change compute | `O(log N)` routed | output-sensitive via conjunct index (`O(K)` fallback for un-indexable predicates) | inner change: node reconcile + keyed query-back per flipped value. outer change: conjunct-index-routed to `O(candidates)` shapes (old ∪ new image probe) |
-| Table copies | 0 | 0 | 0 |
+|                       | equality (router)            | standalone                                                                        | subquery                                                                                                                                                 |
+| --------------------- | ---------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Predicate             | `a=1 AND b=2`                | ranges, OR, NOT, ≠                                                                | `col [NOT] IN (SELECT …)`                                                                                                                                |
+| State retained        | `O(#shapes)` routing entries | none                                                                              | `O(inner-set)` pks, **shared**                                                                                                                           |
+| Shared across shapes? | yes — 1 router / template    | no (but no state to share)                                                        | yes — 1 node / `sig`                                                                                                                                     |
+| Per-change compute    | `O(log N)` routed            | output-sensitive via conjunct index (`O(K)` fallback for un-indexable predicates) | inner change: node reconcile + keyed query-back per flipped value. outer change: conjunct-index-routed to `O(candidates)` shapes (old ∪ new image probe) |
+| Table copies          | 0                            | 0                                                                                 | 0                                                                                                                                                        |
 
 ### 3.5 Full shape de-duplication (the sharing layer above the strategies)
 
@@ -328,9 +328,9 @@ changes_only)` — canonicalization is order-insensitive, so `a AND b` ≡ `b AN
 key on `(table, predicate, fn, column)` in their own namespace. Consequences:
 
 - N clients opening the same shape cost one maintenance path and one append per change —
-  per-subscriber cost collapses onto per-*distinct*-shape cost everywhere in §4.
+  per-subscriber cost collapses onto per-_distinct_-shape cost everywhere in §4.
 - A joiner waits on the share's **ready-watch** until the creator's backfill has landed (and
-  observes a creation *failure* as an error, never a dead stream).
+  observes a creation _failure_ as an error, never a dead stream).
 - Deletes decrement; the **last** drop removes the routing/registry entry AND deletes the
   durable stream (otherwise every dropped shape leaks a stream on the storage server).
 - Creation is **atomic**: on any failure the record, share entries, and (for subqueries) every
@@ -360,25 +360,25 @@ The question this section answers: **as you add shapes, users, and rows, where d
 state accumulate, what is shared vs per-shape vs per-user, and how does that show up in memory
 and disk?**
 
-The headline, measured (shape-memory matrix benchmark, not brought into this repository): a steady fleet of *many* shapes
-over a *large* table is cheap; the only deployment-size-sensitive cost is the **transient
-backfill working set** of a *materialized* shape. (fresh benchmarks pending)
+The headline, measured (shape-memory matrix benchmark, not brought into this repository): a steady fleet of _many_ shapes
+over a _large_ table is cheap; the only deployment-size-sensitive cost is the **transient
+backfill working set** of a _materialized_ shape. (fresh benchmarks pending)
 
 ### 4.1 What is shared vs per-shape vs per-user
 
-| construct | granularity | cost driver |
-|---|---|---|
-| Engine baseline (no shapes) | global | a small constant, **independent of table size** (no table copy) |
-| `KeyRouter` (family) | per **template** (key-column set) | a handful; *not* per shape and *not* per user |
-| Routing entry | per **shape** | one `(key_tuple, stream_path, seed_lsn)` |
-| `StandaloneShape` | per **shape** | one predicate + metadata; per-change eval cost |
-| `SubqueryNode` | per distinct **inner query** (`sig`) | `O(inner result size)` contributor pks; shared by refcount |
-| Subquery contributors | per inner **row** that contributes a value | one pk in a `HashSet` |
-| Subquery edge | per dependent (shape or parent node) | one DAG edge |
-| Per-shape stream | per **shape** | one `shape/<id>` durable stream (storage, not engine RAM) |
+| construct                   | granularity                                | cost driver                                                     |
+| --------------------------- | ------------------------------------------ | --------------------------------------------------------------- |
+| Engine baseline (no shapes) | global                                     | a small constant, **independent of table size** (no table copy) |
+| `KeyRouter` (family)        | per **template** (key-column set)          | a handful; _not_ per shape and _not_ per user                   |
+| Routing entry               | per **shape**                              | one `(key_tuple, stream_path, seed_lsn)`                        |
+| `StandaloneShape`           | per **shape**                              | one predicate + metadata; per-change eval cost                  |
+| `SubqueryNode`              | per distinct **inner query** (`sig`)       | `O(inner result size)` contributor pks; shared by refcount      |
+| Subquery contributors       | per inner **row** that contributes a value | one pk in a `HashSet`                                           |
+| Subquery edge               | per dependent (shape or parent node)       | one DAG edge                                                    |
+| Per-shape stream            | per **shape**                              | one `shape/<id>` durable stream (storage, not engine RAM)       |
 
-"Per user" is not a first-class concept in the engine — it shows up as *the shapes a user
-opens*. In the matrix run, growing the user count grew shapes, subquery nodes, contributors, and
+"Per user" is not a first-class concept in the engine — it shows up as _the shapes a user
+opens_. In the matrix run, growing the user count grew shapes, subquery nodes, contributors, and
 edges proportionally, but family circuit count stayed flat at a small constant. The router count
 is flat in users; node/contributor/edge counts grow linearly in users but with a tiny constant
 (a node holds only the user's own membership rows, not any issues).
@@ -392,8 +392,8 @@ From the shape-memory matrix run (Postgres mode, OTel RSS probe): (fresh benchma
 - **Per-shape registration is a small, bounded per-shape cost and constant across deployment
   sizes.** Even a large fleet of changes-only shapes grows RSS by only a small amount.
 - **Family circuits stay at a small constant** no matter how many equality shapes share them.
-- **Backfill is the deployment-size-sensitive cost:** a *materialized* shape's one-off backfill
-  working set scales ~linearly with the number of *visible* rows (transient read-batch + JSON
+- **Backfill is the deployment-size-sensitive cost:** a _materialized_ shape's one-off backfill
+  working set scales ~linearly with the number of _visible_ rows (transient read-batch + JSON
   serialization memory, **not retained state**, released once the backfill settles).
 
 So engine memory is, to first order:
@@ -408,7 +408,7 @@ RSS ≈ baseline (flat with database size)
 ### 4.3 Sizing rule
 
 **Budget by concurrent backfill working set, not by shape count or table size.** A steady fleet
-of many shapes over a large table is cheap; a *burst of large materialized backfills* is the
+of many shapes over a large table is cheap; a _burst of large materialized backfills_ is the
 spike to provision for. Two levers reduce the spike:
 
 - **`changes-only` / subset feeds skip the backfill entirely** — they pay only a small,
@@ -418,7 +418,7 @@ spike to provision for. Two levers reduce the spike:
 
 A caveat from the matrix: RSS is a coarse, non-monotonic signal (allocator slack; freed pages
 return to the OS at the allocator's discretion). For steady-state sizing, rely on the OTel
-*cardinality* gauges (`engine_shapes`, `engine_subquery_nodes`,
+_cardinality_ gauges (`engine_shapes`, `engine_subquery_nodes`,
 `engine_subquery_contributors`, `engine_family_circuits`) to read retained structural state
 independent of allocator noise; measure RSS after warmup.
 
@@ -433,7 +433,7 @@ For one table change:
   eval. Only shapes with no indexable conjunct (top-level OR/NOT, `LIKE`, `!=`) are evaluated
   on every change — that fallback list is the remaining `O(K)` term to watch.
 - **Subquery:** an inner change reconciles the node (`O(1)` per changed inner row) and, per
-  *flipped value*, runs one keyed `SELECT … WHERE col = v` per dependent edge plus a re-eval.
+  _flipped value_, runs one keyed `SELECT … WHERE col = v` per dependent edge plus a re-eval.
   An outer change is routed by a **necessary-conjunct index over the outer shapes**
   (`subq_index.rs`, the same `access_leaf` extraction the standalone tier uses), bucketed by
   outer table with `RoaringBitmap` posting lists over interned shape ids — so it visits
@@ -487,11 +487,17 @@ subquery shape:
 
 ```jsonc
 // issues visible to user u
-{ "table": "issues",
-  "where": { "col": "project_id",
-             "in": { "table": "project_members",
-                     "project": "project_id",
-                     "where": { "col": "user_id", "op": "eq", "value": "u" } } } }
+{
+  "table": "issues",
+  "where": {
+    "col": "project_id",
+    "in": {
+      "table": "project_members",
+      "project": "project_id",
+      "where": { "col": "user_id", "op": "eq", "value": "u" },
+    },
+  },
+}
 ```
 
 **Setup cost (one user opens this shape):**
@@ -501,7 +507,7 @@ subquery shape:
   `project_id` values. **~6 pks, not any issues.**
 - One edge `(this shape, project_id, node, negated=false)`.
 - One routing/shape entry + one `shape/<id>` stream.
-- If materialized: a backfill of the *visible* issues (a small, bounded per-row cost, transient).
+- If materialized: a backfill of the _visible_ issues (a small, bounded per-row cost, transient).
   If `changes-only`, no backfill.
 
 **Live cost (membership changes — user added to a project):**
@@ -519,7 +525,7 @@ subquery shape:
 
 **Scaling tally (a matrix run with many such users):** nodes, contributors, and edges all grow
 linearly with the number of such shapes, with a small total RSS growth and family circuit count
-staying at a small constant for the *other* (equality) shapes those users open. The visibility
+staying at a small constant for the _other_ (equality) shapes those users open. The visibility
 subquery is per-user by nature (each user's membership set differs, so each gets its own node),
 but each node is tiny and the per-change cost is bounded by the fan-out of the specific project
 that changed. (fresh benchmarks pending)
@@ -531,7 +537,7 @@ that changed. (fresh benchmarks pending)
 Not every read needs a live shape. A **subset query** (`Engine::query_subset` →
 `pg::query_subset_where`) is a one-shot `SELECT … WHERE … ORDER BY … LIMIT … OFFSET` returning
 a page of rows + a snapshot LSN — **no shape, no stream, no retained state.** `orderBy` and
-`limit` are knobs of *subset queries*, not of shapes (a common doc trap — shapes do not have a
+`limit` are knobs of _subset queries_, not of shapes (a common doc trap — shapes do not have a
 top-N operator). Subquery predicates in subset queries are evaluated natively by Postgres via
 `predicate_json_to_sql`. This is the basis for windowed / infinite-scroll sync: each page is a
 bounded keyset range query folded into the `WHERE`, so the engine never holds a stateful top-N.
@@ -540,26 +546,26 @@ bounded keyset range query folded into the `WHERE`, so the engine never holds a 
 
 ## 6b. Design decision: no interpreted operator graph in the dynamic tier
 
-*(July 2026, closing the structural-debt epic. Context: after the engine.rs split and the
+_(July 2026, closing the structural-debt epic. Context: after the engine.rs split and the
 membership/aggregate kernel unifications, the remaining critique of the dynamic tier was that
 `process_envelope` is a fixed sequence of executor loops rather than a composable, interpreted
 dataflow graph — and that the visualizer's operator graph is derived presentation, not the
-execution model.)*
+execution model.)_
 
 **Decision: the dynamic tier stays flat — indexed executors + shared kernels, no hand-rolled
 interpreted operator graph.** Rationale:
 
-- **dbsp is already the composition engine.** New template *kinds* (joins, reductions,
+- **dbsp is already the composition engine.** New template _kinds_ (joins, reductions,
   derived-visibility pipelines) are new operators in `arrangements.rs`, where dbsp provides
   compositional correctness, arrangement sharing, and spilling. A dynamic-tier interpreter
   would be a second dataflow engine beside the real one, with none of its guarantees.
 - **Flatness is the design, not debt.** The engine's central performance idea is that routing
-  is *not* dataflow: an index finds a change's shapes in `O(log N)`, whereas graph-shaped
+  is _not_ dataflow: an index finds a change's shapes in `O(log N)`, whereas graph-shaped
   evaluation passes deltas per node — the per-shape linear scan this design exists to avoid
   (§1, the same argument that keeps equality shapes out of the circuit).
 - **No variation to abstract over.** The executor kinds (filter, router, fold, membership,
-  subquery hook) have been stable; they grow in *count* (solved by the conjunct indexes), not
-  in *kind*. The hard correctness — gates, absolute emission, the `(lsn,seq)` highwater,
+  subquery hook) have been stable; they grow in _count_ (solved by the conjunct indexes), not
+  in _kind_. The hard correctness — gates, absolute emission, the `(lsn,seq)` highwater,
   per-txn flush — is cross-cutting and would not be simplified by node interfaces.
 - **The composability mechanism is the kernel pattern.** When two paths must agree on an
   invariant, extract ONE implementation plus a cross-path regression test —
@@ -576,23 +582,23 @@ executors via a trait so presentation cannot drift from execution.
 
 ## 7. File map
 
-| path | role |
-|---|---|
-| `apps/engine/src/engine/` | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
-| `apps/engine/src/subquery.rs` | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback |
-| `apps/engine/src/arrangements.rs` | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding |
-| `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput via the `pgoutput.rs` decoder, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
-| `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
-| `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |
-| `apps/engine/src/sql.rs` | predicate → SQL (backfill pushdown) |
-| `apps/engine/src/schema.rs` | schema, composite PK (`pk_cols`, `\u{1f}` key join), JSON⇄Row |
-| `apps/engine/src/value.rs` | `Value`, `Row` (the dbsp Z-set element) |
-| `apps/engine/src/ds.rs` | durable-streams HTTP client + `Envelope` |
-| `apps/engine/src/http.rs` | control-plane HTTP |
-| `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
-| `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: the `CIRCUITS_*` environment |
-| `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
+| path                                    | role                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| --------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `apps/engine/src/engine/`               | the engine module: `mod.rs` (the `Engine` handle + shared state), `sequencer.rs` (the LSN-ordered sequencer, (lsn,seq) de-dup, per-txn reliable flush), `lifecycle.rs` (shape creation/sharing/retention), `circuit_serving.rs` (circuit-tier serving), `executors.rs` (routers, filters, folds), `planning.rs` (circuit placement), `catalog.rs` (durable catalog + restore), `introspection.rs` (graph/state DTOs + builders), `membership.rs` (the shared membership kernel: flip detection, pooled Postgres query-backs), `emission.rs` (per-stream ordered emission lanes), `output.rs` (envelope ⇄ delta codec) |
+| `apps/engine/src/subquery.rs`           | cross-table subquery registry: shared nodes, edges, flips, absolute emission, atomic create/rollback                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `apps/engine/src/arrangements.rs`       | the circuit: in-memory dbsp counts pipelines, group-aggregated boot seeding                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `apps/engine/src/replication.rs`        | Postgres logical-replication ingestor (streaming pgoutput via the `pgoutput.rs` decoder, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge)                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `apps/engine/src/pg.rs`                 | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `apps/engine/src/predicate.rs`          | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `apps/engine/src/sql.rs`                | predicate → SQL (backfill pushdown)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `apps/engine/src/schema.rs`             | schema, composite PK (`pk_cols`, `\u{1f}` key join), JSON⇄Row                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `apps/engine/src/value.rs`              | `Value`, `Row` (the dbsp Z-set element)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `apps/engine/src/ds.rs`                 | durable-streams HTTP client + `Envelope`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `apps/engine/src/http.rs`               | control-plane HTTP                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `apps/engine/src/retention.rs`          | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `apps/engine/src/config.rs`             | boot config: the `CIRCUITS_*` environment                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `apps/engine/src/trace.rs`              | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 ## 8. Related documents
 
@@ -603,23 +609,23 @@ executors via a trait so presentation cannot drift from execution.
 ## Serving tiers: compiled, routed, fallback
 
 Every shape lands in one of three serving tiers. The load-bearing separation is between what
-is *compiled* and what is *routed*:
+is _compiled_ and what is _routed_:
 
-| Tier | Cardinality | Cost of adding one | Serves |
-|------|-------------|--------------------|--------|
-| **The circuit** | few counts pipelines, fixed at deploy | a config change + restart (counts reseed on boot) | COUNT **families** (templates) |
-| **Routing** | unbounded, changes at runtime | a routing-table entry | query **instances** (parameter combinations) |
-| **Fallback** | unbounded | nothing | query **strangers** (predicates matching no template) |
+| Tier            | Cardinality                           | Cost of adding one                                | Serves                                                |
+| --------------- | ------------------------------------- | ------------------------------------------------- | ----------------------------------------------------- |
+| **The circuit** | few counts pipelines, fixed at deploy | a config change + restart (counts reseed on boot) | COUNT **families** (templates)                        |
+| **Routing**     | unbounded, changes at runtime         | a routing-table entry                             | query **instances** (parameter combinations)          |
+| **Fallback**    | unbounded                             | nothing                                           | query **strangers** (predicates matching no template) |
 
 - The **circuit** compiles one counts pipeline per aggregate family —
-  `map_index(group) → weighted_count` — keyed by *cohort group* (per project, per
+  `map_index(group) → weighted_count` — keyed by _cohort group_ (per project, per
   (project, status), per aggregate group…). Its state is O(distinct groups), held in memory;
   **row data lives in Postgres, never in the circuit**. Its structure never grows with shapes,
   users, or parameter combinations — if a design makes it do so, the design is wrong (the
   circuit-per-shape trap: structure must never scale with subscriptions).
 - A **circuit-served shape** (a COUNT aggregate) is a selection or sum of cohort groups from
   one pipeline's keyed output, materialized at the delivery edge. Shape cardinality can
-  vastly exceed pipeline cardinality: a count exists per *combination* of projects clients
+  vastly exceed pipeline cardinality: a count exists per _combination_ of projects clients
   ask for, all fed from the same per-(project, status) pipeline. The sum is correct only when
   the cohort key **partitions** the table (each row in exactly one group); overlapping groups
   need dedup at the edge.
@@ -627,7 +633,7 @@ is *compiled* and what is *routed*:
   families, the conjunct-indexed standalone path and conjunct-indexed aggregates, standalone
   three-valued predicate evaluation (with the `AccessLeaf` index), and the subquery registry,
   which serves **every** membership subquery: single-level and nested, negated or not. Together
-  they serve *any* predicate. The circuit is an optimization in front of them, never a
+  they serve _any_ predicate. The circuit is an optimization in front of them, never a
   correctness dependency: a brand-new query pattern works immediately at fallback cost, and a
   COUNT that matters is promoted into the circuit at the next deploy.
 
@@ -635,7 +641,7 @@ is *compiled* and what is *routed*:
 
 1. **Dynamically created shapes** whose predicate decomposes over a template key
    (`project_id IN (3,7,9)`, `issue_id = X`) → the routing tier: `KeyRouter` families and the
-   conjunct-indexed standalone path. These are deliberately *not* circuit-served — an indexed
+   conjunct-indexed standalone path. These are deliberately _not_ circuit-served — an indexed
    route finds a change's shapes in `O(log N)`, whereas a circuit shape would scan every
    delta linearly.
 2. **Time-varying membership** (`project_id IN (SELECT … WHERE user_id = $me)`) → the

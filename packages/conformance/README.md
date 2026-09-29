@@ -13,7 +13,7 @@ A vitest `globalSetup` builds the engine once and starts **one ephemeral Postgre
 `wal_level=logical` (each harness then creates its own database + replication slot inside it, so
 test files stay isolated). Per harness:
 
-- a per-test Postgres database (the system of record *and*, via `createPgOracle`, the truth),
+- a per-test Postgres database (the system of record _and_, via `createPgOracle`, the truth),
 - a `DurableStreamTestServer` (the log),
 - the Rust engine as a child process in Postgres mode (spawned from `target/debug/`, discovered
   via its `ENGINE_LISTENING` stdout line),
@@ -23,17 +23,17 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 
 ## Test areas
 
-| Files | What they pin down |
-|---|---|
-| `conformance.test.ts`, `-postgres`, `-backfill` | core invariant: live replication, batched mutations, backfill ↔ live fencing |
-| `conformance-concurrency.test.ts` | concurrent writers |
-| `conformance-nulls.test.ts` | NULL three-valued logic (`NOT (col = x)` over NULL, `IS [NOT] NULL`) |
-| `conformance-subquery*.test.ts` | `IN (SELECT …)`: scenarios, cross-table matrix, nested subqueries, inner-node sharing |
-| `conformance-sharing`, `-shape-sharing` | identical shapes/feeds collapse to one stream, refcounted create/drop |
-| `conformance-subset-positioning.test.ts` | subset LSN positioning: a change in the page/feed overlap window is counted exactly once |
-| `conformance-expressiveness`, `-transitions` | full predicate grammar, rows entering/leaving shapes |
-| `conformance-fuzz`, `-fuzz-wide`, `-counterexample` | random-predicate fuzz vs the oracle + pinned counterexample replays |
-| `harness-mechanics.test.ts` | the harness itself (boot, teardown, engine discovery) |
+| Files                                               | What they pin down                                                                       |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `conformance.test.ts`, `-postgres`, `-backfill`     | core invariant: live replication, batched mutations, backfill ↔ live fencing             |
+| `conformance-concurrency.test.ts`                   | concurrent writers                                                                       |
+| `conformance-nulls.test.ts`                         | NULL three-valued logic (`NOT (col = x)` over NULL, `IS [NOT] NULL`)                     |
+| `conformance-subquery*.test.ts`                     | `IN (SELECT …)`: scenarios, cross-table matrix, nested subqueries, inner-node sharing    |
+| `conformance-sharing`, `-shape-sharing`             | identical shapes/feeds collapse to one stream, refcounted create/drop                    |
+| `conformance-subset-positioning.test.ts`            | subset LSN positioning: a change in the page/feed overlap window is counted exactly once |
+| `conformance-expressiveness`, `-transitions`        | full predicate grammar, rows entering/leaving shapes                                     |
+| `conformance-fuzz`, `-fuzz-wide`, `-counterexample` | random-predicate fuzz vs the oracle + pinned counterexample replays                      |
+| `harness-mechanics.test.ts`                         | the harness itself (boot, teardown, engine discovery)                                    |
 
 ## Running
 

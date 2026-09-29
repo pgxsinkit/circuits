@@ -8,6 +8,7 @@ Carried over on 2026-09-29 from issue #13 of `pgxsinkit/electric-circuits`, the 
 came from. Checked against the code on that day: still true.
 
 ## The fact
+
 Three refusal paths are unit-tested but have no end-to-end lane:
 
 1. **Circuit-tier drift exit (75).** `circuit_needs_rebuild` (ADR-0005) is unit-tested; no lane boots with `CIRCUITS_DBSP_COUNTS`, triggers drift on a circuit-served table, and asserts exit 75 → restart → re-seed → recover.
@@ -15,7 +16,9 @@ Three refusal paths are unit-tested but have no end-to-end lane:
 3. **`wal_level` ≠ `logical` refusal.** `pg::check_wal_level` is called explicitly at connect and the classifier is unit-tested; the harness cluster is always `logical`, and changing `wal_level` needs a Postgres restart, so a conformance case needs a second throwaway cluster.
 
 ## Fix direction
+
 One conformance file per item, each booting the binary through the harness: (1) a `DBSP_COUNTS` lane with `ADD COLUMN` on the circuit table; (2) a hand-made publication with a column list → assert exit 78 and the named message; (3) an `initdb` with `wal_level = replica` → assert exit 78.
 
 ## Not now because
+
 Test debt only; the mechanisms themselves are covered. Surfaced in the slice-2b and slice-6 reviews (`docs/notes/2026-08-21-upstream-issue-triage.md`, follow-ups).

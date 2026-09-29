@@ -14,18 +14,18 @@ the semantics: NULL three-valued logic, `IN (SELECT …)`, ordering — nothing 
 
 ```ts
 interface Oracle {
-  applyChange(table: string, ev: ChangeEvent): Promise<void>
-  queryShape(shape: ShapeDef): Promise<Row[]>
-  reset(): Promise<void>     // TRUNCATE every table, keep the schema
-  close(): Promise<void>
+  applyChange(table: string, ev: ChangeEvent): Promise<void>;
+  queryShape(shape: ShapeDef): Promise<Row[]>;
+  reset(): Promise<void>; // TRUNCATE every table, keep the schema
+  close(): Promise<void>;
 }
 ```
 
 - **`createOracle(schema)`** — in-memory [PGlite](https://pglite.dev) (`memory://`). Standalone
-  truth for library-mode tests: changes are applied to the oracle *and* to Circuits, then the
+  truth for library-mode tests: changes are applied to the oracle _and_ to Circuits, then the
   two are compared.
 - **`createPgOracle(schema, connectionString)`** — a real Postgres connection. Used by the
-  Postgres-mode harness, where the *same* database is both the write source (changes flow
+  Postgres-mode harness, where the _same_ database is both the write source (changes flow
   source → logical replication → engine) and the comparison truth.
 - **`createPgTables(connectionString, schema)`** — creates the schema's tables with
   `REPLICA IDENTITY FULL` (so logical decoding carries the full old row). Run before starting the
@@ -34,11 +34,11 @@ interface Oracle {
 ## Usage
 
 ```ts
-import { createOracle } from '@circuits/oracle'
+import { createOracle } from "@circuits/oracle";
 
-const oracle = await createOracle(schema)
-await oracle.applyChange('todos', { op: 'insert', pk: 1, row: { id: 1, title: 'x', done: false } })
-const truth = await oracle.queryShape({ table: 'todos', where: { col: 'done', op: 'eq', value: false } })
+const oracle = await createOracle(schema);
+await oracle.applyChange("todos", { op: "insert", pk: 1, row: { id: 1, title: "x", done: false } });
+const truth = await oracle.queryShape({ table: "todos", where: { col: "done", op: "eq", value: false } });
 ```
 
 See [packages/conformance](../conformance/README.md) for the harness that wires an oracle against

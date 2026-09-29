@@ -3,83 +3,79 @@
 // no `headers.lsn`: this is the path a consumer that dedups on ds offsets and aligns on
 // `GET /replication/lsn` actually exercises.
 
-import pgpkg from 'pg'
-import type { Row, StreamEnvelope } from '@circuits/protocol'
+import type { Row, StreamEnvelope } from "@circuits/protocol";
+import pgpkg from "pg";
 
-import type { Harness } from './harness.js'
+import type { Harness } from "./harness.js";
 
-export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function pgQuery(h: Harness, sql: string, params: unknown[] = []): Promise<Row[]> {
-  const c = new pgpkg.Client({ connectionString: h.pgUrl })
-  await c.connect()
+  const c = new pgpkg.Client({ connectionString: h.pgUrl });
+  await c.connect();
   try {
-    return (await c.query(sql, params)).rows as Row[]
+    return (await c.query(sql, params)).rows as Row[];
   } finally {
-    await c.end().catch(() => {})
+    await c.end().catch(() => {});
   }
 }
 
 export interface ShapeResp {
-  shapeId: string
-  streamPath: string
-  streamUrl: string
+  shapeId: string;
+  streamPath: string;
+  streamUrl: string;
   /** The subscription the create was recorded under (ADR-0008) — sent, or minted by the engine. */
-  subscription?: string
+  subscription?: string;
   /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
-  leaseSeconds?: number
+  leaseSeconds?: number;
 }
 
 /** `POST /shapes` as the control plane does it: the body is the shape definition, the answer a handle. */
 export async function createShape(h: Harness, body: unknown, signal?: AbortSignal): Promise<ShapeResp> {
   const res = await fetch(`${h.engineUrl}/shapes`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    method: "POST",
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
     ...(signal ? { signal } : {}),
-  })
-  if (!res.ok) throw new Error(`POST /shapes -> ${res.status} ${await res.text()}`)
-  return (await res.json()) as ShapeResp
+  });
+  if (!res.ok) throw new Error(`POST /shapes -> ${res.status} ${await res.text()}`);
+  return (await res.json()) as ShapeResp;
 }
 
-export async function waitFor(
-  cond: () => boolean | Promise<boolean>,
-  what: string,
-  timeoutMs = 20000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs
+export async function waitFor(cond: () => boolean | Promise<boolean>, what: string, timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (await cond()) return
-    await sleep(50)
+    if (await cond()) return;
+    await sleep(50);
   }
-  throw new Error(`timed out waiting for ${what}`)
+  throw new Error(`timed out waiting for ${what}`);
 }
 
 /** Fold a shape stream (raw durable-streams reads, from the start) into its current key -> row map. */
 export async function foldStream(streamUrl: string): Promise<Map<string, Row>> {
-  const rows = new Map<string, Row>()
-  let offset = '-1'
+  const rows = new Map<string, Row>();
+  let offset = "-1";
   for (let i = 0; i < 100; i++) {
-    const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`)
-    if (res.status === 204) break
-    if (!res.ok) throw new Error(`GET ${streamUrl} -> ${res.status}`)
-    const body = (await res.text()).trim()
-    const envs: StreamEnvelope[] = body ? (JSON.parse(body) as StreamEnvelope[]) : []
+    const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`);
+    if (res.status === 204) break;
+    if (!res.ok) throw new Error(`GET ${streamUrl} -> ${res.status}`);
+    const body = (await res.text()).trim();
+    const envs: StreamEnvelope[] = body ? (JSON.parse(body) as StreamEnvelope[]) : [];
     for (const env of envs) {
-      if (env.headers.operation === 'delete') rows.delete(env.key)
-      else if (env.value) rows.set(env.key, env.value as Row)
+      if (env.headers.operation === "delete") rows.delete(env.key);
+      else if (env.value) rows.set(env.key, env.value as Row);
     }
-    const next = res.headers.get('stream-next-offset')
-    const upToDate = res.headers.get('stream-up-to-date') !== null
-    if (!next || next === offset) break
-    offset = next
-    if (upToDate) break
+    const next = res.headers.get("stream-next-offset");
+    const upToDate = res.headers.get("stream-up-to-date") !== null;
+    if (!next || next === offset) break;
+    offset = next;
+    if (upToDate) break;
   }
-  return rows
+  return rows;
 }
 
 export async function streamKeys(streamUrl: string): Promise<string[]> {
-  return [...(await foldStream(streamUrl)).keys()].sort((a, b) => Number(a) - Number(b))
+  return [...(await foldStream(streamUrl)).keys()].sort((a, b) => Number(a) - Number(b));
 }
 
 /**
@@ -88,19 +84,19 @@ export async function streamKeys(streamUrl: string): Promise<string[]> {
  * engine at a chosen point of a create or a propagation without touching engine internals.
  */
 export async function lockTable(h: Harness, table: string): Promise<{ release: () => Promise<void> }> {
-  const c = new pgpkg.Client({ connectionString: h.pgUrl })
-  await c.connect()
-  await c.query('BEGIN')
-  await c.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`)
-  let released = false
+  const c = new pgpkg.Client({ connectionString: h.pgUrl });
+  await c.connect();
+  await c.query("BEGIN");
+  await c.query(`LOCK TABLE ${table} IN ACCESS EXCLUSIVE MODE`);
+  let released = false;
   return {
     release: async () => {
-      if (released) return
-      released = true
-      await c.query('COMMIT').catch(() => {})
-      await c.end().catch(() => {})
+      if (released) return;
+      released = true;
+      await c.query("COMMIT").catch(() => {});
+      await c.end().catch(() => {});
     },
-  }
+  };
 }
 
 /** Backends in this database currently waiting on a heavyweight lock (the engine statement parked by `lockTable`). */
@@ -109,8 +105,8 @@ export async function lockWaiters(h: Harness): Promise<number[]> {
     h,
     `SELECT pid FROM pg_stat_activity
       WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid <> pg_backend_pid()`,
-  )
-  return rows.map((r) => Number(r.pid))
+  );
+  return rows.map((r) => Number(r.pid));
 }
 
 /** Backends waiting to acquire a relation lock on one specific table. */
@@ -123,10 +119,10 @@ export async function tableLockWaiters(h: Harness, table: string): Promise<numbe
        JOIN pg_class AS c ON c.oid = l.relation
       WHERE a.datname = current_database() AND c.relname = $1 AND a.pid <> pg_backend_pid()`,
     [table],
-  )
-  return rows.map((r) => Number(r.pid))
+  );
+  return rows.map((r) => Number(r.pid));
 }
 
 export async function waitForLockWaiter(h: Harness, what: string): Promise<void> {
-  await waitFor(async () => (await lockWaiters(h)).length > 0, what)
+  await waitFor(async () => (await lockWaiters(h)).length > 0, what);
 }

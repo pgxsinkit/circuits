@@ -13,10 +13,5 @@
     "vitest.config.ts",
     "vitest.global-setup.ts"
   ],
-  "exclude": [
-    "**/node_modules",
-    "**/dist",
-    "target",
-    "tmp"
-  ]
+  "exclude": ["**/node_modules", "**/dist", "target", "tmp"]
 }

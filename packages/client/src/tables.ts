@@ -12,8 +12,8 @@
 // carry its own columns/primary key would make client-side validation depend on which spelling a
 // call happened to use.
 
-import type { Schema, TableDef } from '@circuits/protocol'
-import { canonicalTable, PUBLIC_SCHEMA, parseTableRef } from '@circuits/protocol'
+import type { Schema, TableDef } from "@circuits/protocol";
+import { canonicalTable, PUBLIC_SCHEMA, parseTableRef } from "@circuits/protocol";
 
 /**
  * The schema's tables keyed by their canonical `schema.name`, built once.
@@ -24,21 +24,21 @@ import { canonicalTable, PUBLIC_SCHEMA, parseTableRef } from '@circuits/protocol
  * equality the schema type does not promise.
  */
 export function canonicalTableIndex(schema: Schema): Map<string, TableDef> {
-  const byCanonical = new Map<string, TableDef>()
-  const spelledAs = new Map<string, string>()
+  const byCanonical = new Map<string, TableDef>();
+  const spelledAs = new Map<string, string>();
   for (const [key, def] of Object.entries(schema.tables)) {
-    const canonical = canonicalTable(key)
-    const previous = spelledAs.get(canonical)
+    const canonical = canonicalTable(key);
+    const previous = spelledAs.get(canonical);
     if (previous !== undefined) {
       throw new Error(
         `client: schema keys "${previous}" and "${key}" are the same table (${canonical}) — ` +
           `a canonical table-name conflict. Keep exactly one entry per table.`,
-      )
+      );
     }
-    spelledAs.set(canonical, key)
-    byCanonical.set(canonical, def)
+    spelledAs.set(canonical, key);
+    byCanonical.set(canonical, def);
   }
-  return byCanonical
+  return byCanonical;
 }
 
 /**
@@ -46,8 +46,8 @@ export function canonicalTableIndex(schema: Schema): Map<string, TableDef> {
  * bare shorthand for a table in `public`. Used to expose one table's helpers under both names.
  */
 export function tableSpellings(canonical: string): string[] {
-  const ref = parseTableRef(canonical)
-  return ref.schema === PUBLIC_SCHEMA ? [canonical, ref.name] : [canonical]
+  const ref = parseTableRef(canonical);
+  return ref.schema === PUBLIC_SCHEMA ? [canonical, ref.name] : [canonical];
 }
 
 /**
@@ -62,13 +62,13 @@ export function tableSpellings(canonical: string): string[] {
 export function lookupTableDef(schema: Schema, table: string): TableDef | undefined {
   // Parse the REFERENCE first: a malformed argument is the caller's error and must be reported as
   // such, ahead of anything the schema might also be wrong about.
-  const canonical = canonicalTable(table)
-  return canonicalTableIndex(schema).get(canonical)
+  const canonical = canonicalTable(table);
+  return canonicalTableIndex(schema).get(canonical);
 }
 
 /** [`lookupTableDef`], but a miss is the error every caller would otherwise write itself. */
 export function resolveTableDef(schema: Schema, table: string): TableDef {
-  const def = lookupTableDef(schema, table)
-  if (!def) throw new Error(`client: unknown table "${table}"`)
-  return def
+  const def = lookupTableDef(schema, table);
+  if (!def) throw new Error(`client: unknown table "${table}"`);
+  return def;
 }

@@ -1,8 +1,8 @@
 {
   "name": "@circuits/client",
-  "description": "Browser/Node client for the extended circuits API: a typed tRPC client plus durable-stream readers for live shapes, subset queries and live aggregations.",
   "version": "0.0.0",
   "private": true,
+  "description": "Browser/Node client for the extended circuits API: a typed tRPC client plus durable-stream readers for live shapes, subset queries and live aggregations.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -11,12 +11,12 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@circuits/protocol": "workspace:*",
     "@circuits/api": "workspace:*",
-    "@trpc/client": "11.18.0",
+    "@circuits/protocol": "workspace:*",
     "@durable-streams/client": "0.2.6",
     "@durable-streams/state": "0.3.1",
     "@tanstack/db": "0.6.12",
+    "@trpc/client": "11.18.0",
     "zod": "4.4.3"
   }
 }

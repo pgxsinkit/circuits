@@ -5,19 +5,19 @@ The browser/Node client for the extended Circuits API: a typed tRPC client over
 shape streams into live TanStack DB collections.
 
 ```ts
-import { createClient } from '@circuits/client'
+import { createClient } from "@circuits/client";
 
 const client = createClient({
-  apiUrl,            // the tRPC API server
-  schema,            // Schema from @circuits/protocol
-  dsBaseUrl,         // optional: durable-streams base override (e.g. '/ds' behind a dev proxy)
-  liveMode,          // true (SSE, default) | 'sse' | 'long-poll'
-})
+  apiUrl, // the tRPC API server
+  schema, // Schema from @circuits/protocol
+  dsBaseUrl, // optional: durable-streams base override (e.g. '/ds' behind a dev proxy)
+  liveMode, // true (SSE, default) | 'sse' | 'long-poll'
+});
 ```
 
 **Either table spelling works, whichever one keyed your schema.** `schema.name` is canonical and a
 bare name is shorthand for `public.<name>` (ADR-0002), so `shape({ table: 'public.issues' })` and
-`shape({ table: 'issues' })` resolve to the same entry of a `Schema` keyed `issues` *or*
+`shape({ table: 'issues' })` resolve to the same entry of a `Schema` keyed `issues` _or_
 `public.issues`. The keys of your `Schema` are local config — the engine never sees them — so the
 client resolves the caller's spelling against them rather than requiring the two to match
 (`lookupTableDef` / `resolveTableDef` / `canonicalTableIndex` / `tableSpellings` are exported if you
@@ -41,15 +41,17 @@ stream, ref-counted.
 
 ```ts
 const shape = await client.shape({
-  table: 'issues',
-  where: { col: 'status', op: 'eq', value: 'open' },   // Predicate AST (see packages/protocol)
-  columns: ['id', 'title', 'status'],                  // optional projection; pk always included
-})
-shape.currentRows()                    // Row[]
-shape.collection                       // TanStack DB collection (usable with useLiveQuery)
-const unsub = shape.subscribe((changes) => { /* live change batches */ })
-await shape.awaitTxId(txid)            // resolve once the write bearing txid is materialized
-await shape.close()
+  table: "issues",
+  where: { col: "status", op: "eq", value: "open" }, // Predicate AST (see packages/protocol)
+  columns: ["id", "title", "status"], // optional projection; pk always included
+});
+shape.currentRows(); // Row[]
+shape.collection; // TanStack DB collection (usable with useLiveQuery)
+const unsub = shape.subscribe((changes) => {
+  /* live change batches */
+});
+await shape.awaitTxId(txid); // resolve once the write bearing txid is materialized
+await shape.close();
 ```
 
 ## `subset(def)` / `query(def)` — ordered pages, shared live tail
@@ -61,15 +63,15 @@ watermarks (a stale page can never resurrect a deleted row).
 
 ```ts
 const page = await client.subset({
-  table: 'issues',
-  orderBy: { col: 'created', desc: true },   // pk appended as tiebreaker
+  table: "issues",
+  orderBy: { col: "created", desc: true }, // pk appended as tiebreaker
   limit: 50,
   where,
-})
-page.collection                 // live collection of the loaded window
-await page.loadMore(50)         // next keyset page; resolves to rows added (0 when exhausted)
-page.hasMore()
-await page.close()
+});
+page.collection; // live collection of the loaded window
+await page.loadMore(50); // next keyset page; resolves to rows added (0 when exhausted)
+page.hasMore();
+await page.close();
 ```
 
 Paging rules worth knowing: `offset` positions the **first** page only (later pages move a keyset

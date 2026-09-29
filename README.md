@@ -56,9 +56,9 @@ re-runs the query, so the cost follows the size of the change and not the size o
 
 ## Images
 
-| Image | Program |
-|---|---|
-| `ghcr.io/pgxsinkit/circuits/engine` | the engine |
+| Image                                        | Program        |
+| -------------------------------------------- | -------------- |
+| `ghcr.io/pgxsinkit/circuits/engine`          | the engine     |
 | `ghcr.io/pgxsinkit/circuits/durable-streams` | the log server |
 
 Both images of a release are built from one commit and carry the same tags, so the pair is pinned
@@ -89,16 +89,16 @@ Postgres that received the same operations.
 
 ## Layout
 
-| Path | Language | What it is |
-|---|---|---|
-| `apps/engine` | Rust | replication ingest, shape maintenance, the control plane |
-| `apps/durable-streams` | Rust | the log server, and its protocol conformance run |
-| `apps/api` | TypeScript | the API the test harness drives the engine through |
-| `packages/protocol` | TypeScript | the shared contract: schema, predicate and envelope types |
-| `packages/client` | TypeScript | the harness client |
-| `packages/oracle`, `packages/conformance` | TypeScript | the reference implementation and the conformance suite |
-| `packages/ds-rust` | TypeScript | starts the log server for a test |
-| `container/` | | the two image builds |
+| Path                                      | Language   | What it is                                                |
+| ----------------------------------------- | ---------- | --------------------------------------------------------- |
+| `apps/engine`                             | Rust       | replication ingest, shape maintenance, the control plane  |
+| `apps/durable-streams`                    | Rust       | the log server, and its protocol conformance run          |
+| `apps/api`                                | TypeScript | the API the test harness drives the engine through        |
+| `packages/protocol`                       | TypeScript | the shared contract: schema, predicate and envelope types |
+| `packages/client`                         | TypeScript | the harness client                                        |
+| `packages/oracle`, `packages/conformance` | TypeScript | the reference implementation and the conformance suite    |
+| `packages/ds-rust`                        | TypeScript | starts the log server for a test                          |
+| `container/`                              |            | the two image builds                                      |
 
 Decisions are in [docs/adr/](docs/adr/), the glossary in [CONTEXT.md](CONTEXT.md), and where the
 code came from in [PROVENANCE.md](PROVENANCE.md). Guidance for agents working here is in

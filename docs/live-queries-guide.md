@@ -20,7 +20,7 @@ You create it once; the engine keeps its result set live as Postgres changes, de
 incremental `upsert`/`delete` updates to its feed. There are **no general joins** — the one
 cross-table form is a **single-column subquery** (`col [NOT] IN (SELECT …)`, §4).
 
-Two things a live query's predicate is *not*:
+Two things a live query's predicate is _not_:
 
 - It has no `ORDER BY` / `LIMIT`. Ordering and windowing are either a **client-side live query**
   (TanStack DB's `useLiveQuery`, presentation) or a **subset query** (pagination) — see §6.
@@ -30,10 +30,10 @@ Two things a live query's predicate is *not*:
 
 Keep these two layers distinct — it's what lets you sync a bounded set yet present it flexibly:
 
-| layer | runs where | decides |
-|---|---|---|
-| **Live query** | engine (server) | *what crosses the network* — the sync boundary |
-| **Client-side live query** (TanStack DB's `useLiveQuery` hook, over the synced collection) | client | *how the synced set is presented* — ordering, text search, finer filtering |
+| layer                                                                                      | runs where      | decides                                                                    |
+| ------------------------------------------------------------------------------------------ | --------------- | -------------------------------------------------------------------------- |
+| **Live query**                                                                             | engine (server) | _what crosses the network_ — the sync boundary                             |
+| **Client-side live query** (TanStack DB's `useLiveQuery` hook, over the synced collection) | client          | _how the synced set is presented_ — ordering, text search, finer filtering |
 
 The example apps filter by status/priority/id in the **live query**, and order by date and search
 by text in the **client-side live query** — no re-sync when you type in a search box.
@@ -55,12 +55,12 @@ via snapshot reads. (The engine can also run without Postgres — writes go thro
 
 ### Engine configuration (environment)
 
-| env var | meaning |
-|---|---|
-| `CIRCUITS_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
-| `CIRCUITS_PG_TABLES` | comma-separated table list — `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*`/empty means `public.*`: **every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table), never every schema. |
-| `CIRCUITS_PG_SLOT` | replication slot name (default `circuits`; the slot uses the `pgoutput` plugin). |
-| `CIRCUITS_PG_POLL_MS` | slot poll interval. |
+| env var               | meaning                                                                                                                                                                                                                                                                                              |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CIRCUITS_PG_URL`     | Postgres connection string. Its presence selects Postgres mode.                                                                                                                                                                                                                                      |
+| `CIRCUITS_PG_TABLES`  | comma-separated table list — `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*`/empty means `public.*`: **every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table), never every schema. |
+| `CIRCUITS_PG_SLOT`    | replication slot name (default `circuits`; the slot uses the `pgoutput` plugin).                                                                                                                                                                                                                     |
+| `CIRCUITS_PG_POLL_MS` | slot poll interval.                                                                                                                                                                                                                                                                                  |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
@@ -93,21 +93,25 @@ Postgres oracle always agree).
 ### Via the client (tRPC + stream-db)
 
 ```ts
-import { createClient } from '@circuits/client'
+import { createClient } from "@circuits/client";
 
-const client = createClient({ apiUrl, schema })
+const client = createClient({ apiUrl, schema });
 
 // one table + a WHERE over its columns
 const liveQuery = await client.shape({
-  table: 'todos',
-  where: { and: [
-    { col: 'done',     op: 'eq',  value: false },
-    { col: 'priority', op: 'gte', value: 3 },
-  ] },
-})
+  table: "todos",
+  where: {
+    and: [
+      { col: "done", op: "eq", value: false },
+      { col: "priority", op: "gte", value: 3 },
+    ],
+  },
+});
 
-liveQuery.currentRows()                          // Row[] — current matching set
-const off = liveQuery.subscribe((changes) => { /* insert/update/delete batches */ })
+liveQuery.currentRows(); // Row[] — current matching set
+const off = liveQuery.subscribe((changes) => {
+  /* insert/update/delete batches */
+});
 ```
 
 `client.shape()` creates the live query and returns a **TanStack DB collection** kept live by a
@@ -117,8 +121,8 @@ stream-db reader on its feed; it re-renders on every delta.
 
 Add `columns: ['id', 'title', 'status']` to sync only the columns a view needs (the primary key
 is always included). This cuts both the backfill working set and the synced payload — e.g. a
-browse list that never renders a large `description` should drop it. It affects *what is synced*,
-not *what is matched*.
+browse list that never renders a large `description` should drop it. It affects _what is synced_,
+not _what is matched_.
 
 ---
 
@@ -128,14 +132,18 @@ The single cross-table form: a column is `IN` (or `NOT IN`) the result of a sing
 subquery, which may itself be nested.
 
 ```jsonc
-{ "col": "project_id",
-  "in": { "table": "project_members",
-          "project": "project_id",
-          "where": { "col": "user_id", "op": "eq", "value": "u" } },
-  "negated": false }
+{
+  "col": "project_id",
+  "in": {
+    "table": "project_members",
+    "project": "project_id",
+    "where": { "col": "user_id", "op": "eq", "value": "u" },
+  },
+  "negated": false,
+}
 ```
 
-Read as: *issues whose `project_id` is one of the `project_id`s this user is a member of.*
+Read as: _issues whose `project_id` is one of the `project_id`s this user is a member of._
 
 - **`NOT IN`** is `"negated": true` (SQL NULL semantics apply — if the inner set contains a NULL,
   `NOT IN` is UNKNOWN for every row, as in Postgres).
@@ -147,12 +155,12 @@ Read as: *issues whose `project_id` is one of the `project_id`s this user is a m
 
 ### Supported vs out of scope
 
-| supported | out of scope |
-|---|---|
-| `col IN (SELECT proj FROM t WHERE …)` | general joins |
-| `col NOT IN (…)` | `EXISTS` / `= (SELECT …)` / `< ANY` |
-| nested / multi-level subqueries | correlated subqueries |
-| "tag" subqueries through composite-PK `*_tags` side tables | composite-key `(a,b) IN (…)` |
+| supported                                                  | out of scope                        |
+| ---------------------------------------------------------- | ----------------------------------- |
+| `col IN (SELECT proj FROM t WHERE …)`                      | general joins                       |
+| `col NOT IN (…)`                                           | `EXISTS` / `= (SELECT …)` / `< ANY` |
+| nested / multi-level subqueries                            | correlated subqueries               |
+| "tag" subqueries through composite-PK `*_tags` side tables | composite-key `(a,b) IN (…)`        |
 
 If you need something out of scope, model it as a subquery chain through a side table, push the
 filter into the inner `where`, or handle it as a client-side live query over a broader synced set.
@@ -165,12 +173,14 @@ filter into the inner `where`, or handle it as a client-side live query over a b
 
 ```ts
 const liveQuery = await client.shape({
-  table: 'todos',
-  where: { and: [
-    { col: 'done',     op: 'eq',  value: false },
-    { col: 'priority', op: 'gte', value: 3 },
-  ] },
-})
+  table: "todos",
+  where: {
+    and: [
+      { col: "done", op: "eq", value: false },
+      { col: "priority", op: "gte", value: 3 },
+    ],
+  },
+});
 ```
 
 Rows enter and leave live as todos are completed, re-prioritised, and deleted. This is a
@@ -187,8 +197,12 @@ changes, the affected issues move in/out of the live query automatically. Verifi
 ### Tenant / equality filters
 
 ```ts
-where: { and: [ { col: 'tenant', op: 'eq', value: 7 },
-                { col: 'region', op: 'eq', value: 'eu' } ] }
+where: {
+  and: [
+    { col: "tenant", op: "eq", value: 7 },
+    { col: "region", op: "eq", value: "eu" },
+  ];
+}
 ```
 
 This is an **equality template**. All live queries with the same key columns (`tenant`, `region`),
@@ -222,15 +236,15 @@ The full analysis is in `docs/ivm-engine-internals.md` §4; the practical summar
 
 **The thing to budget for:**
 
-- **Concurrent large materialized backfills.** A materialized live query's *initial* backfill
+- **Concurrent large materialized backfills.** A materialized live query's _initial_ backfill
   working set is a small, bounded per-row cost (transient, released after sync). Budget memory by
   the **peak concurrent backfill working set** (visible-rows-per-live-query, summed over live
-  queries backfilling at once) — *not* by total live-query count or total rows. Narrow it with the
+  queries backfilling at once) — _not_ by total live-query count or total rows. Narrow it with the
   `columns` projection, or avoid it with `changes-only`/subset.
 
 **Watch as you scale:**
 
-- **Many distinct *range* live queries on one table.** Standalone live queries are tested on every
+- **Many distinct _range_ live queries on one table.** Standalone live queries are tested on every
   change to that table (`O(K)` per change). Cheap per eval, but it grows with live-query count on
   the live path — the one term that isn't shared. Equality and subquery live queries don't have
   this property.
@@ -244,15 +258,15 @@ To read retained state directly (independent of allocator noise), scrape the OTe
 
 ## 7. Quick reference
 
-| you want | use | notes |
-|---|---|---|
-| a live filtered view of one table | **live query** with `where` | incremental upsert/delete feed |
-| only some columns synced | live query `columns` | pk always included |
-| cross-table membership | **subquery** `col IN (SELECT …)` | single column; nestable; auto-shared |
-| exclusion | subquery `negated: true` | SQL `NOT IN` NULL semantics |
-| an ordered page / infinite scroll | **subset query** (`orderBy`+`limit`) | not a live query; no top-N state |
-| a live count / sum / avg / min / max | **aggregation** (`client.aggregate({ table, fn, col?, where })`) | one maintained fold shared by all subscribers; SQL NULL semantics |
-| ordering / text search of a synced set | **client-side live query** (TanStack DB's `useLiveQuery`) | no re-sync |
+| you want                               | use                                                              | notes                                                             |
+| -------------------------------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------- |
+| a live filtered view of one table      | **live query** with `where`                                      | incremental upsert/delete feed                                    |
+| only some columns synced               | live query `columns`                                             | pk always included                                                |
+| cross-table membership                 | **subquery** `col IN (SELECT …)`                                 | single column; nestable; auto-shared                              |
+| exclusion                              | subquery `negated: true`                                         | SQL `NOT IN` NULL semantics                                       |
+| an ordered page / infinite scroll      | **subset query** (`orderBy`+`limit`)                             | not a live query; no top-N state                                  |
+| a live count / sum / avg / min / max   | **aggregation** (`client.aggregate({ table, fn, col?, where })`) | one maintained fold shared by all subscribers; SQL NULL semantics |
+| ordering / text search of a synced set | **client-side live query** (TanStack DB's `useLiveQuery`)        | no re-sync                                                        |
 
 Identical live queries are **de-duplicated end to end**: two `shape()`/`subset()`/`aggregate()`
 calls with the same definition (predicate order doesn't matter) share one maintained stream on the

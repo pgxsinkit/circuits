@@ -1,19 +1,20 @@
 // tRPC router: the public, schema-derived write/read API.
 
-import { initTRPC, TRPCError } from '@trpc/server'
-import { z } from 'zod'
-import type { CircuitsCore } from './core.js'
+import { initTRPC, TRPCError } from "@trpc/server";
+import { z } from "zod";
+
+import type { CircuitsCore } from "./core.js";
 
 export interface Context {
-  core: CircuitsCore
+  core: CircuitsCore;
 }
 
-const t = initTRPC.context<Context>().create()
+const t = initTRPC.context<Context>().create();
 
-const valueSchema = z.union([z.number(), z.string(), z.boolean(), z.null()])
-const rowSchema = z.record(z.string(), valueSchema)
-const columnType = z.enum(['int', 'text', 'bool', 'float'])
-const leafOp = z.enum(['eq', 'neq', 'lt', 'lte', 'gt', 'gte'])
+const valueSchema = z.union([z.number(), z.string(), z.boolean(), z.null()]);
+const rowSchema = z.record(z.string(), valueSchema);
+const columnType = z.enum(["int", "text", "bool", "float"]);
+const leafOp = z.enum(["eq", "neq", "lt", "lte", "gt", "gte"]);
 
 const schemaSchema = z.object({
   tables: z.record(
@@ -23,7 +24,7 @@ const schemaSchema = z.object({
       primaryKey: z.string(),
     }),
   ),
-})
+});
 
 // Recursive predicate AST: leaf | is-null | and | or | not | in-subquery.
 const predicateSchema: z.ZodType = z.lazy(() =>
@@ -39,16 +40,14 @@ const predicateSchema: z.ZodType = z.lazy(() =>
       negated: z.boolean().optional(),
     }),
   ]),
-)
+);
 
 export const appRouter = t.router({
   schema: t.router({
-    define: t.procedure
-      .input(z.object({ schema: schemaSchema }))
-      .mutation(async ({ input, ctx }) => {
-        await ctx.core.defineSchema(input.schema as Parameters<CircuitsCore['defineSchema']>[0])
-        return { ok: true as const }
-      }),
+    define: t.procedure.input(z.object({ schema: schemaSchema })).mutation(async ({ input, ctx }) => {
+      await ctx.core.defineSchema(input.schema as Parameters<CircuitsCore["defineSchema"]>[0]);
+      return { ok: true as const };
+    }),
   }),
 
   ingest: t.router({
@@ -56,7 +55,7 @@ export const appRouter = t.router({
       .input(
         z.object({
           table: z.string(),
-          op: z.enum(['insert', 'update', 'delete']),
+          op: z.enum(["insert", "update", "delete"]),
           pk: valueSchema,
           row: rowSchema.optional(),
           txid: z.string().optional(),
@@ -86,16 +85,16 @@ export const appRouter = t.router({
       ),
 
     get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
-      const handle = await ctx.core.getShape(input.id)
-      if (!handle) throw new TRPCError({ code: 'NOT_FOUND', message: `shape ${input.id} not found` })
-      return handle
+      const handle = await ctx.core.getShape(input.id);
+      if (!handle) throw new TRPCError({ code: "NOT_FOUND", message: `shape ${input.id} not found` });
+      return handle;
     }),
 
     delete: t.procedure
       .input(z.object({ id: z.string(), subscription: z.string().min(1).max(128).optional() }))
       .mutation(async ({ input, ctx }) => {
-        await ctx.core.dropShape(input.id, input.subscription)
-        return { ok: true as const }
+        await ctx.core.dropShape(input.id, input.subscription);
+        return { ok: true as const };
       }),
   }),
 
@@ -151,7 +150,7 @@ export const appRouter = t.router({
         z.object({
           table: z.string(),
           where: predicateSchema.optional(),
-          fn: z.enum(['count', 'sum', 'avg', 'min', 'max']),
+          fn: z.enum(["count", "sum", "avg", "min", "max"]),
           col: z.string().optional(),
           subscription: z.string().min(1).max(128).optional(),
         }),
@@ -163,6 +162,6 @@ export const appRouter = t.router({
         ),
       ),
   }),
-})
+});
 
-export type AppRouter = typeof appRouter
+export type AppRouter = typeof appRouter;
