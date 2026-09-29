@@ -99,7 +99,6 @@ Postgres that received the same operations.
 | `packages/oracle`, `packages/conformance` | TypeScript | the reference implementation and the conformance suite |
 | `packages/ds-rust` | TypeScript | starts the log server for a test |
 | `container/` | | the two image builds |
-| `electric-conformance/` | Elixir | tests for the compatibility adapter; removed with it (ADR-0011) |
 
 Decisions are in [docs/adr/](docs/adr/), the glossary in [CONTEXT.md](CONTEXT.md), and where the
 code came from in [PROVENANCE.md](PROVENANCE.md). Guidance for agents working here is in

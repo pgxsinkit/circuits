@@ -754,9 +754,8 @@ from the captured resume offset (through the sequencer's two-phase pending-buffe
 eviction **retires** the stream: closed, then deleted (§5.6), so a client tailing it is released
 with `stream-closed` and must re-subscribe; see `apps/engine/src/retention.rs`). A request with an
 evicted handle gets `409 must-refetch`,
-which the Electric client handles by re-syncing onto the retained shape. Conformance against Electric's own oracle + integration tests lives in
-`electric-conformance/` (see its README for scope and known gaps — e.g. row `tags` are not emitted;
-absolute membership emission makes them unnecessary for convergence).
+which the Electric client handles by re-syncing onto the retained shape. Row `tags` are not emitted: absolute
+membership emission makes them unnecessary for convergence.
 
 ---
 

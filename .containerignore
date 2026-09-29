@@ -4,4 +4,3 @@ target
 tmp
 **/dist
 *.log
-erl_crash.dump

@@ -15,7 +15,6 @@ pnpm-debug.log*
 
 # Ad-hoc run artifacts / scratch (not source)
 /*.png
-erl_crash.dump
 *.dump
 memtest.txt
 /results/

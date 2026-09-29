@@ -214,8 +214,8 @@ unchanged.
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition |
 | `GET /v1/shape` | Electric protocol: snapshot (`offset=-1`), live long-poll, handles/offsets/`must-refetch` |
 
-The `/v1/shape` adapter parses Electric's SQL `where` grammar and is validated against Electric's own
-oracle/property/integration tests ([electric-conformance/](../../electric-conformance/README.md)).
+The `/v1/shape` adapter parses Electric's SQL `where` grammar. Nothing in this repository calls it, and it
+is being removed ([ADR-0011](../../docs/adr/0011-one-repository-no-longer-a-fork.md)).
 
 **Creating a subquery shape** (`POST /shapes` with an `IN (SELECT …)` predicate) registers the
 shape's dependency edges before it reads Postgres, so a membership change can reach it mid-create:

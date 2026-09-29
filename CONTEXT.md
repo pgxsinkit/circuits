@@ -28,7 +28,7 @@ streams — the only surface this repository develops.
 
 **Compat adapter**:
 The Electric-protocol `GET /v1/shape` surface. Nothing of ours calls it, and it is being removed
-(ADR-0011).
+([ADR-0011](docs/adr/0011-one-repository-no-longer-a-fork.md)).
 _Avoid_: Electric path, legacy API
 
 **Shape**:

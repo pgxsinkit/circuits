@@ -52,6 +52,5 @@ SEED=<n> bun run test:fuzz
 Fuzz tunables: `FUZZ_SEEDS` (scenarios per run, default 5), `FUZZ_SHAPES`, `FUZZ_OPS`, `SEED`
 (base seed). `src/simulator.ts` generates the random schemas/predicates/op streams.
 
-This suite tests the **extended** API; Electric's own protocol tests run separately from
-[`electric-conformance/`](../../electric-conformance/README.md). Consistency model:
+This suite tests the **extended** API. Consistency model:
 [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).

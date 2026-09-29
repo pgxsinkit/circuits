@@ -9,7 +9,8 @@ words.
 
 The surface this repository develops is the **native path**: the engine's control plane
 (`POST /shapes`, the predicate AST) plus reads straight from the log server. The Electric
-compatibility adapter (`GET /v1/shape`) is still in the engine and is being removed (ADR-0011): do
+compatibility adapter (`GET /v1/shape`) is still in the engine and is being removed
+([ADR-0011](docs/adr/0011-one-repository-no-longer-a-fork.md)): do
 not extend it, and do not justify anything by compatibility with Electric.
 
 ## Layout
@@ -25,7 +26,6 @@ not extend it, and do not justify anything by compatibility with Electric.
 | `packages/oracle` | Reference implementation shapes are checked against. |
 | `packages/ds-rust` | Starts the log server built in this workspace for a test (one process, fresh data directory and port per test). |
 | `container/` | The two image builds: `Containerfile.engine`, `Containerfile.durable-streams`. |
-| `electric-conformance/` | Electric's own oracle/property/integration tests pointed at the compatibility adapter. Removed with it. |
 
 ## Docs (read these before designing)
 

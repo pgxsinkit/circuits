@@ -2,6 +2,10 @@
 
 Status: accepted (2026-09-29). Supersedes [ADR-0001](0001-fork-scope-native-path.md).
 
+Status note (2026-09-29): `electric-conformance/` was removed ahead of the rest of the adapter. It could
+not run here: it started the stack through a launcher in the benchmarks package, which was not brought
+over, and it needed Elixir and a checkout of Electric.
+
 The Circuits engine and the durable-streams log server were two forks in two repositories, each
 tracking an upstream that has stopped maintaining it. They are now one repository,
 `pgxsinkit/circuits`, maintained here outright. The reasons, and the alternatives that were turned
