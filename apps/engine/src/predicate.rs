@@ -348,7 +348,7 @@ impl CompiledPredicate {
         if !collect(self, &mut acc) || acc.is_empty() {
             return None;
         }
-        acc.sort_by(|a, b| a.0.cmp(&b.0));
+        acc.sort_by_key(|a| a.0);
         if acc.windows(2).any(|w| w[0].0 == w[1].0) {
             return None; // duplicate column — degenerate, not a shareable single key
         }
