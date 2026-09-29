@@ -143,7 +143,8 @@ mod s3 {
     use super::*;
     use object_store::aws::AmazonS3Builder;
     use object_store::path::Path as ObjPath;
-    use object_store::{GetOptions, GetRange, ObjectStore};
+    // `put`, `head` and `delete` are methods of the `ObjectStoreExt` extension trait.
+    use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt};
 
     /// A generic S3-compatible BlobStore over `object_store`. Configured with a
     /// custom endpoint + path-style addressing so it targets any S3-compatible
@@ -188,6 +189,9 @@ mod s3 {
             let path = ObjPath::from(key);
             Box::pin(async move {
                 let range = super::checked_range(start, len)?;
+                // object_store takes a `u64` range; `checked_range` has already rejected one that
+                // overflows or does not fit this platform's `usize`.
+                let range = range.start as u64..range.end as u64;
                 let opts = GetOptions { range: Some(GetRange::Bounded(range)), ..Default::default() };
                 let res = self.inner.get_opts(&path, opts).await.map_err(io::Error::other)?;
                 res.bytes().await.map_err(io::Error::other)
@@ -198,7 +202,7 @@ mod s3 {
             let path = ObjPath::from(key);
             Box::pin(async move {
                 match self.inner.head(&path).await {
-                    Ok(meta) => Ok(Some(meta.size as u64)),
+                    Ok(meta) => Ok(Some(meta.size)),
                     Err(object_store::Error::NotFound { .. }) => Ok(None),
                     Err(e) => Err(io::Error::other(e)),
                 }

@@ -17,33 +17,33 @@ name = "durable-streams-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-bytes = "1"
-dashmap = "6"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
-httparse = "1"
-libc = "0.2"
-percent-encoding = "2"
+tokio = { version = "1.53.1", features = ["full"] }
+bytes = "1.12.1"
+dashmap = "6.2.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["raw_value"] }
+httparse = "1.10.1"
+libc = "0.2.189"
+percent-encoding = "2.3.2"
 
 # CRC32C (hardware-accelerated where available) for WAL record header framing.
 # Header-only checksum — see the durable-wal-v2 design spec §4 (B-light framing).
-crc32c = "0.6"
+crc32c = "0.6.8"
 
 # Structured logging / tracing facade. Always compiled (it is light), but with
 # `release_max_level_info` so trace/debug records are stripped from release
 # builds at compile time — zero runtime cost when telemetry is off.
-tracing = { version = "0.1", features = ["release_max_level_info"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = { version = "0.1.44", features = ["release_max_level_info"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 
 # OpenTelemetry — opt-in via the `telemetry` feature, OFF BY DEFAULT. None of
 # these are pulled in (or compiled) for a default build, so the server keeps a
 # zero-dependency, zero-overhead telemetry path unless explicitly enabled.
-opentelemetry = { version = "0.32", optional = true }
-opentelemetry_sdk = { version = "0.32", optional = true }
-opentelemetry-otlp = { version = "0.32", optional = true, features = ["grpc-tonic"] }
-opentelemetry-semantic-conventions = { version = "0.32", optional = true }
-tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.33.0", optional = true }
+opentelemetry_sdk = { version = "0.33.0", optional = true }
+opentelemetry-otlp = { version = "0.33.0", optional = true, features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = { version = "0.33.0", optional = true }
+tracing-opentelemetry = { version = "0.34.0", optional = true }
 
 # Hot/cold tiering S3-compatible object store — opt-in via the `tier` feature,
 # OFF BY DEFAULT. `object_store` (and its reqwest/aws transport) is only pulled
@@ -51,7 +51,7 @@ tracing-opentelemetry = { version = "0.33", optional = true }
 # its existing dependency set and is byte-for-byte unchanged. The manifest /
 # sealing / reclaim logic is plain Rust and always compiled (but inactive unless
 # `--tier` is passed); only the S3 BlobStore adapter is behind this feature.
-object_store = { version = "0.11", optional = true, features = ["aws"] }
+object_store = { version = "0.14.2", optional = true, features = ["aws"] }
 
 [dev-dependencies]
 # Self-removing temp directories for tests. A `TempDir` deletes its tree when it
