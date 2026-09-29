@@ -21,9 +21,9 @@ interface Oracle {
 }
 ```
 
-- **`createOracle(schema)`** — in-memory [PGlite](https://pglite.dev) (`memory://`). Standalone
-  truth for library-mode tests: changes are applied to the oracle _and_ to Circuits, then the
-  two are compared.
+- **`createOracle(schema)`** — in-memory [pgwasm](https://pgxsinkit.github.io/packages/pgwasm/)
+  (`memory://`). Standalone truth for library-mode tests: changes are applied to the oracle _and_ to
+  Circuits, then the two are compared.
 - **`createPgOracle(schema, connectionString)`** — a real Postgres connection. Used by the
   Postgres-mode harness, where the _same_ database is both the write source (changes flow
   source → logical replication → engine) and the comparison truth.

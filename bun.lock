@@ -55,8 +55,9 @@
         "@circuits/protocol": "workspace:*",
         "@durable-streams/client": "0.2.6",
         "@durable-streams/state": "0.3.1",
-        "@electric-sql/pglite": "0.5.3",
         "@faker-js/faker": "10.5.0",
+        "@pgxsinkit/pgwasm": "0.5.2",
+        "@pgxsinkit/pgwasm-c": "0.5.2",
         "@tanstack/db": "0.6.12",
         "@trpc/client": "11.18.0",
         "pg": "8.22.0",
@@ -75,7 +76,8 @@
       "version": "0.0.0",
       "dependencies": {
         "@circuits/protocol": "workspace:*",
-        "@electric-sql/pglite": "0.5.3",
+        "@pgxsinkit/pgwasm": "0.5.2",
+        "@pgxsinkit/pgwasm-c": "0.5.2",
         "pg": "8.22.0",
       },
       "devDependencies": {
@@ -107,8 +109,6 @@
     "@durable-streams/server-conformance-tests": ["@durable-streams/server-conformance-tests@0.3.6", "", { "dependencies": { "@durable-streams/client": "0.2.6", "fast-check": "4.9.0", "vitest": "4.1.11" }, "bin": { "server-conformance-tests": "dist/cli.js", "durable-streams-server-conformance": "dist/cli.js", "durable-streams-server-conformance-dev": "bin/conformance-dev.mjs" } }, "sha512-mYuErUvlUpRCWIHlkkaKltImMGYl9La2VRMhq9ic6uz7uaW/fUqSiiKnzrzrdKa0g1khUjeTGuhIfwVKgd1J2Q=="],
 
     "@durable-streams/state": ["@durable-streams/state@0.3.1", "", { "dependencies": { "@durable-streams/client": "0.2.6", "@standard-schema/spec": "1.1.0" }, "peerDependencies": { "@tanstack/db": ">=0.6.0 <1.0.0" }, "optionalPeers": ["@tanstack/db"], "bin": { "intent": "bin/intent.js" } }, "sha512-HYhw520Bfl9+L3MJgWpzLQjByP5y/uNNasOqSSFfyWhFxZeaKHM6Go2P79YFfTJPmXh4ZHEh1jOgIfrumqT6hA=="],
-
-    "@electric-sql/pglite": ["@electric-sql/pglite@0.5.3", "", {}, "sha512-iTTYbA5Uesrl+N7zss0J5LopT7KE4j9aymYo+EZZh+rZbARQCUQOs+n2pay64JRUpc3fCkpfrniTNJnvYzOE+g=="],
 
     "@esbuild/aix-ppc64": ["@esbuild/aix-ppc64@0.28.1", "", { "os": "aix", "cpu": "ppc64" }, "sha512-Svl7tq8k/08+p6CXPpRjQ1fKX+1odH/BQbb48fV6fj3CWHhsoIOoY87w1oHXm0qEpkIK3ZfVgp0hed3XBXzXMQ=="],
 
@@ -257,6 +257,10 @@
     "@oxlint/binding-win32-ia32-msvc": ["@oxlint/binding-win32-ia32-msvc@1.86.0", "", { "os": "win32", "cpu": "ia32" }, "sha512-a47ga7EKVfMU8rO0i1m3mGwfNRj3FhQyt1d/ukO/E9u1HHF3KpR3tyb3VhuJBGEVPF8uR4exSyHUyx7xbE+uxw=="],
 
     "@oxlint/binding-win32-x64-msvc": ["@oxlint/binding-win32-x64-msvc@1.86.0", "", { "os": "win32", "cpu": "x64" }, "sha512-az4dzifCRzES1crwu6pDFXzJTIanrdxXFL9TbiJWrx9LKcuacbR83aPvxDA1LKLNswi/RoqitC7Afcflhu3zBQ=="],
+
+    "@pgxsinkit/pgwasm": ["@pgxsinkit/pgwasm@0.5.2", "", { "peerDependencies": { "drizzle-orm": "1.0.0-rc.4" }, "optionalPeers": ["drizzle-orm"] }, "sha512-NNfTJAUYieZwAENVYkOlALDJidLRPuTXSpXBjuAj1kNwpIPwLGn+bijq3aODhegQHjchEPUZLZVGP8bCamArhQ=="],
+
+    "@pgxsinkit/pgwasm-c": ["@pgxsinkit/pgwasm-c@0.5.2", "", { "peerDependencies": { "@pgxsinkit/pgwasm": "0.5.2" } }, "sha512-2wmqMn4buBGH99Kh+H0IfLBWlziUOry1QlPIr+0l5W9Tl4TcbrIGnTPDgREuozV0xiCPl8/6FiPhEy4z6vejsw=="],
 
     "@rolldown/binding-android-arm-eabi": ["@rolldown/binding-android-arm-eabi@1.2.5", "", { "os": "android", "cpu": "arm" }, "sha512-DLe/i+l8ynIBY7XEQ191TeZvCoowIGa18R+dIV30GW7DiOtp74i/xX8hs8GUjW5ARV7VZuie3d6AumSmCwbeRA=="],
 

@@ -4,7 +4,10 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2023"],
+    // "DOM" only for the WebAssembly declarations, which TypeScript ships in its DOM and WebWorker
+    // libraries alone (@types/node has none). The oracle's Postgres, @pgxsinkit/pgwasm-c, uses them in
+    // the types it publishes.
+    "lib": ["ES2023", "DOM"],
     "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,

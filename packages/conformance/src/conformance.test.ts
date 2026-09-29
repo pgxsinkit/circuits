@@ -1,5 +1,5 @@
 // End-to-end conformance: drive Circuits through the real tRPC API + streamdb client and
-// assert the materialized shape set equals the pglite oracle for the same op stream.
+// assert the materialized shape set equals the oracle for the same op stream.
 
 import type { Schema, ShapeDef } from "@circuits/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";

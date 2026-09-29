@@ -1,6 +1,6 @@
 // Oracle-driven property/fuzz test: the loop an agent iterates against. For each random seed
 // it generates random-predicate shapes (eq/neq/lt/lte/gt/gte + and/or/not over the schema),
-// applies a random op stream to Circuits AND pglite, and asserts every shape's
+// applies a random op stream to Circuits AND the oracle, and asserts every shape's
 // client-materialized set equals the oracle. A failure prints the seed for exact replay.
 //
 // Tunables (env): FUZZ_SEEDS (scenarios per run), FUZZ_SHAPES, FUZZ_OPS, SEED (base seed).

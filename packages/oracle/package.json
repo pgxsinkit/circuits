@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@circuits/protocol": "workspace:*",
-    "@electric-sql/pglite": "0.5.3",
+    "@pgxsinkit/pgwasm": "0.5.2",
+    "@pgxsinkit/pgwasm-c": "0.5.2",
     "pg": "8.22.0"
   },
   "devDependencies": {

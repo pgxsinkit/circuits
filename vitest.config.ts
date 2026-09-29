@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 // Two projects, and every test file is in exactly one of them.
 //
 // `unit`: the files below, which need neither the engine, a log server nor a Postgres server.
-// `bun run test` runs them next to the Rust tests. The oracle's tests use PGlite, a Postgres that
+// `bun run test` runs them next to the Rust tests. The oracle's tests use pgwasm, a Postgres that
 // runs in-process; ds-rust's binary.test.ts checks which log server binary the wrapper resolves,
 // which needs the workspace build to exist but starts nothing, so this project's setup builds it.
 //
@@ -32,7 +32,7 @@ const common = {
 
 export default defineConfig({
   test: {
-    // Conformance tests each boot an engine subprocess + pglite; keep memory bounded.
+    // Conformance tests each boot an engine subprocess and a log server; keep memory bounded.
     poolOptions: { forks: { maxForks: 4 } },
     projects: [
       {

@@ -1,10 +1,10 @@
 // Query-expressiveness conformance: a deterministic fixture dataset with known edge values lets
 // us assert exact behaviour for every comparison op on every column type, boundary literals,
 // edge values (empty string, negatives), contradiction/tautology, deep nesting, and predicates
-// touching every column. Each shape is registered before data, drained, then compared to pglite.
+// touching every column. Each shape is registered before data, drained, then compared to the oracle.
 //
 // Text ordering uses lowercase-ASCII + empty string only, matching the collation-safe domain the
-// existing fuzz already proves agrees between Rust byte ordering and pglite.
+// existing fuzz already proves agrees between Rust byte ordering and the oracle.
 
 import type { Row, Schema, ShapeDef } from "@circuits/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";

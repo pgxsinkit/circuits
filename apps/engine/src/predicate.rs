@@ -420,7 +420,7 @@ impl CompiledPredicate {
     }
 
     /// Three-valued evaluation (TRUE / FALSE / UNKNOWN), mirroring Postgres so the engine and the
-    /// pglite oracle agree even in the presence of NULLs. `ev` resolves subquery membership.
+    /// oracle agree even in the presence of NULLs. `ev` resolves subquery membership.
     fn eval_ctx(&self, row: &Row, ev: &dyn SubqueryEval) -> Tri {
         match self {
             CompiledPredicate::MatchAll => Tri::True,

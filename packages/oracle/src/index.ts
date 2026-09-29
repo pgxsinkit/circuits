@@ -1,6 +1,9 @@
-// pglite-backed oracle: a real Postgres that receives the same change events as Circuits
+// pgwasm-backed oracle: a real Postgres that receives the same change events as Circuits
 // and answers `SELECT * WHERE <predicate>` for any shape. The conformance invariant is that
 // Circuits' materialized shape set equals this oracle's result set for the same op stream.
+
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 
 import {
   type ChangeEvent,
@@ -13,7 +16,8 @@ import {
   shapeSelectSql,
   tableDDL,
 } from "@circuits/protocol";
-import { PGlite } from "@electric-sql/pglite";
+import { createPgwasm, type PostgresBuild } from "@pgxsinkit/pgwasm";
+import { cBuildArtefacts, createCBuild } from "@pgxsinkit/pgwasm-c";
 import pgpkg from "pg";
 
 export interface Oracle {
@@ -26,8 +30,27 @@ export interface Oracle {
   close(): Promise<void>;
 }
 
+// The C build loads its artefacts (the Postgres and initdb WebAssembly modules, the filesystem
+// bundle) with `fetch`, which reads their `file://` URLs on Bun but not on Node, and vitest runs the
+// tests on Node. So the oracle reads and compiles them itself and hands them to the build, once per
+// process; every oracle boots from the same compiled modules.
+let oracleBuild: PostgresBuild | undefined;
+
+async function compileArtefact(url: URL): Promise<WebAssembly.Module> {
+  return WebAssembly.compile(await readFile(fileURLToPath(url)));
+}
+
+function pgwasmBuild(): PostgresBuild {
+  oracleBuild ??= createCBuild({
+    postgresWasmModule: compileArtefact(cBuildArtefacts.postgresWasm),
+    initdbWasmModule: compileArtefact(cBuildArtefacts.initdbWasm),
+    fsBundle: readFile(fileURLToPath(cBuildArtefacts.fsBundle)).then((bytes) => new Blob([bytes])),
+  });
+  return oracleBuild;
+}
+
 export async function createOracle(schema: Schema): Promise<Oracle> {
-  const db = await PGlite.create("memory://");
+  const db = await createPgwasm({ build: pgwasmBuild(), dataDir: "memory://" });
   for (const [name, def] of Object.entries(schema.tables)) {
     // A non-`public` table needs its schema to exist first (a bare key is `public.<name>` sugar,
     // which always exists).

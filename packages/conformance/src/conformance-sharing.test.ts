@@ -1,5 +1,5 @@
 // Pipeline-sharing conformance: many shapes that differ only in an equality constant must (a) each
-// still match pglite exactly, and (b) share ONE dbsp circuit per template rather than spawning N.
+// still match the oracle exactly, and (b) share ONE dbsp circuit per template rather than spawning N.
 // Sharing is verified via the engine's `GET /tables/:name/families` introspection endpoint.
 // See docs/ivm-engine-internals.md §3 (shared execution strategies).
 
@@ -87,7 +87,7 @@ describe("conformance: equality shapes share one family circuit", () => {
     await applyOp(h, "users", { op: "delete", pk: 7 });
     await drainEngine(h);
 
-    // (a) correctness: every shape — shared family member, standalone, or two-column — matches pglite.
+    // (a) correctness: every shape — shared family member, standalone, or two-column — matches the oracle.
     for (const { def, shape } of shapes) {
       const res = await waitForConvergence(h, { shape, def, columns: COLUMNS, pk: "id" });
       expect(res.equal, `${JSON.stringify(def.where)} -> ${formatCompare(res)}`).toBe(true);

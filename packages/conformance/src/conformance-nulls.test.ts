@@ -1,4 +1,4 @@
-// NULL / three-valued-logic conformance. pglite is the ground truth (real Postgres WHERE), so each
+// NULL / three-valued-logic conformance. The oracle is the ground truth (real Postgres WHERE), so each
 // case asserts the client-materialized set equals the oracle even when cells are NULL. This is the
 // gap the rest of the suite deliberately avoided (no nulls generated): a comparison with a NULL
 // operand is UNKNOWN, AND/OR follow the SQL truth tables, and `NOT (col = x)` over a NULL cell
@@ -131,7 +131,7 @@ describe("conformance: NULL three-valued logic (deterministic fixtures)", () => 
 });
 
 // Fuzz with NULLs ON: random predicates over an op stream that injects nulls into ~35% of cells,
-// so NOT-over-null and AND/OR-with-null arise constantly. Still compared row-for-row to pglite.
+// so NOT-over-null and AND/OR-with-null arise constantly. Still compared row-for-row to the oracle.
 const SEEDS = Number(process.env.NULL_FUZZ_SEEDS ?? 4);
 const SHAPES = Number(process.env.NULL_FUZZ_SHAPES ?? 14);
 const OPS = Number(process.env.NULL_FUZZ_OPS ?? 300);
