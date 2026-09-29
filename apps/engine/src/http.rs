@@ -836,12 +836,12 @@ impl From<anyhow::Error> for AppError {
             StatusCode::SERVICE_UNAVAILABLE
         // A subscription id that already names another shape is the caller's conflict to resolve,
         // not a server fault and not something a retry changes (ADR-0008).
-        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some() {
-            StatusCode::CONFLICT
-        // A request for the other mode (`POST /schema` to a Postgres-mode engine): 409 like the
-        // epoch reset refused on an intact epoch — valid on its face, in conflict with how this
-        // engine runs, and not something a retry changes.
-        } else if e.downcast_ref::<crate::engine::SchemaIsPostgres>().is_some() {
+        } else if e.downcast_ref::<crate::engine::SubscriptionConflict>().is_some()
+            // A request for the other mode (`POST /schema` to a Postgres-mode engine): 409 like the
+            // epoch reset refused on an intact epoch — valid on its face, in conflict with how this
+            // engine runs, and not something a retry changes.
+            || e.downcast_ref::<crate::engine::SchemaIsPostgres>().is_some()
+        {
             StatusCode::CONFLICT
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
