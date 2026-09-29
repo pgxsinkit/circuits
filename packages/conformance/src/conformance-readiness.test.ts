@@ -7,7 +7,6 @@
 //                   restart does not fix.
 //   `GET /ready`  — READINESS. 200 `{"status":"active"}` only when the engine can actually serve;
 //                   503 with the word that says why otherwise.
-//   `GET /v1/health` — unchanged fleet parity (202 while booting, 200 active, 503 degraded).
 //
 // The interesting case is `degraded`: with `CIRCUITS_RESET_ON_SLOT_LOSS=false` the engine
 // fails closed on a lost slot (ADR-0004) and stays that way until an operator posts `/epoch/reset`.
@@ -46,11 +45,6 @@ async function health(): Promise<{ code: number; body: string }> {
   return { code: res.status, body: await res.text() }
 }
 
-async function healthV1(): Promise<{ code: number; status: string }> {
-  const res = await fetch(`${h!.engineUrl}/v1/health`)
-  return { code: res.status, status: ((await res.json()) as { status: string }).status }
-}
-
 /**
  * Destroy the engine's replication slot for real (the same helper `conformance-epoch.test.ts` uses):
  * terminate the walsender holding it, then DROP, retrying until the DROP itself succeeds.
@@ -72,11 +66,10 @@ async function destroySlot(): Promise<void> {
 }
 
 describe('readiness vs liveness', () => {
-  it('is 200 active on a healthy engine, with liveness and fleet health agreeing', async () => {
+  it('is 200 active on a healthy engine, with liveness agreeing', async () => {
     await boot()
     expect(await ready()).toEqual({ code: 200, status: 'active' })
     expect(await health()).toEqual({ code: 200, body: 'ok' })
-    expect(await healthV1()).toEqual({ code: 200, status: 'active' })
 
     // Readiness must never be cached: an orchestrator polling it has to see the live phase.
     const res = await fetch(`${h!.engineUrl}/ready`)
@@ -98,8 +91,6 @@ describe('readiness vs liveness', () => {
     // Liveness is unmoved: a restart is NOT the fix here (it would lose the parked shapes the
     // operator's reset is about to retire properly), so a kubelet must not be told to restart.
     expect(await health()).toEqual({ code: 200, body: 'ok' })
-    // ...and the fleet endpoint keeps its own contract.
-    expect(await healthV1()).toEqual({ code: 503, status: 'degraded' })
 
     const reset = await fetch(`${h!.engineUrl}/epoch/reset`, { method: 'POST' })
     expect(reset.status).toBe(200)

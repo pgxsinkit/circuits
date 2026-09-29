@@ -29,7 +29,6 @@ async function spawnLibraryEngine(
   const proc = spawn(join(root, 'target/debug/circuits-engine'), [], {
     env: {
       ...process.env,
-      DATABASE_URL: '',
       CIRCUITS_PG_URL: '',
       CIRCUITS_DS_URL: dsUrl,
       CIRCUITS_BIND: '127.0.0.1:0',

@@ -22,9 +22,6 @@ pub fn router(engine: Engine) -> Router {
 /// zero-subscriber fast path (one atomic load). The surface is unauthenticated when enabled.
 pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router {
     let mut r = Router::new()
-        // Fleet surface: root probe + health state machine.
-        .route("/", get(|| async { StatusCode::OK }))
-        .route("/v1/health", get(health_v1))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
         .route("/health", get(|| async { "ok" }))
         .route("/ready", get(ready))
@@ -82,26 +79,9 @@ async fn get_trace(State(engine): State<Engine>) -> impl IntoResponse {
     axum::response::sse::Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
-/// Exact `/v1/health` JSON body for a status — no whitespace (the fleet's healthcheck string-compares
-/// the body against `{"status":"active"}`).
+/// Exact `/ready` JSON body for a status — `{"status":"<word>"}`, no whitespace.
 fn health_json(status: &str) -> String {
     format!("{{\"status\":\"{status}\"}}")
-}
-
-/// `GET /v1/health` — `waiting`/`starting` → 202, `active` → 200, `degraded` → 503 (the engine lost
-/// membership effects and only a restart fixes it; 503 keeps a load balancer from routing to it).
-/// Caches are disabled so the fleet's 500ms poll always sees the live phase.
-async fn health_v1(State(engine): State<Engine>) -> Response {
-    let status = engine.health_status();
-    let code = match status {
-        "active" => StatusCode::OK,
-        "degraded" => StatusCode::SERVICE_UNAVAILABLE,
-        _ => StatusCode::ACCEPTED,
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    (code, headers, health_json(status)).into_response()
 }
 
 /// `GET /ready` — the **readiness** probe, and the only endpoint a load balancer should gate on.
@@ -112,8 +92,6 @@ async fn health_v1(State(engine): State<Engine>) -> Response {
 ///
 /// It is deliberately NOT `/health`, which stays pure **liveness**: "ok" while the process runs, so
 /// a kubelet never restarts an engine that is merely waiting for Postgres to come up, or draining.
-/// `/v1/health` is unchanged — it is the benchmarking-fleet's healthcheck and its status/code
-/// mapping (202 while booting) is parity, not a probe contract.
 async fn ready(State(engine): State<Engine>) -> Response {
     let status = engine.readiness_status();
     let code = if status == "active" { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
@@ -886,8 +864,8 @@ impl IntoResponse for AppError {
 mod tests {
     use super::health_json;
 
-    // The fleet's healthcheck does an awk string-compare against the exact body, so byte-for-byte
-    // exactness (no whitespace) matters more than JSON equivalence.
+    // A probe may string-compare the body, so byte-for-byte exactness (no whitespace) matters more
+    // than JSON equivalence.
     #[test]
     fn health_body_is_exact() {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);

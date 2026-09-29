@@ -62,7 +62,7 @@ pub(crate) use output::{
 };
 pub use planning::CircuitPlacement;
 
-/// `GET /v1/health` phases (see [`Engine::health`]).
+/// Boot phases behind `GET /ready` (see [`Engine::health`]).
 const HEALTH_WAITING: u8 = 0;
 const HEALTH_STARTING: u8 = 1;
 const HEALTH_ACTIVE: u8 = 2;
@@ -211,7 +211,7 @@ pub struct Engine {
     /// replication ingestor has been spawned. A second call is refused against it (see
     /// `setup_postgres`).
     replicator_started: Arc<std::sync::atomic::AtomicBool>,
-    /// Boot readiness phase driving `GET /v1/health`: 0 = `waiting` (Postgres not connected), 1 =
+    /// Boot readiness phase driving `GET /ready`: 0 = `waiting` (Postgres not connected), 1 =
     /// `starting` (connected; introspecting / creating slot / spawning ingest), 2 = `active` (ingest
     /// loop running). Library mode (no Postgres) is `active` from construction.
     health: Arc<std::sync::atomic::AtomicU8>,
@@ -1262,12 +1262,12 @@ impl Engine {
         v
     }
 
-    /// The `/v1/health` status string: `degraded` | `waiting` | `starting` | `active` (exact, no
-    /// whitespace). `degraded` outranks every boot phase — an engine that has lost membership
-    /// effects, or whose epoch broke under the refuse policy (ADR-0004), is not healthy however far
-    /// along its boot got. The two are one status word on purpose: the fleet healthcheck
-    /// string-compares the body, and `GET /replication/lsn` is where the *reason* lives
-    /// (`flipFailures` vs `epoch.reason`).
+    /// The engine's health word: `degraded` | `waiting` | `starting` | `active`, which
+    /// [`Self::readiness_status`] reports unless a shutdown has begun. `degraded` outranks every boot
+    /// phase — an engine that has lost membership effects, or whose epoch broke under the refuse
+    /// policy (ADR-0004), is not healthy however far along its boot got. The two are one status word
+    /// on purpose: `GET /replication/lsn` is where the *reason* lives (`flipFailures` vs
+    /// `epoch.reason`).
     pub fn health_status(&self) -> &'static str {
         if self.degraded() || self.epoch_broken().is_some() {
             return "degraded";
@@ -1330,7 +1330,7 @@ impl Engine {
         // failure: it needs a Postgres RESTART to change, so it deserves its own named refusal.
         crate::pg::check_wal_level(&client).await?;
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
-        // ingest spawn still ahead). `/v1/health` reports 202 until the ingest loop is running.
+        // ingest spawn still ahead). `/ready` reports 503 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);
         // An empty setting means `*`, i.e. `public.*`: every table with a PK in `public` — NOT every
         // schema (introspect-all sets REPLICA IDENTITY FULL, which is not ours to do to managed
@@ -1496,7 +1496,7 @@ impl Engine {
         // sweep is what deletes the segments nothing can resume inside (ADR-0006), so it must run
         // whether or not anyone has ever created a shape.
         self.ensure_retention_sweeper();
-        // Introspection + slot + ingest loop are up: report `active` (200 on `/v1/health`).
+        // Introspection + slot + ingest loop are up: report `active` (200 on `/ready`).
         self.health.store(HEALTH_ACTIVE, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }

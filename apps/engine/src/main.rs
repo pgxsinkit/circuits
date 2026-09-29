@@ -1,13 +1,12 @@
 //! Circuits engine binary: a durable-streams client that incrementally maintains shapes
 //! (key routing + stateless predicate evaluation over Z-set deltas).
 //!
-//! Boot configuration is resolved from the environment by [`circuits_engine::config`], which maps
-//! the benchmarking-fleet's `ELECTRIC_*` / `DATABASE_URL` surface onto the engine's `CIRCUITS_*`
-//! internals (the latter still win, preserving the dev/test workflow). The durable-streams base URL
-//! comes from `CIRCUITS_DS_URL`; the engine binds `0.0.0.0:$ELECTRIC_PORT` (default 3000 under the
-//! fleet, `127.0.0.1:0` in dev). Two stdout lines are the discovery channel: `ENGINE_BINDING <url>`
-//! when the port is open (before Postgres is contacted, so `GET /ready` is answerable while the boot
-//! is still retrying) and `ENGINE_LISTENING <url>` once the boot has RESOLVED.
+//! Boot configuration is resolved from the `CIRCUITS_*` environment variables by
+//! [`circuits_engine::config`]. The durable-streams base URL comes from `CIRCUITS_DS_URL`; the engine
+//! binds `CIRCUITS_BIND` (default `0.0.0.0:3000` in Postgres mode, `127.0.0.1:0` in library mode).
+//! Two stdout lines are the discovery channel: `ENGINE_BINDING <url>` when the port is open (before
+//! Postgres is contacted, so `GET /ready` is answerable while the boot is still retrying) and
+//! `ENGINE_LISTENING <url>` once the boot has RESOLVED.
 //!
 //! ## Exit codes
 //!
@@ -51,23 +50,12 @@ async fn main() -> Result<()> {
     };
     init_tracing(&config.log_filter);
 
-    // Unknown ELECTRIC_* vars are accepted, never fatal — surface them once so operators can see the
-    // image tolerated (and ignored) them.
-    if !config.noop_vars.is_empty() {
-        tracing::info!("accepted (no-op) ELECTRIC_* vars: {}", config.noop_vars.join(", "));
-    }
     tracing::info!("resolved config: {}", config.redacted());
 
     // Publish the metric-tag globals (instance id, stack id) and wire up StatsD.
     config::set_globals(&config.instance_id, &config.stack_id);
     if let Some(target) = &config.statsd {
         statsd::init(target, &config.instance_id);
-    }
-    if config.prometheus_port.is_some() {
-        tracing::info!(
-            "ELECTRIC_PROMETHEUS_PORT is set, but the dedicated Prometheus listener is not implemented; \
-             /metrics/prometheus stays on the main port"
-        );
     }
 
     let Some(ds_url) = config.ds_url.clone() else {
@@ -97,7 +85,7 @@ async fn main() -> Result<()> {
     circuits_engine::pg::set_backfill_config(config.backfill);
 
     // Postgres mode: data lives in Postgres, ingested via logical replication and read back for
-    // backfill. Enabled by a resolved pg_url (CIRCUITS_PG_URL or DATABASE_URL).
+    // backfill. Enabled by CIRCUITS_PG_URL.
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
             let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
@@ -367,7 +355,7 @@ fn refuse_boot(kind: &str, e: &anyhow::Error) -> ! {
 
 fn init_tracing(filter: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
-    // `filter` already reflects CIRCUITS_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
+    // `filter` is CIRCUITS_LOG, or `info` (see config.rs).
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 }

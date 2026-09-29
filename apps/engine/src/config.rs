@@ -1,14 +1,6 @@
-//! Boot configuration resolved from the environment.
-//!
-//! The engine grew up on `CIRCUITS_*` vars (see `README.md`); the benchmarking-fleet drives the
-//! image with Electric's own `ELECTRIC_*` / `DATABASE_URL` surface (see `docs/fleet-conformance.md`).
-//! This module maps the fleet surface onto the engine, keeping the `CIRCUITS_*` vars as the
-//! higher-precedence override so the existing dev/test workflow is unchanged. Resolution is a pure
-//! function of an env getter ([`Config::resolve`]) so precedence is unit-testable without touching the
-//! process environment.
-//!
-//! Unknown `ELECTRIC_*` vars are collected into [`Config::noop_vars`] and logged once as
-//! "accepted (no-op)" — they must never crash the boot.
+//! Boot configuration resolved from the environment: the `CIRCUITS_*` variables (see the engine's
+//! `README.md`). Resolution is a pure function of an env getter ([`Config::resolve`]) so it is
+//! unit-testable without touching the process environment.
 
 use std::time::Duration;
 
@@ -33,15 +25,15 @@ impl StatsdTarget {
 /// Fully-resolved boot configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Postgres connection string (enables Postgres mode). `CIRCUITS_PG_URL` wins over `DATABASE_URL`.
+    /// Postgres connection string (`CIRCUITS_PG_URL`; enables Postgres mode).
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
-    /// HTTP bind address for the control plane + `/v1/health`.
+    /// HTTP bind address for the control plane (`CIRCUITS_BIND`).
     pub bind: String,
-    /// `tracing` EnvFilter string.
+    /// `tracing` EnvFilter string (`CIRCUITS_LOG`).
     pub log_filter: String,
-    /// Logical-replication slot name.
+    /// Logical-replication slot name (`CIRCUITS_PG_SLOT`).
     pub slot: String,
     /// Tables to replicate (`CIRCUITS_PG_TABLES`): `schema.name`, a bare name (=
     /// `public.<name>`), or `schema.*` / `*` for "every table with a primary key in that schema"
@@ -53,7 +45,7 @@ pub struct Config {
     pub poll_ms: u64,
     /// This instance's id — tags every StatsD metric.
     pub instance_id: String,
-    /// The `stack_id` tag value on shape metrics: the replication stream id, or `single_stack`.
+    /// The `stack_id` tag value on shape metrics (`single_stack`).
     pub stack_id: String,
     /// StatsD destination (absent → StatsD off).
     pub statsd: Option<StatsdTarget>,
@@ -61,8 +53,6 @@ pub struct Config {
     pub metrics_period: Duration,
     /// Root dir of durable-streams file storage, for `electric.storage.used.bytes` (`du`).
     pub storage_dir: Option<String>,
-    /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
-    pub prometheus_port: Option<u16>,
     /// Max pooled Postgres connections for backfills/query-backs (`CIRCUITS_PG_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
@@ -86,8 +76,6 @@ pub struct Config {
     /// a load balancer's probe sees the drain (`CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
     /// of `shutdown_grace`, not on top of it.
     pub shutdown_ready_drain: Duration,
-    /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
-    pub noop_vars: Vec<String>,
 }
 
 /// Settings for the dbsp arrangement layer (all under `CIRCUITS_DBSP*`).
@@ -116,20 +104,6 @@ pub struct DbspConfig {
     /// decomposes over these columns are served from the groups.
     pub counts: Vec<(TableRef, Vec<String>)>,
 }
-
-/// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
-/// (and not the internal `CIRCUITS_*` namespace) is an accepted no-op.
-const HANDLED: &[&str] = &[
-    "ELECTRIC_PORT",
-    "ELECTRIC_INSTANCE_ID",
-    "ELECTRIC_STATSD_HOST",
-    "ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL",
-    "ELECTRIC_STORAGE_DIR",
-    "ELECTRIC_LOG_LEVEL",
-    "ELECTRIC_REPLICATION_STREAM_ID",
-    "ELECTRIC_PROMETHEUS_PORT",
-    "ELECTRIC_DB_POOL_SIZE",
-];
 
 fn nonempty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
@@ -174,44 +148,31 @@ impl Config {
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
 
-        // Postgres URL: our internal var wins, then the fleet's DATABASE_URL. Parsed here (parsing
-        // is pure — no I/O) so an unusable one is a NAMED boot refusal rather than a connect that
-        // fails identically forever: to the boot classifier a `Config::from_str` failure looks
-        // exactly like "the database is not up yet" (no SQLSTATE, no server answer), so without
-        // this a typo would back off and re-parse the same broken string every 30 s for ever.
-        let pg_url = g("CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
+        // Postgres URL. Parsed here (parsing is pure — no I/O) so an unusable one is a NAMED boot
+        // refusal rather than a connect that fails identically forever: to the boot classifier a
+        // `Config::from_str` failure looks exactly like "the database is not up yet" (no SQLSTATE,
+        // no server answer), so without this a typo would back off and re-parse the same broken
+        // string every 30 s for ever.
+        let pg_url = g("CIRCUITS_PG_URL");
         if let Some(url) = pg_url.as_deref() {
-            crate::pg::parse_pg_url(url).context("CIRCUITS_PG_URL / DATABASE_URL")?;
+            crate::pg::parse_pg_url(url).context("CIRCUITS_PG_URL")?;
         }
         let ds_url = g("CIRCUITS_DS_URL");
 
-        // Bind address. CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
-        // if the fleet surface is present (ELECTRIC_PORT or DATABASE_URL) bind 0.0.0.0:<port|3000>.
+        // Bind address. CIRCUITS_BIND always wins. Otherwise Postgres mode (a deployment) binds
+        // 0.0.0.0:3000 and library mode an ephemeral local port.
         let bind = if let Some(b) = g("CIRCUITS_BIND") {
             b
-        } else if let Some(port) = g("ELECTRIC_PORT") {
-            format!("0.0.0.0:{}", port.trim())
         } else if pg_url.is_some() {
             "0.0.0.0:3000".to_string()
         } else {
             "127.0.0.1:0".to_string()
         };
 
-        // Log filter: CIRCUITS_LOG (a raw EnvFilter) wins; else map ELECTRIC_LOG_LEVEL; else info.
-        let log_filter = g("CIRCUITS_LOG").unwrap_or_else(|| match g("ELECTRIC_LOG_LEVEL").as_deref() {
-            Some("error") => "error".into(),
-            Some("warning") | Some("warn") => "warn".into(),
-            Some("debug") => "debug".into(),
-            Some("info") => "info".into(),
-            _ => "info".into(),
-        });
+        // Log filter: CIRCUITS_LOG, a raw EnvFilter; else info.
+        let log_filter = g("CIRCUITS_LOG").unwrap_or_else(|| "info".into());
 
-        // Slot name: CIRCUITS_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
-        let stream_id = g("ELECTRIC_REPLICATION_STREAM_ID");
-        let slot = g("CIRCUITS_PG_SLOT").unwrap_or_else(|| match &stream_id {
-            Some(id) => format!("electric_slot_{id}"),
-            None => "circuits".to_string(),
-        });
+        let slot = g("CIRCUITS_PG_SLOT").unwrap_or_else(|| "circuits".to_string());
 
         // `schema.name` / bare name (= `public.<name>`) / `schema.*` / `*`. An empty setting leaves
         // the list empty, which `setup_postgres` reads as `public.*` (introspect all).
@@ -243,7 +204,7 @@ impl Config {
         let poll_ms = g("CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
         let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let stack_id = stream_id.clone().unwrap_or_else(|| "single_stack".to_string());
+        let stack_id = "single_stack".to_string();
 
         let statsd = g("ELECTRIC_STATSD_HOST").map(|h| {
             let h = h.trim();
@@ -263,13 +224,8 @@ impl Config {
             .unwrap_or_else(|| Duration::from_secs(5));
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
-        let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
-        // `CIRCUITS_PG_POOL_SIZE` wins; `ELECTRIC_DB_POOL_SIZE` is the fleet's spelling of it.
-        let db_pool_size = g("CIRCUITS_PG_POOL_SIZE")
-            .or_else(|| g("ELECTRIC_DB_POOL_SIZE"))
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|n| *n >= 1)
-            .unwrap_or(20);
+        let db_pool_size =
+            g("CIRCUITS_PG_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
 
         let trace = g("CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
@@ -383,7 +339,6 @@ impl Config {
             statsd,
             metrics_period,
             storage_dir,
-            prometheus_port,
             db_pool_size,
             trace,
             dbsp,
@@ -391,23 +346,19 @@ impl Config {
             backfill,
             shutdown_grace,
             shutdown_ready_drain,
-            noop_vars: Vec::new(),
         })
     }
 
-    /// Resolve from the real process environment, then scan it for accepted-no-op `ELECTRIC_*` vars.
+    /// Resolve from the real process environment.
     pub fn from_env() -> Result<Config> {
-        let mut cfg = Config::resolve(|k| std::env::var(k).ok())?;
-        cfg.noop_vars = std::env::vars().map(|(k, _)| k).filter(|k| is_noop_var(k)).collect();
-        cfg.noop_vars.sort();
-        Ok(cfg)
+        Config::resolve(|k| std::env::var(k).ok())
     }
 
     /// The resolved configuration with the Postgres URL's credentials redacted — safe to log.
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             storage_dir={} prometheus_port={:?} trace={} log={} \
+             storage_dir={} trace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -419,7 +370,6 @@ impl Config {
             self.statsd.as_ref().map(|s| s.addr()).unwrap_or_else(|| "<off>".into()),
             self.metrics_period,
             self.storage_dir.as_deref().unwrap_or("<none>"),
-            self.prometheus_port,
             self.trace,
             self.log_filter,
             self.txn.memory_bytes,
@@ -431,12 +381,6 @@ impl Config {
             self.shutdown_ready_drain,
         )
     }
-}
-
-/// Is `k` an `ELECTRIC_*` var the engine does not act on (so it should be accepted as a no-op)?
-/// Internal `CIRCUITS_*` vars are ours (handled) and never counted here.
-pub fn is_noop_var(k: &str) -> bool {
-    k.starts_with("ELECTRIC_") && !k.starts_with("CIRCUITS_") && !HANDLED.contains(&k)
 }
 
 /// Redact `user:pass@` credentials from a Postgres/URL connection string for logging.
@@ -491,14 +435,13 @@ mod tests {
         Config::resolve(move |k| map.get(k).cloned())
     }
 
+    /// Postgres mode comes from `CIRCUITS_PG_URL` alone; `DATABASE_URL` is not read.
     #[test]
-    fn pg_url_precedence_ivm_wins_over_database_url() {
-        let c = cfg(&[("CIRCUITS_PG_URL", "postgres://ivm"), ("DATABASE_URL", "postgres://fleet")]);
-        assert_eq!(c.pg_url.as_deref(), Some("postgres://ivm"));
-        let c = cfg(&[("DATABASE_URL", "postgres://fleet")]);
-        assert_eq!(c.pg_url.as_deref(), Some("postgres://fleet"));
-        let c = cfg(&[]);
-        assert_eq!(c.pg_url, None);
+    fn pg_url_is_circuits_pg_url() {
+        let c = cfg(&[("CIRCUITS_PG_URL", "postgres://circuits")]);
+        assert_eq!(c.pg_url.as_deref(), Some("postgres://circuits"));
+        assert_eq!(cfg(&[("DATABASE_URL", "postgres://other")]).pg_url, None);
+        assert_eq!(cfg(&[]).pg_url, None);
     }
 
     /// A connection string the driver cannot parse refuses the boot HERE, where every other
@@ -513,8 +456,6 @@ mod tests {
         .expect_err("an unusable connection string must not resolve");
         let msg = format!("{e:#}");
         assert!(msg.contains("unusable Postgres URL"), "{msg}");
-        // The same string via the fleet's variable is refused identically.
-        assert!(Config::resolve(|k| (k == "DATABASE_URL").then(|| "postgres://u@host:notaport/db".into())).is_err());
     }
 
     /// A password containing an `@` must not leak its tail into the "safe to log" config line.
@@ -527,11 +468,11 @@ mod tests {
     }
 
     #[test]
-    fn database_url_tolerates_sslmode_disable() {
+    fn pg_url_tolerates_sslmode_disable() {
         // We don't strip it — tokio-postgres accepts sslmode in the conn string. Just confirm it
         // passes through verbatim so the connect string is unchanged.
         let url = "postgresql://postgres:password@proxy:5433/postgres?sslmode=disable";
-        let c = cfg(&[("DATABASE_URL", url)]);
+        let c = cfg(&[("CIRCUITS_PG_URL", url)]);
         assert_eq!(c.pg_url.as_deref(), Some(url));
     }
 
@@ -539,38 +480,23 @@ mod tests {
     fn bind_precedence() {
         // nothing set -> dev default
         assert_eq!(cfg(&[]).bind, "127.0.0.1:0");
-        // ELECTRIC_PORT -> 0.0.0.0:<port>
-        assert_eq!(cfg(&[("ELECTRIC_PORT", "3000")]).bind, "0.0.0.0:3000");
-        // DATABASE_URL present, no port -> 0.0.0.0:3000
-        assert_eq!(cfg(&[("DATABASE_URL", "postgres://x")]).bind, "0.0.0.0:3000");
+        // Postgres mode, no bind -> 0.0.0.0:3000
+        assert_eq!(cfg(&[("CIRCUITS_PG_URL", "postgres://x")]).bind, "0.0.0.0:3000");
         // CIRCUITS_BIND always wins
-        assert_eq!(cfg(&[("CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind, "127.0.0.1:9");
+        assert_eq!(cfg(&[("CIRCUITS_BIND", "127.0.0.1:9"), ("CIRCUITS_PG_URL", "postgres://x")]).bind, "127.0.0.1:9");
     }
 
     #[test]
-    fn log_level_mapping() {
+    fn log_filter() {
         assert_eq!(cfg(&[]).log_filter, "info");
-        assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "warning")]).log_filter, "warn");
-        assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "error")]).log_filter, "error");
-        assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "debug")]).log_filter, "debug");
-        // CIRCUITS_LOG wins and passes through verbatim
-        assert_eq!(
-            cfg(&[("CIRCUITS_LOG", "circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")]).log_filter,
-            "circuits_engine=debug"
-        );
+        // CIRCUITS_LOG passes through verbatim
+        assert_eq!(cfg(&[("CIRCUITS_LOG", "circuits_engine=debug")]).log_filter, "circuits_engine=debug");
     }
 
     #[test]
-    fn slot_name_from_stream_id() {
+    fn slot_name() {
         assert_eq!(cfg(&[]).slot, "circuits");
-        assert_eq!(cfg(&[("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "electric_slot_bench");
-        assert_eq!(cfg(&[("CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "custom");
-    }
-
-    #[test]
-    fn stack_id_from_stream_id() {
-        assert_eq!(cfg(&[]).stack_id, "single_stack");
-        assert_eq!(cfg(&[("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).stack_id, "bench");
+        assert_eq!(cfg(&[("CIRCUITS_PG_SLOT", "custom")]).slot, "custom");
     }
 
     #[test]
@@ -693,15 +619,5 @@ mod tests {
             assert!(msg.contains("CIRCUITS_PG_TABLES"), "{msg}");
             assert!(msg.contains("schema.*"), "the message must state the rule: {msg}");
         }
-    }
-
-    #[test]
-    fn noop_var_detection() {
-        assert!(is_noop_var("ELECTRIC_CACHE_MAX_AGE"));
-        assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
-        assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
-        assert!(!is_noop_var("ELECTRIC_PORT")); // handled
-        assert!(!is_noop_var("CIRCUITS_PG_URL")); // internal
-        assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var
     }
 }

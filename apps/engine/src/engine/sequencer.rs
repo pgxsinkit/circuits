@@ -1011,9 +1011,9 @@ pub(crate) async fn sequencer_loop(
                         reading = false;
                         parked = true;
                         *fail_closed.failure.lock().unwrap() = Some(failure.clone());
-                        // Latch the engine broken so `/ready` and `/v1/health` say `degraded` and
-                        // every shape route refuses, rather than serving shapes nothing maintains any
-                        // more. NEVER auto-reset: `EpochBreakReason::needs_operator`.
+                        // Latch the engine broken so `/ready` says `degraded` and every shape route
+                        // refuses, rather than serving shapes nothing maintains any more. NEVER
+                        // auto-reset: `EpochBreakReason::needs_operator`.
                         fail_closed.epoch.latch(EpochBreakReason::ChangeLogUnprocessable);
                         tracing::error!(
                             "CHANGE LOG UNPROCESSABLE at {} (table '{}', key '{}', txid {:?}, lsn {:?}, envelope {} of \

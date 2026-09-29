@@ -331,7 +331,7 @@ impl Engine {
 
     /// `Some(reason)` while the epoch is broken: latched the moment a break is detected, under
     /// EITHER policy, and cleared only by a rebind. Under the refuse policy that is the whole
-    /// degraded state (every shape route answers 503, `/v1/health` says `degraded`); under
+    /// degraded state (every shape route answers 503, `/ready` says `degraded`); under
     /// auto-reset it is the "a reset is owed here" flag, so a reset that fails part-way is retried
     /// on the next connection attempt instead of being forgotten.
     pub fn epoch_broken(&self) -> Option<EpochBreakReason> {
