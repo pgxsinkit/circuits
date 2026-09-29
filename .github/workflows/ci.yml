@@ -1,55 +1,18 @@
-# Build + test on every push/PR: Rust engine unit tests, then the full TS suite (unit + the
-# conformance harness, which boots its own ephemeral logical-replication Postgres). The runner is
-# pinned to an explicit Ubuntu LTS — an update every two years, decided here rather than by
-# `ubuntu-latest` moving underneath us — and that image ships the PostgreSQL the engine targets.
+# Pull requests are validated and publish nothing. Pushes to develop and release tags are validated
+# by images.yml, which publishes only when validation passes.
 name: ci
 
 on:
-  push:
-    branches: [main]
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    # Ubuntu 26.04 ships PostgreSQL 18 (service disabled; the harness runs its own initdb).
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      # Pinned to 1.96.0: stable 1.97.0 ICEs compiling dbsp 0.318.0 (rustc
-      # next-trait-solver panic in structural_traits.rs). Keep in sync with
-      # rust-toolchain.toml; do not float back to @stable until upstream is fixed.
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          # `cargo fmt --check` below needs the component; the action installs none by default.
-          components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Rust formatting (rustfmt.toml at the root)
-        run: cargo fmt --check
-
-      - name: Rust engine tests
-        run: cargo test -p circuits-engine
-
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-
-      - name: Put the PostgreSQL 18 server binaries on PATH
-        run: |
-          echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
-          /usr/lib/postgresql/18/bin/initdb --version
-
-      - name: Install JS dependencies
-        run: pnpm install --frozen-lockfile
-
-      # Fail fast: the vitest lane is esbuild (transpile-only) and sees no type errors at all.
-      - name: Typecheck
-        run: pnpm typecheck
-
-      - name: Full test suite (incl. conformance)
-        run: pnpm test
+  validate:
+    uses: ./.github/workflows/validate.yml

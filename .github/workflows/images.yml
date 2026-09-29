@@ -1,0 +1,97 @@
+# Builds the two images and publishes them to the GitHub Container Registry:
+#
+#   ghcr.io/pgxsinkit/circuits/engine           the Circuits engine
+#   ghcr.io/pgxsinkit/circuits/durable-streams  the log server
+#
+#   push to develop -> dev images:     `sha-<short sha>` and `dev`
+#   semver tag      -> release images: `<tag>`, `latest` and `sha-<short sha>`
+#
+# Both images of a run are built from the one commit and carry the same tags, so a consumer pins the
+# pair with one value. `develop` is freely rewritable; `main` is stable and publishes nothing on push.
+#
+# Publishing is gated on validation. The images are amd64 only: emulated arm64 Rust builds are slow,
+# and nothing that runs them is arm64.
+name: images
+
+on:
+  push:
+    branches: [develop]
+    tags: ["[0-9]*.[0-9]*.[0-9]*"]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate.yml
+
+  publish:
+    name: publish ${{ matrix.image }}
+    needs: validate
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [engine, durable-streams]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runner image has podman (5.7.0 in ubuntu-26.04 20260920); install it only if a new image drops it.
+      - name: podman
+        run: |
+          command -v podman || { sudo apt-get update && sudo apt-get install --yes podman; }
+          podman --version
+
+      - name: Tags
+        id: tags
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          short="sha-${GITHUB_SHA::7}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "tags=$REF_NAME latest $short" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$short" >> "$GITHUB_OUTPUT"
+            echo "tags=$short dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/${{ matrix.image }}
+          VERSION: ${{ steps.tags.outputs.version }}
+        run: |
+          podman build \
+            --file "container/Containerfile.${{ matrix.image }}" \
+            --tag "$IMAGE:build" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            .
+
+      - name: Log in to ghcr.io
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/${{ matrix.image }}
+          TAGS: ${{ steps.tags.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            podman tag "$IMAGE:build" "$IMAGE:$tag"
+            podman push "$IMAGE:$tag"
+            echo "- \`$IMAGE:$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          done

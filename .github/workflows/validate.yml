@@ -1,0 +1,127 @@
+# Everything that has to pass before a change is accepted or an image is published. Called by
+# ci.yml (pull requests) and by images.yml (pushes to develop, and release tags).
+#
+# The engine and the log server are tested from the one workspace at the one commit, so the engine's
+# conformance suite always runs against the log server built beside it.
+name: validate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: cargo fmt + test + clippy
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # Reads rust-toolchain.toml, the one pin CI, the container builds and local work share.
+      # `rustflags: ""` because the action's default (`-D warnings`) would turn every rustc warning
+      # in either crate into a build failure; clippy below is where warnings are denied.
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: rustfmt, clippy
+          rustflags: ""
+
+      - name: Formatting (rustfmt.toml at the root)
+        run: cargo fmt --check
+
+      - name: Engine tests
+        run: cargo test -p circuits-engine --locked
+
+      # The log server is tested as it ships: its release profile, link-time optimisation included.
+      - name: Log server build
+        run: cargo build -p durable-streams --profile release-durable-streams --locked
+
+      - name: Log server tests
+        run: cargo test -p durable-streams --profile release-durable-streams --locked
+
+      - name: Log server clippy
+        run: cargo clippy -p durable-streams --profile release-durable-streams --locked --all-targets -- -D warnings
+
+      - name: Upload the log server binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: durable-streams-server
+          path: target/release-durable-streams/durable-streams-server
+          retention-days: 1
+
+  harness:
+    name: typecheck + engine conformance
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          rustflags: ""
+
+      # No `bun-version`: setup-bun reads package.json's `packageManager`, which mise.toml matches.
+      - uses: oven-sh/setup-bun@v2
+
+      # vitest runs under node; the version is mise.toml's.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      # The runner image ships PostgreSQL 18 but does not put its server binaries on PATH. The
+      # harness boots its own ephemeral server with initdb and pg_ctl.
+      - name: Put the PostgreSQL 18 server binaries on PATH
+        run: |
+          echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/18/bin/initdb --version
+
+      - run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Builds the engine and the log server once, then runs every suite, conformance included.
+      - name: Test
+        run: bun run test
+
+  durable-streams-conformance:
+    name: log server conformance (${{ matrix.config.name }})
+    needs: rust
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with the run-configuration matrix in apps/durable-streams/README.md.
+        config:
+          - { name: wal-default, args: "" }
+          - { name: wal-resident-cache, args: "--tail-cache-bytes 65536" }
+          - { name: wal-read-offload-always, args: "--read-offload always" }
+          - { name: memory, args: "--durability memory" }
+          - { name: wal-small-chunk, args: "--max-chunk-bytes 4096" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - run: bun install --frozen-lockfile
+
+      - name: Download the log server binary
+        uses: actions/download-artifact@v8
+        with:
+          name: durable-streams-server
+          path: ${{ runner.temp }}/durable-streams
+
+      - name: Make the binary executable
+        run: chmod +x "$RUNNER_TEMP/durable-streams/durable-streams-server"
+
+      - name: Run conformance (${{ matrix.config.name }})
+        env:
+          RUST_SERVER_BIN: ${{ runner.temp }}/durable-streams/durable-streams-server
+          RUST_SERVER_ARGS: ${{ matrix.config.args }}
+        run: bun run test:durable-streams:conformance
