@@ -4,8 +4,8 @@
 // identity as the explicit form (so `items` and `public.items` can never become two separately
 // maintained shapes).
 //
-// Everything here is driven through the NATIVE surface (`POST /shapes` + raw durable-streams reads)
-// plus the compat `GET /v1/shape`, because those are the two boundaries a table name crosses.
+// Everything here is driven through the NATIVE surface (`POST /shapes` + raw durable-streams reads),
+// the boundary a table name crosses.
 
 import type { Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
@@ -38,16 +38,6 @@ async function readEnvelopes(streamUrl: string): Promise<StreamEnvelope[]> {
     if (upToDate) break
   }
   return out
-}
-
-/** `GET /v1/shape` snapshot: the compat adapter's `insert` messages, keyed by pk. */
-async function v1ShapeRows(h: Harness, table: string): Promise<Map<string, Record<string, unknown>>> {
-  const res = await fetch(`${h.engineUrl}/v1/shape?table=${encodeURIComponent(table)}&offset=-1`)
-  if (!res.ok) throw new Error(`GET /v1/shape?table=${table} -> ${res.status} ${await res.text()}`)
-  const msgs = (await res.json()) as { key?: string; value?: Record<string, unknown> }[]
-  const rows = new Map<string, Record<string, unknown>>()
-  for (const m of msgs) if (m.key !== undefined && m.value) rows.set(m.key, m.value)
-  return rows
 }
 
 const sortedKeys = (rows: Map<string, unknown>) => [...rows.keys()].sort((a, b) => Number(a) - Number(b))
@@ -135,16 +125,17 @@ describe('conformance: two schemas, one table name', () => {
     expect(sortedKeys(await foldStream(pub.streamUrl))).toEqual(['1', '2', '3'])
   }, 60000)
 
-  // (d) The compat adapter RESOLVES the schema prefix instead of stripping it. Stripping answered
-  // `table=private.users` with `public.users`' rows — a wrong-rows disclosure; a qualified request
-  // now gets that schema's rows, and a bare one keeps meaning `public`.
-  it('resolves the /v1/shape table prefix instead of stripping it', async () => {
-    expect(sortedKeys(await v1ShapeRows(h, 'other.items'))).toEqual(['11', '12'])
-    expect(sortedKeys(await v1ShapeRows(h, 'items'))).toEqual(['1', '2', '3'])
-    expect(sortedKeys(await v1ShapeRows(h, 'public.items'))).toEqual(['1', '2', '3'])
-    // A schema that is not served is refused, NOT silently answered from `public`.
-    const res = await fetch(`${h.engineUrl}/v1/shape?table=private.items&offset=-1`)
-    expect(res.status).toBe(400)
+  // (d) A qualified reference is RESOLVED, never stripped: `private.items` is `private.items`, and
+  // since that table is not served the create is refused — not silently answered with
+  // `public.items`' rows, which would be a wrong-rows disclosure. ((a) and (b) cover the qualified
+  // and bare forms of the tables that ARE served.)
+  it('refuses a table in a schema it does not serve instead of answering from public', async () => {
+    const res = await fetch(`${h.engineUrl}/shapes`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ table: 'private.items' }),
+    })
+    expect(res.ok).toBe(false)
     expect(await res.text()).toContain('private.items')
   }, 60000)
 

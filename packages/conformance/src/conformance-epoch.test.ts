@@ -64,8 +64,8 @@ async function status(url: string): Promise<number> {
   return (await fetch(url)).status
 }
 
-async function healthStatus(): Promise<{ code: number; status: string }> {
-  const res = await fetch(`${h!.engineUrl}/v1/health`)
+async function readyStatus(): Promise<{ code: number; status: string }> {
+  const res = await fetch(`${h!.engineUrl}/ready`)
   return { code: res.status, status: ((await res.json()) as { status: string }).status }
 }
 
@@ -158,7 +158,7 @@ describe('losing the replication slot ends the epoch (ADR-0004)', () => {
     expect(await counter('epoch_breaks_total')).toBeGreaterThanOrEqual(1)
 
     // And the engine is genuinely ingesting again on the new slot.
-    expect((await healthStatus()).status).toBe('active')
+    expect((await readyStatus()).status).toBe('active')
     await expectLiveShapeWorks('items', 2)
   }, 90000)
 
@@ -171,14 +171,14 @@ describe('losing the replication slot ends the epoch (ADR-0004)', () => {
 
     await destroySlot()
 
-    // Fail closed with a NAMED reason: the health word is the fleet's (unchanged) `degraded`, and
+    // Fail closed with a NAMED reason: readiness reports the one word `degraded`, and
     // `/replication/lsn` is where an operator reads what actually happened.
     await waitFor(async () => (await epoch()).state === 'broken', 'the engine to declare its epoch broken')
     const broken = await epoch()
     expect(broken.reason).toBe('slot_lost')
-    const health = await healthStatus()
-    expect(health.code).toBe(503)
-    expect(health.status).toBe('degraded')
+    const ready = await readyStatus()
+    expect(ready.code).toBe(503)
+    expect(ready.status).toBe('degraded')
     // Every shape route refuses rather than serving rows over an epoch the engine cannot vouch for.
     const create = await fetch(`${h!.engineUrl}/shapes`, {
       method: 'POST',
@@ -199,7 +199,7 @@ describe('losing the replication slot ends the epoch (ADR-0004)', () => {
     expect(after.reason).toBeNull()
     expect(after.boundAt).not.toBe(broken.boundAt)
     expect(await slotExists()).toBe(true)
-    await waitFor(async () => (await healthStatus()).status === 'active', 'health to recover')
+    await waitFor(async () => (await readyStatus()).status === 'active', 'readiness to recover')
     await expectLiveShapeWorks('items', 2)
   }, 90000)
 

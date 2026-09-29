@@ -11,8 +11,9 @@
 // the `emitted` counter (`GET /state/node?id=shape:<id>`) rather than long-poll timing: a write
 // that matches only shape A must not move shape B's counter at all, not "eventually settle".
 
-import type { Schema } from '@circuits/protocol'
+import type { Predicate, Schema } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { createShape } from './engine-native.js'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
 
 const schema: Schema = {
@@ -22,19 +23,11 @@ const schema: Schema = {
   },
 }
 
-const whereOwnerA = 'parent_id IN (SELECT id FROM parent WHERE owner = 100)'
-const whereOwnerB = 'parent_id IN (SELECT id FROM parent WHERE owner = 200)'
-
-/** A `/v1/shape` handle is `<shapeId>h<seq>` — strip the per-client suffix to address the
- * underlying shape via the engine's introspection routes. */
-const shapeIdOfHandle = (handle: string) => handle.replace(/h\d+$/, '')
-
-async function snapshotHandle(engineUrl: string, where: string): Promise<string> {
-  const q = new URLSearchParams({ table: 'child', offset: '-1', where })
-  const res = await fetch(`${engineUrl}/v1/shape?${q.toString()}`)
-  expect(res.status).toBe(200)
-  return res.headers.get('electric-handle') as string
-}
+/** `parent_id IN (SELECT id FROM parent WHERE owner = <owner>)` */
+const childrenOfOwner = (owner: number): Predicate => ({
+  col: 'parent_id',
+  in: { table: 'parent', project: 'id', where: { col: 'owner', op: 'eq', value: owner } },
+})
 
 async function emittedCount(engineUrl: string, shapeId: string): Promise<number> {
   const res = await fetch(`${engineUrl}/state/node?id=${encodeURIComponent(`shape:${shapeId}`)}`)
@@ -54,10 +47,8 @@ describe('conformance: subquery shapes do not emit for writes they never matched
   afterAll(async () => await h?.shutdown())
 
   it("a write matching only shape A never moves shape B's emitted counter", async () => {
-    const handleA = await snapshotHandle(h.engineUrl, whereOwnerA)
-    const handleB = await snapshotHandle(h.engineUrl, whereOwnerB)
-    const idA = shapeIdOfHandle(handleA)
-    const idB = shapeIdOfHandle(handleB)
+    const idA = (await createShape(h, { table: 'child', where: childrenOfOwner(100) })).shapeId
+    const idB = (await createShape(h, { table: 'child', where: childrenOfOwner(200) })).shapeId
 
     const beforeA = await emittedCount(h.engineUrl, idA)
     const beforeB = await emittedCount(h.engineUrl, idB)

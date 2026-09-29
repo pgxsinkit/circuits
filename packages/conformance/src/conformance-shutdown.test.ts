@@ -6,10 +6,9 @@
 // What is asserted here, end to end against the live engine, real Postgres and the real
 // durable-streams server:
 //
-//   1. a `/v1/shape` `live=true` request and a raw durable-streams long-poll, both parked on an idle
-//      stream, return within ~2 s of the signal instead of at their ~20 s window — the single
-//      loudest symptom of an engine that does not shut down gracefully, and the reason a pod would
-//      otherwise sit out its whole `terminationGracePeriodSeconds`;
+//   1. the drain finishes in seconds, without waiting for a client long-polling durable-streams
+//      directly — the engine is not in that request's path, and an engine that waited for its
+//      readers would sit out a pod's whole `terminationGracePeriodSeconds`;
 //   2. `/ready` answers 503 during the drain while `/health` stays 200 — the liveness/readiness
 //      split doing its job;
 //   3. the process exits 0 inside the grace period;
@@ -95,34 +94,19 @@ async function expectEachKeyExactlyOnce(streamUrl: string, expectedKeys: number)
 }
 
 describe('graceful shutdown (SIGTERM)', () => {
-  it('releases parked long-polls, drains readiness, exits 0, and keeps the shape maintained', async () => {
+  it('drains readiness, exits 0 without waiting on storage long-polls, and keeps the shape maintained', async () => {
     await boot()
     const shape = await createShape(h!, { table: 'items', where: matchAll })
     await pg('INSERT INTO items (id, n, label) VALUES (1, 1, $1)', ['one'])
     await drainEngine(h!)
     await waitFor(async () => (await foldStream(shape.streamUrl)).has('1'), 'the first insert to reach the shape')
 
-    // A `/v1/shape` live long-poll AND a raw durable-streams long-poll, both parked on an idle
-    // stream. Their natural windows are ~20 s and the ds server's own (longer still).
+    // The tail of the idle stream, where the long-poll below parks.
     const tail = await fetch(`${shape.streamUrl}?offset=-1`)
     const tailOffset = tail.headers.get('stream-next-offset') ?? '-1'
     await tail.text()
 
     const t0 = Date.now()
-    // The snapshot mints the handle; the LIVE request that follows it is the one that parks.
-    const liveReq = (async () => {
-      const snap = await fetch(`${h!.engineUrl}/v1/shape?table=items&offset=-1`)
-      const handle = snap.headers.get('electric-handle')!
-      const offset = snap.headers.get('electric-offset')!
-      await snap.text()
-      const started = Date.now()
-      const res = await fetch(
-        `${h!.engineUrl}/v1/shape?table=items&handle=${handle}&offset=${encodeURIComponent(offset)}&live=true`,
-      )
-      await res.text()
-      return Date.now() - started
-    })()
-
     // A raw durable-streams long-poll, parked directly on the storage server (past the engine
     // entirely). It exists to prove a NEGATIVE: a client tailing storage cannot pin the engine's
     // shutdown, because the engine is not in that request's path at all. Its own window belongs to
@@ -140,7 +124,7 @@ describe('graceful shutdown (SIGTERM)', () => {
         // Aborted at the end of the test (see below) — not a completion.
       })
 
-    // Let both requests actually reach the engine and park.
+    // Let the request actually reach the storage server and park.
     await new Promise((r) => setTimeout(r, 500))
     expect((await readyStatus(h!.engineUrl)).code).toBe(200)
 
@@ -151,7 +135,6 @@ describe('graceful shutdown (SIGTERM)', () => {
     // is meant to be short.
     let sawDraining = false
     let healthStayedOk = true
-    let drainingLivePoll: { status: number; retryAfter: string | null } | undefined
     const deadline = Date.now() + 5000
     while (Date.now() < deadline) {
       try {
@@ -159,14 +142,6 @@ describe('graceful shutdown (SIGTERM)', () => {
         if (r.code === 503 && r.status === 'shutting_down') {
           sawDraining = true
           healthStayedOk = (await fetch(`${h!.engineUrl}/health`)).status === 200
-          // A NEW live poll arriving now must be turned away with a backoff instruction rather
-          // than an empty 204 — an Electric client re-polls a 204 at once, which would turn the
-          // drain window into a tight loop for every live subscriber.
-          const lp = await fetch(
-            `${h!.engineUrl}/v1/shape?table=items&handle=whatever&offset=0_0&live=true`,
-          )
-          drainingLivePoll = { status: lp.status, retryAfter: lp.headers.get('retry-after') }
-          await lp.text()
           break
         }
       } catch {
@@ -177,14 +152,6 @@ describe('graceful shutdown (SIGTERM)', () => {
 
     expect(sawDraining, '/ready must answer 503 shutting_down during the drain').toBe(true)
     expect(healthStayedOk, '/health (liveness) must stay 200 while draining').toBe(true)
-    expect(drainingLivePoll?.status, 'a NEW live poll during the drain is told to come back').toBe(503)
-    expect(drainingLivePoll?.retryAfter, 'and told when').toBe('1')
-
-    // The `/v1/shape` live request comes back at once — NOT at its ~20 s ELECTRIC_LIVE_TIMEOUT_MS.
-    const liveMs = await liveReq
-    expect(liveMs, 'a parked /v1/shape live poll must be released by the shutdown, not time out').toBeLessThan(
-      3000,
-    )
 
     const exit = await h!.waitForEngineExit(30000)
     const shutdownMs = Date.now() - signalledAt

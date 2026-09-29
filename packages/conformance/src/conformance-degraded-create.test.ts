@@ -14,8 +14,8 @@ const schema: Schema = {
 
 const activeParents = { table: 'parent', project: 'id', where: { col: 'active', op: 'eq', value: true } } as const
 
-async function healthStatus(h: Harness): Promise<number> {
-  return (await fetch(`${h.engineUrl}/v1/health`)).status
+async function readyStatus(h: Harness): Promise<string> {
+  return ((await (await fetch(`${h.engineUrl}/ready`)).json()) as { status: string }).status
 }
 
 async function streamStatus(streamUrl: string): Promise<number> {
@@ -71,7 +71,7 @@ describe('native: degradation closes every membership stream, including an in-fl
         await pgQuery(h, 'SELECT pg_terminate_backend($1)', [pid])
       }
 
-      await waitFor(async () => (await healthStatus(h)) === 503, 'the engine to report degraded')
+      await waitFor(async () => (await readyStatus(h)) === 'degraded', 'the engine to report degraded')
       await waitFor(async () => (await streamStatus(live.streamUrl)) === 404, 'the live stream to be reaped')
     } finally {
       await queryBackLock.release()
