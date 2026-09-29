@@ -1329,7 +1329,13 @@ impl Engine {
         // from the router snapshot, which the catch-up replay has brought to the same point).
         // Aggregates re-seed from the counts snapshot (their fold is not persisted) — same
         // fresh-value semantics as the legacy aggregate resume.
-        if let Some(arr) = self.arrangements.lock().unwrap().clone() {
+        //
+        // Cloned out in a statement of its own, so the std guard is dropped here: as the `if let`
+        // scrutinee it would live to the end of the block — across the sequencer's reply and the
+        // state lock below — and `GET /graph` and `GET /debug/dbsp-profile`, which are served
+        // during the boot, block a runtime worker on this mutex while it is held.
+        let arr = self.arrangements.lock().unwrap().clone();
+        if let Some(arr) = arr {
             match &rec.aggregate {
                 Some(a) if matches!(a.func, AggFn::Count) && a.col.is_none() => {
                     if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec())
