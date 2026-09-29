@@ -11,7 +11,8 @@
     "packages/conformance/scripts/**/*.ts",
     "apps/api/src/**/*.ts",
     "vitest.config.ts",
-    "vitest.global-setup.ts"
+    "vitest.global-setup.ts",
+    "vitest.unit-setup.ts"
   ],
   "exclude": ["**/node_modules", "**/dist", "target", "tmp"]
 }

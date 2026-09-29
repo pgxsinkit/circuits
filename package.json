@@ -11,6 +11,7 @@
   "type": "module",
   "scripts": {
     "build": "bun run engine:build && bun run durable-streams:build",
+    "check": "bun run typecheck && bun run lint && bun run test",
     "durable-streams:build": "bash scripts/with-toolchain.sh cargo build -p durable-streams",
     "engine:build": "bash scripts/with-toolchain.sh cargo build -p circuits-engine",
     "engine:test": "bash scripts/with-toolchain.sh cargo test -p circuits-engine",
@@ -19,12 +20,17 @@
     "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings",
     "lint:fix": "oxlint --fix -c .oxlintrc.jsonc .",
     "loop": "bash scripts/with-toolchain.sh bash scripts/conformance-loop.sh",
-    "test": "bash scripts/with-toolchain.sh vitest run",
+    "test": "bun run engine:test && bun run test:durable-streams && bun run test:unit:ts",
     "test:conformance": "bash scripts/with-toolchain.sh vitest run packages/conformance",
     "test:durable-streams": "bash scripts/with-toolchain.sh cargo test -p durable-streams",
     "test:durable-streams:conformance": "bun run durable-streams:build --profile release-durable-streams && bun run --cwd apps/durable-streams test:conformance",
     "test:fuzz": "bash scripts/with-toolchain.sh vitest run packages/conformance/src/conformance-fuzz.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test:integration": "bun run test:integration:harness && bun run test:durable-streams:conformance",
+    "test:integration:harness": "bash scripts/with-toolchain.sh vitest run --project integration",
+    "test:unit:ts": "bash scripts/with-toolchain.sh vitest run --project unit",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "validate": "bun run format && bun run check",
+    "validate:full": "bun run validate && bun run test:integration"
   },
   "devDependencies": {
     "@types/node": "22.20.1",

@@ -1,8 +1,9 @@
-// Global test setup: build the engine and the log server once (so parallel workers don't race the
-// cargo lock, and @circuits/ds-rust runs the log server built from this workspace) and boot one
-// ephemeral Postgres with logical replication enabled. Each harness then creates its own database
-// + slot inside it (logical slots are per-database), so test files stay isolated. The admin
-// connection string is exported via CIRCUITS_TEST_PG_URL (inherited by forked workers).
+// Global setup for the `integration` project: build the engine and the log server once (so parallel
+// workers don't race the cargo lock, and @circuits/ds-rust runs the log server built from this
+// workspace) and boot one ephemeral Postgres with logical replication enabled. Each harness then
+// creates its own database + slot inside it (logical slots are per-database), so test files stay
+// isolated. The admin connection string is exported via CIRCUITS_TEST_PG_URL (inherited by forked
+// workers).
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
