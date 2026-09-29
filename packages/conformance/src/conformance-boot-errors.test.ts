@@ -148,6 +148,18 @@ async function waitForReady(url: string, status: string, timeoutMs = 20000): Pro
   throw new Error(`/ready never reported '${status}' (last: ${saw})`)
 }
 
+// `/ready` reports `waiting` from the moment the engine is constructed, which is before its first
+// connection attempt has failed and been logged. A test that reads the log as soon as it sees
+// `waiting` races that first warning, so it waits for the line itself.
+async function waitForStderr(e: RawEngine, text: string, timeoutMs = 20000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (e.stderr().includes(text)) return
+    await new Promise((r) => setTimeout(r, 50))
+  }
+  throw new Error(`stderr never contained '${text}'\n${e.stderr()}`)
+}
+
 describe('boot-time error taxonomy', () => {
   it('exits 78 quickly with a named message when authentication is refused', async () => {
     const e = await spawnAgainst(badRoleUrl())
@@ -210,7 +222,7 @@ describe('boot-time error taxonomy', () => {
     await waitForReady(url, 'waiting')
 
     // Retrying, and saying so by name.
-    expect(e.stderr()).toContain('durable-streams is unreachable')
+    await waitForStderr(e, 'durable-streams is unreachable')
     expect(e.stderr()).toContain('retrying in')
     expect(e.stderr()).not.toContain('boot refused')
     // Liveness is unmoved, as with an absent database.
@@ -246,7 +258,7 @@ describe('boot-time error taxonomy', () => {
     expect((await fetch(`${url}/health`)).status).toBe(200)
 
     // It must be RETRYING, not stuck: the log names the class of failure and the next delay.
-    expect(e.stderr()).toContain('Postgres not ready')
+    await waitForStderr(e, 'Postgres not ready')
     expect(e.stderr()).toContain('retrying in')
 
     // And a pod terminated while still waiting for its database exits cleanly, not with a kill.
