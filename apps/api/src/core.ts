@@ -62,8 +62,8 @@ export interface ElectricCore {
    * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
    */
   createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>, subscription?: string): Promise<ShapeHandle>
-  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — a Circuits
-   * extension (not in the Electric protocol). Streams a single value maintained incrementally. */
+  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter. Streams a single
+   * value maintained incrementally. */
   createAggregate(def: AggregateDef, subscription?: string): Promise<ShapeHandle>
 }
 

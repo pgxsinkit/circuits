@@ -30,7 +30,7 @@
 //!
 //! `CIRCUITS_RESET_ON_SLOT_LOSS` (default `true`) picks between them:
 //!
-//! - **auto-reset** (Electric parity, the default): [`Engine::reset_epoch`] retires every shape —
+//! - **auto-reset** (the default): [`Engine::reset_epoch`] retires every shape —
 //!   active and dormant alike, each stream closed then deleted (ADR-0007) with a `Dropped` record —
 //!   drops and recreates the slot, and appends a new `SlotBound`. That binding IS the new epoch.
 //!   Clients see closed streams and re-subscribe. An unattended deployment self-heals, at the cost

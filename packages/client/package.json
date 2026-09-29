@@ -1,6 +1,6 @@
 {
   "name": "@circuits/client",
-  "description": "Browser/Node client for the extended circuits API: a typed tRPC client adding subset queries and live aggregations on top of the Electric client.",
+  "description": "Browser/Node client for the extended circuits API: a typed tRPC client plus durable-stream readers for live shapes, subset queries and live aggregations.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

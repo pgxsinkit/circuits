@@ -206,7 +206,7 @@ export interface SubsetResult {
   lsn: string
 }
 
-/** Scalar aggregation functions (a Circuits extension — not part of the Electric protocol). */
+/** Scalar aggregation functions. */
 export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max'
 
 /** A scalar aggregation over a filtered set, maintained incrementally by the engine and streamed as a

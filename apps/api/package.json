@@ -1,6 +1,6 @@
 {
   "name": "@circuits/api",
-  "description": "The extended tRPC API server — the surface @circuits/client talks to, sitting beside the engine's Electric-protocol endpoint.",
+  "description": "The extended tRPC API server — the surface @circuits/client talks to, in front of the engine's control plane.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
