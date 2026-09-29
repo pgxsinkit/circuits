@@ -375,6 +375,10 @@ impl AggSeed {
 /// The single implementation shared by the live `AggShape::apply` and the creator-side
 /// [`AggSeed`], so a streamed backfill's seed is arithmetically identical to feeding the same rows
 /// through the live path. NULL column values are excluded (SQL semantics: aggregates ignore NULLs).
+// The four `&mut` terms are fields of two different structs, `AggShape` and `AggSeed`, which both
+// fold through this one function so a seed and the live path cannot drift apart. Grouping them
+// would mean a terms struct shared by both — a restructuring of the aggregate state, not a lint fix.
+#[allow(clippy::too_many_arguments)]
 fn fold_agg_row(
     func: AggFn,
     col: Option<usize>,

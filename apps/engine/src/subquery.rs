@@ -2421,6 +2421,10 @@ fn flip_net(flips: &[Flip]) -> i64 {
 /// `event_table` is the table the event is *about* (the dependent shape's own table, matching the
 /// direct-change trace's `table`); `source_table` is where the change entered and heads the hop path
 /// (they differ: a `project_members` change moves an `issues` shape).
+// Everything after `trace_tx` goes into the one `TraceEvent` this builds (its stamp, table, hop
+// path, shapes and net weight). The three callers hold those as separate locals, so a parameter
+// struct would only move the same list into a struct literal at each of them.
+#[allow(clippy::too_many_arguments)]
 fn emit_flip_trace(
     trace_tx: &tokio::sync::broadcast::Sender<Arc<String>>,
     event_table: &TableRef,

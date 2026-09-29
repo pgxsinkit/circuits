@@ -53,6 +53,11 @@ pub(crate) fn stamped_delta_for_arrangements(
 
 /// Sequencer-side creation of a circuit-served COUNT aggregate: seed = Σ matching count groups
 /// from the counts snapshot (consistent with the processed offset), emitted immediately.
+// The arguments are the sequencer task's own state (the log client, the counts layer, its
+// executors, the shared schema view, the shutdown token) plus the fields of the one
+// `SequencerCmd::CreateCircuitAgg` it is serving. The sequencer has no context struct to pass
+// instead, and its other per-command helpers take their state the same way.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn create_circuit_agg(
     ds: &DsClient,
     arr: Option<&crate::arrangements::Arrangements>,
