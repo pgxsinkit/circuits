@@ -5,7 +5,7 @@ Opened: 2026-09-15 · Area: `packages/client/src/subset.ts` (the lease keeper), 
 (engine error forwarding), `packages/conformance` (`conformance-native-subscription-ambiguity`,
 `conformance-retention`)
 Reopen trigger: the first time this log noise hides a real failure in a CI run, or the first
-non-harness consumer of `@electric-circuits/client`'s lease keeper.
+non-harness consumer of `@circuits/client`'s lease keeper.
 
 ## The fact
 
@@ -25,7 +25,7 @@ non-harness consumer of `@electric-circuits/client`'s lease keeper.
   string: `apps/api/src/core.ts:100` wraps the engine body into `Error("engine … -> 503: …")`, and the
   tRPC transport delivers something the client hands straight to `JSON.parse`. The exact hop was not
   traced; the noise is harness-only (pgxsinkit talks to the engine's native HTTP directly and maps
-  every 5xx to its own 503 — this path is the `@electric-circuits/api` tRPC surface).
+  every 5xx to its own 503 — this path is the `@circuits/api` tRPC surface).
 - Pre-dates ADR-0009/0010: identical counts in the full-suite logs from before and after them.
 
 ## The fix

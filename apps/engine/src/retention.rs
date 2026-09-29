@@ -13,7 +13,7 @@
 //!   reactivates by replaying the global change log from the captured resume **position** —
 //!   `(segment, offset)`, following rotation pointers across segments (ADR-0006) — with no Postgres
 //!   backfill (see `Engine::ensure_active`). While dormant a shape PINS its resume segment against
-//!   deletion; one that would pin it past `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted
+//!   deletion; one that would pin it past `CIRCUITS_CHANGES_RETAIN_SECS` is evicted
 //!   ([`EvictReason::ChangeLogRetention`]) so the segment can go.
 //! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
 //!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
@@ -57,22 +57,22 @@ use crate::pg::SnapshotGate;
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
-/// | `ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
-/// | `ELECTRIC_CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
-/// | `ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
-/// | `ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
+/// | `CIRCUITS_SHAPE_IDLE_SECS` | `1800` (30 min) | Idle time (no reads, refcount 0) before an active shape goes dormant. `0` disables dormancy. |
+/// | `CIRCUITS_SHAPE_DORMANT_TTL_SECS` | `604800` (7 days) | Time a shape may stay dormant before it is evicted. `0` disables the TTL layer. |
+/// | `CIRCUITS_MAX_SHAPES` | `10000` | Total shape-count cap; over it, least-recently-read dormant shapes are evicted. `0` = unlimited. |
+/// | `CIRCUITS_SHAPE_DISK_BUDGET_MB` | `0` (disabled) | Cap on tracked shape-stream bytes; over it, least-recently-read dormant shapes are evicted. |
+/// | `CIRCUITS_RETENTION_SWEEP_SECS` | `60` | Sweep interval of the background retention task. |
 #[derive(Clone, Debug)]
 pub struct RetentionConfig {
-    /// Active → dormant idle threshold (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
+    /// Active → dormant idle threshold (`CIRCUITS_SHAPE_IDLE_SECS`, default 30 min; 0 = never).
     pub idle_timeout: Duration,
-    /// Dormant → evicted hygiene TTL (`ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
+    /// Dormant → evicted hygiene TTL (`CIRCUITS_SHAPE_DORMANT_TTL_SECS`, default 7 days; 0 = never).
     pub dormant_ttl: Duration,
-    /// Total shape-count cap (`ELECTRIC_CIRCUITS_MAX_SHAPES`, default 10000; 0 = unlimited).
+    /// Total shape-count cap (`CIRCUITS_MAX_SHAPES`, default 10000; 0 = unlimited).
     pub max_shapes: usize,
-    /// Shape-stream disk budget in bytes (`ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
+    /// Shape-stream disk budget in bytes (`CIRCUITS_SHAPE_DISK_BUDGET_MB`, default 0 = disabled).
     pub disk_budget_bytes: u64,
-    /// Background sweep interval (`ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS`, default 60s).
+    /// Background sweep interval (`CIRCUITS_RETENTION_SWEEP_SECS`, default 60s).
     pub sweep_interval: Duration,
 }
 
@@ -96,14 +96,14 @@ impl RetentionConfig {
     pub fn from_env() -> Self {
         let d = RetentionConfig::default();
         RetentionConfig {
-            idle_timeout: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
+            idle_timeout: Duration::from_secs(env_u64("CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
             dormant_ttl: Duration::from_secs(env_u64(
-                "ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS",
+                "CIRCUITS_SHAPE_DORMANT_TTL_SECS",
                 d.dormant_ttl.as_secs(),
             )),
-            max_shapes: env_u64("ELECTRIC_CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
-            disk_budget_bytes: env_u64("ELECTRIC_CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
-            sweep_interval: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
+            max_shapes: env_u64("CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
+            disk_budget_bytes: env_u64("CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
+            sweep_interval: Duration::from_secs(env_u64("CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),
         }
     }
 }
@@ -205,7 +205,7 @@ pub enum EvictReason {
     MaxShapes,
     DiskBudget,
     /// The shape's dormant resume position sits in a change-log segment that was rotated out more
-    /// than `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` ago (ADR-0006). Evicting it is what unpins the
+    /// than `CIRCUITS_CHANGES_RETAIN_SECS` ago (ADR-0006). Evicting it is what unpins the
     /// segment so it can be deleted — the change log must not be held hostage by a shape nobody has
     /// touched in a week.
     ChangeLogRetention,

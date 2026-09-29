@@ -1,6 +1,6 @@
-# @electric-circuits/protocol
+# @circuits/protocol
 
-The shared contract of [electric-circuits](../../README.md): the JSON types and compilers that the TS
+The shared contract of [Circuits](../../README.md): the JSON types and compilers that the TS
 API/oracle/client and the Rust engine (which mirrors them with serde) all agree on. Zero runtime
 dependencies. Four modules, re-exported from the package root:
 
@@ -67,6 +67,6 @@ changeEventToDML('todos', def, ev)  // insert/update -> upsert by pk (partial up
 shapeSelectSql('todos', where)      // -> SELECT * FROM "todos" WHERE <pred>
 ```
 
-These compilers are what [`@electric-circuits/oracle`](../oracle/README.md) is built from — the same
+These compilers are what [`@circuits/oracle`](../oracle/README.md) is built from — the same
 predicate JSON drives the engine, the oracle's `SELECT`, and the client, which is what makes the
 [conformance invariant](../conformance/README.md) checkable end-to-end.

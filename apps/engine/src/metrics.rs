@@ -106,7 +106,7 @@ pub struct Metrics {
     pub retention_pressure: AtomicU64, // retention: sweeps where a cap/budget was exceeded with nothing dormant to evict
     /// ADR-0008 COUNTER: subscriptions released by the sweeper because their lease was not renewed
     /// within the idle window. A climbing value with healthy clients means the renewal cadence is
-    /// longer than `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
+    /// longer than `CIRCUITS_SHAPE_IDLE_SECS`, not that anything crashed.
     pub subscriptions_lapsed: AtomicU64,
     pub schema_drift: AtomicU64, // ADR-0005: tables whose dependents were retired (drift / TRUNCATE / identity regression / drop)
     pub schema_unresolved: AtomicU64, // ADR-0005: drifts that could not be resolved (table parked, retrying)
@@ -240,7 +240,7 @@ pub enum RestoreRetireReason {
     /// A subquery shape: its inner-node state is not persisted, so it is never restorable.
     Subquery,
     /// The table is no longer in the compiled set — dropped while the engine was down under a
-    /// wildcard selector, or no longer selected by `ELECTRIC_CIRCUITS_PG_TABLES`. (A table an explicit
+    /// wildcard selector, or no longer selected by `CIRCUITS_PG_TABLES`. (A table an explicit
     /// entry still names refuses the boot before the restore runs.)
     TableGone,
     /// Storage answered the stream's `HEAD` with 404/410.

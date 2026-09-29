@@ -15,11 +15,11 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::predicate::PredicateJson;
-use electric_circuits_engine::schema::Schema;
-use electric_circuits_engine::table_ref::TableRef;
+use circuits_engine::ds::DsClient;
+use circuits_engine::engine::Engine;
+use circuits_engine::predicate::PredicateJson;
+use circuits_engine::schema::Schema;
+use circuits_engine::table_ref::TableRef;
 
 /// Table refs in tests: bare names are the `public.<name>` sugar.
 fn tref(name: &str) -> TableRef {

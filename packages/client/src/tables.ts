@@ -12,8 +12,8 @@
 // carry its own columns/primary key would make client-side validation depend on which spelling a
 // call happened to use.
 
-import type { Schema, TableDef } from '@electric-circuits/protocol'
-import { canonicalTable, PUBLIC_SCHEMA, parseTableRef } from '@electric-circuits/protocol'
+import type { Schema, TableDef } from '@circuits/protocol'
+import { canonicalTable, PUBLIC_SCHEMA, parseTableRef } from '@circuits/protocol'
 
 /**
  * The schema's tables keyed by their canonical `schema.name`, built once.

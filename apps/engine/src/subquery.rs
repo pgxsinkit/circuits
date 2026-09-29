@@ -1904,7 +1904,7 @@ impl SubqueryRegistry {
 
 // --- deferred flip propagation ------------------------------------------------------------------
 //
-// Runs on the engine's flip-worker pool (semaphore-bounded, `ELECTRIC_CIRCUITS_FLIP_WORKERS`), NOT
+// Runs on the engine's flip-worker pool (semaphore-bounded, `CIRCUITS_FLIP_WORKERS`), NOT
 // inside the table tailers, so the flip-driven Postgres query-backs neither sit on the tailer
 // hot path nor serialize on a single task. Two invariants make this sound:
 //

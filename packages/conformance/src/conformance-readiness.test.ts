@@ -9,12 +9,12 @@
 //                   503 with the word that says why otherwise.
 //   `GET /v1/health` — unchanged fleet parity (202 while booting, 200 active, 503 degraded).
 //
-// The interesting case is `degraded`: with `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` the engine
+// The interesting case is `degraded`: with `CIRCUITS_RESET_ON_SLOT_LOSS=false` the engine
 // fails closed on a lost slot (ADR-0004) and stays that way until an operator posts `/epoch/reset`.
 // Readiness must reflect that (503, so traffic goes elsewhere); liveness must not (200, because
 // restarting fixes nothing and would only lose the parked state the operator is about to recover).
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { bootHarness, type BootOptions, type Harness } from './harness.js'
 import { pgQuery, waitFor } from './engine-native.js'
@@ -86,7 +86,7 @@ describe('readiness vs liveness', () => {
   })
 
   it('reports degraded (503) on a broken epoch while liveness stays ok, and recovers on /epoch/reset', async () => {
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS: 'false' } })
+    await boot({ engineEnv: { CIRCUITS_RESET_ON_SLOT_LOSS: 'false' } })
     expect(await ready()).toEqual({ code: 200, status: 'active' })
 
     await destroySlot()

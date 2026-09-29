@@ -18,7 +18,7 @@
 
 import { afterEach, describe, expect, it } from 'vitest'
 import pgpkg from 'pg'
-import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
+import { DurableStreamTestServer } from '@circuits/ds-rust'
 import { buildEngine, spawnRawEngine, type RawEngine } from './harness.js'
 
 /** A port nothing listens on — a connect here is refused at once (the retryable case). */
@@ -33,8 +33,8 @@ const DEAD_PG_PORT = 5
 const BLACKHOLE_PG = 'postgres://u:p@10.255.255.1:5432/db'
 
 function adminUrl(): string {
-  const url = process.env.ELECTRIC_CIRCUITS_TEST_PG_URL
-  if (!url) throw new Error('ELECTRIC_CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
+  const url = process.env.CIRCUITS_TEST_PG_URL
+  if (!url) throw new Error('CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
   return url
 }
 
@@ -98,7 +98,7 @@ async function scratchDbUrl(): Promise<string> {
   const u = new URL(adminUrl())
   u.pathname = `/${scratchDb}`
   const url = u.toString()
-  // One real table: `ELECTRIC_CIRCUITS_PG_TABLES='*'` refuses a schema with no primary-keyed base
+  // One real table: `CIRCUITS_PG_TABLES='*'` refuses a schema with no primary-keyed base
   // tables, and that refusal would fire before the boot ever reached durable-streams.
   const d = new pgpkg.Client({ connectionString: url })
   await d.connect()
@@ -122,12 +122,12 @@ async function spawnAgainst(pgUrl: string, opts: SpawnOpts = {}): Promise<RawEng
     dsUrl = await ds.start()
   }
   engine = spawnRawEngine({
-    ELECTRIC_CIRCUITS_DS_URL: dsUrl,
-    ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
-    ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'info',
-    ELECTRIC_CIRCUITS_PG_URL: pgUrl,
-    ELECTRIC_CIRCUITS_PG_TABLES: '*',
-    ELECTRIC_CIRCUITS_PG_SLOT: `boot_errors_${process.pid}_${Date.now().toString(36)}`,
+    CIRCUITS_DS_URL: dsUrl,
+    CIRCUITS_BIND: '127.0.0.1:0',
+    CIRCUITS_LOG: process.env.CIRCUITS_LOG ?? 'info',
+    CIRCUITS_PG_URL: pgUrl,
+    CIRCUITS_PG_TABLES: '*',
+    CIRCUITS_PG_SLOT: `boot_errors_${process.pid}_${Date.now().toString(36)}`,
   })
   return engine
 }

@@ -200,7 +200,7 @@ impl<'de> serde::Deserialize<'de> for TableRef {
     }
 }
 
-/// What one `ELECTRIC_CIRCUITS_PG_TABLES` entry selects.
+/// What one `CIRCUITS_PG_TABLES` entry selects.
 ///
 /// `*` (or an empty setting) means every `public` table with a primary key — deliberately NOT every
 /// schema: introspect-all runs `ALTER TABLE … REPLICA IDENTITY FULL`, and doing that across managed

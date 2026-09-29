@@ -1659,7 +1659,7 @@ pub(crate) async fn replay_changes_for_shape(
 /// the catalog restore hands it to the boot's retry-or-refuse decision (ADR-0009).
 ///
 /// **Nothing here ever holds a whole backfill.** The snapshot arrives in chunks bounded by
-/// `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, and each chunk is appended (or folded) and dropped
+/// `CIRCUITS_BACKFILL_APPEND_BYTES`, and each chunk is appended (or folded) and dropped
 /// before the next is read, so the creator's memory is one chunk for a table of any size. Chunking
 /// needs no protocol change: the shape is PENDING until `ActivateShape` lands, so a partly-appended
 /// snapshot is on a stream no subscriber is reading yet, and a failure aborts the pending shape and

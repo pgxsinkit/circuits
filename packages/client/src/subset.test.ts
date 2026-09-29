@@ -4,7 +4,7 @@
 // Plus subscription lifecycle (one-shot close, feed cleanup on error) against a fake tRPC.
 
 import { describe, expect, it, vi } from 'vitest'
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import {
   cmpCodePoints,
   createSubset,

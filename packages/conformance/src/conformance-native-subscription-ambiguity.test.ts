@@ -4,8 +4,8 @@
 
 import { createServer, request } from 'node:http'
 
-import { createClient, type ElectricIvmClient } from '@electric-circuits/client'
-import type { Row, Schema } from '@electric-circuits/protocol'
+import { createClient, type ElectricIvmClient } from '@circuits/client'
+import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
@@ -128,9 +128,9 @@ afterEach(async () => {
 async function bootWithShortRetention(): Promise<{ client: ElectricIvmClient; proxy: ResponseLossProxy }> {
   h = await bootHarness(schema, {
     engineEnv: {
-      ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-      ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
-      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      CIRCUITS_SHAPE_IDLE_SECS: '1',
+      CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+      CIRCUITS_RETENTION_SWEEP_SECS: '1',
     },
   })
   const proxy = await startResponseLossProxy(h.apiUrl)

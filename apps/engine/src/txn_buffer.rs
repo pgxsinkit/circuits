@@ -12,12 +12,12 @@
 //!   (one serialization, in `DsClient`, at the append). The cap is measured on
 //!   [`crate::ds::envelope_memory_bytes`] — inline size plus owned heap — so its units are the
 //!   memory actually held, not the size the same data would serialize to;
-//! - once that reaches `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` the buffer is serialized out to one
+//! - once that reaches `CIRCUITS_TXN_MEMORY_BYTES` the buffer is serialized out to one
 //!   temporary file as newline-delimited JSON, memory is released, and every further envelope of
 //!   that transaction is serialized **straight to the file**;
 //! - at `Commit` the envelopes are streamed back in order (stamped in place from memory, parsed
 //!   back from the file), and handed out as chunks whose serialized POST body stays under
-//!   `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (which must itself stay under the durable-streams
+//!   `CIRCUITS_CHANGES_APPEND_BYTES` (which must itself stay under the durable-streams
 //!   body cap, [`DS_MAX_BODY_BYTES`]).
 //!
 //! Peak **ingestor** memory is therefore the cap plus one chunk (held parsed, plus its serialized
@@ -87,9 +87,9 @@ fn default_spill_dir() -> PathBuf {
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. |
-/// | `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Largest POST body one commit's append may build. Must be > 0 and ≤ [`DS_MAX_BODY_BYTES`]. |
-/// | `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Where spill files are written. Needs room for the largest transaction. |
+/// | `CIRCUITS_TXN_MEMORY_BYTES` | `134217728` (128 MiB) | In-memory bytes of ONE transaction before it spills to disk. `0` = never spill. |
+/// | `CIRCUITS_CHANGES_APPEND_BYTES` | `67108864` (64 MiB) | Largest POST body one commit's append may build. Must be > 0 and ≤ [`DS_MAX_BODY_BYTES`]. |
+/// | `CIRCUITS_TXN_SPILL_DIR` | `<temp dir>/circuits-txn-spill-<uid>` | Where spill files are written. Needs room for the largest transaction. |
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TxnBufferConfig {
     /// Buffered in-memory bytes ([`envelope_memory_bytes`]) before the transaction spills. `0`
@@ -115,25 +115,25 @@ impl Default for TxnBufferConfig {
 impl TxnBufferConfig {
     /// Resolve from an env getter. Pure (no process-env access) so it is unit-testable, and
     /// **fallible**: an unparseable or out-of-range setting is boot-fatal rather than silently
-    /// replaced by the default — same reasoning as `ELECTRIC_CIRCUITS_PG_TABLES` (see `config.rs`),
+    /// replaced by the default — same reasoning as `CIRCUITS_PG_TABLES` (see `config.rs`),
     /// a quietly half-configured memory cap is worse than a refused boot.
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<TxnBufferConfig> {
         let d = TxnBufferConfig::default();
-        let memory_bytes = bytes_var(&get, "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES", d.memory_bytes)?;
-        let append_bytes = bytes_var(&get, "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES", d.append_bytes)?;
+        let memory_bytes = bytes_var(&get, "CIRCUITS_TXN_MEMORY_BYTES", d.memory_bytes)?;
+        let append_bytes = bytes_var(&get, "CIRCUITS_CHANGES_APPEND_BYTES", d.append_bytes)?;
         if append_bytes == 0 {
             bail!(
-                "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES must be a positive byte count (it bounds one \
+                "CIRCUITS_CHANGES_APPEND_BYTES must be a positive byte count (it bounds one \
                  append's request body); 0 would make every commit unappendable"
             );
         }
         if append_bytes > DS_MAX_BODY_BYTES {
             bail!(
-                "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES is {append_bytes}, above the durable-streams \
+                "CIRCUITS_CHANGES_APPEND_BYTES is {append_bytes}, above the durable-streams \
                  request-body cap of {DS_MAX_BODY_BYTES} bytes; an append that large could never land"
             );
         }
-        let spill_dir = get("ELECTRIC_CIRCUITS_TXN_SPILL_DIR")
+        let spill_dir = get("CIRCUITS_TXN_SPILL_DIR")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -161,7 +161,7 @@ impl TxnBufferConfig {
         let _ = std::fs::remove_file(&probe);
         let mut f = spill_open(&probe).with_context(|| {
             format!(
-                "ELECTRIC_CIRCUITS_TXN_SPILL_DIR={} is not writable; large transactions spill there \
+                "CIRCUITS_TXN_SPILL_DIR={} is not writable; large transactions spill there \
                  (ADR-0003), so the engine refuses to start rather than fail every big commit",
                 self.spill_dir.display()
             )
@@ -386,7 +386,7 @@ impl TxnBuffer {
 
     /// Start streaming the transaction out for its commit: envelopes in order, each stamped with
     /// `stamp` plus its running `seq`, the last of them additionally marked `last: true`, packed
-    /// into chunks whose request body stays inside `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`.
+    /// into chunks whose request body stays inside `CIRCUITS_CHANGES_APPEND_BYTES`.
     ///
     /// The caller appends each chunk to the CURRENT segment **in order** and acknowledges the slot
     /// only after the last one lands.
@@ -623,7 +623,7 @@ impl Iterator for TxnDrain<'_> {
 /// unrelated pid spaces, so each would read the other's files as dead (or, worse, as live) at
 /// random; a spill directory must belong to exactly one engine. The default
 /// (`<temp dir>/circuits-txn-spill-<uid>`) is per-user, not per-engine, so operators running several
-/// engines as one user must set `ELECTRIC_CIRCUITS_TXN_SPILL_DIR` per engine.
+/// engines as one user must set `CIRCUITS_TXN_SPILL_DIR` per engine.
 ///
 /// Our own pid is NOT special-cased: a successor that happens to be given its predecessor's pid must
 /// still be able to sweep the file that predecessor left. `live` lets the caller name the spill files
@@ -1053,9 +1053,9 @@ mod tests {
         assert!(d.spill_dir.starts_with(std::env::temp_dir()));
 
         let c = TxnBufferConfig::resolve(|k| match k {
-            "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES" => Some("4096".to_string()),
-            "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES" => Some("16384".to_string()),
-            "ELECTRIC_CIRCUITS_TXN_SPILL_DIR" => Some("/var/tmp/circuits".to_string()),
+            "CIRCUITS_TXN_MEMORY_BYTES" => Some("4096".to_string()),
+            "CIRCUITS_CHANGES_APPEND_BYTES" => Some("16384".to_string()),
+            "CIRCUITS_TXN_SPILL_DIR" => Some("/var/tmp/circuits".to_string()),
             _ => None,
         })
         .unwrap();
@@ -1065,7 +1065,7 @@ mod tests {
 
         // 0 = never spill, an accepted setting (unlike a 0 append budget).
         assert_eq!(
-            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES").then(|| "0".to_string()))
+            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_TXN_MEMORY_BYTES").then(|| "0".to_string()))
                 .unwrap()
                 .memory_bytes,
             0
@@ -1077,18 +1077,18 @@ mod tests {
     fn an_unusable_append_budget_is_refused() {
         let too_big = (DS_MAX_BODY_BYTES + 1).to_string();
         let err =
-            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone()))
+            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone()))
                 .expect_err("above the durable-streams body cap");
         assert!(format!("{err:#}").contains("request-body cap"), "{err:#}");
 
         let err =
-            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string()))
+            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string()))
                 .expect_err("a zero budget cannot append anything");
         assert!(format!("{err:#}").contains("positive byte count"), "{err:#}");
 
         let err =
-            TxnBufferConfig::resolve(|k| (k == "ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string()))
+            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string()))
                 .expect_err("not a byte count");
-        assert!(format!("{err:#}").contains("ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES"), "{err:#}");
+        assert!(format!("{err:#}").contains("CIRCUITS_TXN_MEMORY_BYTES"), "{err:#}");
     }
 }

@@ -1,6 +1,6 @@
 # Guide: live queries and subqueries
 
-Audience: people integrating against Electric Circuits — defining live queries and subqueries,
+Audience: people integrating against Circuits — defining live queries and subqueries,
 wiring the engine to Postgres, and sizing a deployment. For how the engine works internally and
 the full analytical cost model, see the companion `docs/ivm-engine-internals.md`.
 
@@ -59,10 +59,10 @@ identical either way.)
 
 | env var | meaning |
 |---|---|
-| `ELECTRIC_CIRCUITS_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
-| `ELECTRIC_CIRCUITS_PG_TABLES` | comma-separated table list — `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*`/empty means `public.*`: **every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table), never every schema. |
-| `ELECTRIC_CIRCUITS_PG_SLOT` | replication slot name (default `electric_circuits`; the slot uses the `pgoutput` plugin). |
-| `ELECTRIC_CIRCUITS_PG_POLL_MS` | slot poll interval. |
+| `CIRCUITS_PG_URL` | Postgres connection string. Its presence selects Postgres mode. |
+| `CIRCUITS_PG_TABLES` | comma-separated table list — `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*`/empty means `public.*`: **every public table that has a primary key** (skipping the engine's `__el_sync` bookkeeping table), never every schema. |
+| `CIRCUITS_PG_SLOT` | replication slot name (default `circuits`; the slot uses the `pgoutput` plugin). |
+| `CIRCUITS_PG_POLL_MS` | slot poll interval. |
 
 On boot the engine introspects the configured tables (columns, types, primary key — composite
 keys ordered by index position), sets `REPLICA IDENTITY FULL`, creates the replication slot,
@@ -95,7 +95,7 @@ Postgres oracle always agree).
 ### Via the client (tRPC + stream-db)
 
 ```ts
-import { createClient } from '@electric-circuits/client'
+import { createClient } from '@circuits/client'
 
 const client = createClient({ apiUrl, schema })
 
@@ -278,7 +278,7 @@ engine, each holding its own named **subscription** — always `close()` what yo
 one-shot, and now safe to repeat on the wire too: it releases a claim by name, so a retry after a
 lost response cannot take another subscriber's). A subscription is also a **lease**: the client
 renews it automatically while the query is open, because native reads bypass the engine and a claim
-nobody renews is released after `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (see
+nobody renews is released after `CIRCUITS_SHAPE_IDLE_SECS` (see
 `docs/adr/0008-subscriptions-are-identified-idempotent-and-leased.md`).
 
 ## 8. See also

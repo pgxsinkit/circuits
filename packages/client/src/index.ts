@@ -1,7 +1,7 @@
-// electric-circuits client: a thin wrapper over a typed tRPC client plus stream-db
+// Circuits client: a thin wrapper over a typed tRPC client plus stream-db
 // (`@durable-streams/state/db`) for materializing a shape into a live TanStack DB collection.
 
-import type { AppRouter } from '@electric-circuits/api'
+import type { AppRouter } from '@circuits/api'
 import type {
   AggregateDef,
   Op,
@@ -13,8 +13,8 @@ import type {
   SubsetResult,
   TableDef,
   Value,
-} from '@electric-circuits/protocol'
-import { canonicalTable } from '@electric-circuits/protocol'
+} from '@circuits/protocol'
+import { canonicalTable } from '@circuits/protocol'
 import { stream } from '@durable-streams/client'
 import { createStateSchema, createStreamDB } from '@durable-streams/state/db'
 import { createTRPCClient, httpBatchLink } from '@trpc/client'
@@ -42,7 +42,7 @@ export interface ShapeHandle {
   table: string
   streamPath: string
   streamUrl: string
-  /** This materialization's subscription id (ADR-0008) — see `@electric-circuits/protocol`. */
+  /** This materialization's subscription id (ADR-0008) — see `@circuits/protocol`. */
   subscription?: string
   /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
   leaseSeconds?: number
@@ -119,7 +119,7 @@ export interface ElectricIvmClient {
    * never stores the page; a change is matched against one base predicate, never fanned across ranges.
    */
   subset(def: SubsetDef): Promise<SubsetSubscription>
-  /** Open a live scalar **aggregation** over a filtered set (electric-circuits extension). */
+  /** Open a live scalar **aggregation** over a filtered set (Circuits extension). */
   aggregate(def: AggregateDef): Promise<AggregateSubscription>
   close(): Promise<void>
 }

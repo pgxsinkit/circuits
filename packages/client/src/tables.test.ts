@@ -1,4 +1,4 @@
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { describe, expect, it } from 'vitest'
 
 import { canonicalTableIndex, lookupTableDef, resolveTableDef, tableSpellings } from './tables.js'

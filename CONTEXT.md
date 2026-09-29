@@ -1,4 +1,4 @@
-# Electric Circuits (fork)
+# Circuits (fork)
 
 A reactive sync engine: application writes go to Postgres, the engine turns logical-replication
 changes into live, incrementally maintained shapes, and durable streams are the log between them. This
@@ -59,4 +59,4 @@ _Avoid_: refcount (for the caller's side), handle (that is what the caller recei
 
 **Lease**:
 The liveness of a subscription: it counts only if created or renewed within
-`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`. Renewal is the same `POST /shapes` with the same subscription id.
+`CIRCUITS_SHAPE_IDLE_SECS`. Renewal is the same `POST /shapes` with the same subscription id.

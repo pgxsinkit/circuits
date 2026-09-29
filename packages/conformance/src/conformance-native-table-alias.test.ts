@@ -1,8 +1,8 @@
 // ADR-0002 makes a bare table name ingress shorthand for public.<name>. The published native client
 // must therefore accept either spelling independently of which spelling keyed its local Schema.
 
-import type { Schema } from '@electric-circuits/protocol'
-import { createClient } from '@electric-circuits/client'
+import type { Schema } from '@circuits/protocol'
+import { createClient } from '@circuits/client'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { bootHarness, type Harness } from './harness.js'

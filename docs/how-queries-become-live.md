@@ -1,6 +1,6 @@
 # How your queries become live
 
-Audience: people building an app on Electric Circuits who want the mental model behind "it's just
+Audience: people building an app on Circuits who want the mental model behind "it's just
 live" — not the engine's internal routing and fallback machinery (that's
 `docs/ivm-engine-internals.md`, for people working on the engine itself). This doc explains what a
 **circuit** is, why registering a query onto one is cheap, and what actually stays in memory versus
@@ -12,7 +12,7 @@ in Postgres.
 
 You don't design a dataflow, declare a pipeline, or provision anything for a new query. You write
 the query your app already needs — a filter, a per-user visibility check, a live count — and it
-becomes a **live query**: a result that Electric Circuits keeps in sync as Postgres changes,
+becomes a **live query**: a result that Circuits keeps in sync as Postgres changes,
 delivered to your app as a **Stream**.
 
 The thing that makes that possible — a **circuit** — is already there before you write a single
@@ -88,7 +88,7 @@ behind them.
 
 A live query doesn't hand you a one-time result — it hands you a Stream: your app receives the
 current matching rows, then a live feed of exactly what changed, forever, as **upserts** and
-**deletes**. That Stream is a **Durable Stream** — Electric Circuits' durable, replayable log
+**deletes**. That Stream is a **Durable Stream** — Circuits' durable, replayable log
 primitive — so it survives reconnects and can be resumed from any point, not just followed live.
 
 What you do with that Stream client-side is up to your app: bind it directly to UI, feed it to an

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 
 import { foldStream, pgQuery } from './engine-native.js'
 import { bootHarness, type Harness } from './harness.js'

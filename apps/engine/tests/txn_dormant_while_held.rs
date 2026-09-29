@@ -19,10 +19,10 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::schema::Schema;
-use electric_circuits_engine::table_ref::TableRef;
+use circuits_engine::ds::DsClient;
+use circuits_engine::engine::Engine;
+use circuits_engine::schema::Schema;
+use circuits_engine::table_ref::TableRef;
 
 type Page = (String, String);
 
@@ -83,9 +83,9 @@ async fn a_shape_parked_while_a_transaction_is_held_resumes_at_the_pinned_positi
     // else observes the mutation.
     // SAFETY: single-threaded point in a single-test binary, before any engine or sweeper exists.
     unsafe {
-        std::env::set_var("ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS", "1");
-        std::env::set_var("ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS", "1");
-        std::env::set_var("ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3600");
+        std::env::set_var("CIRCUITS_SHAPE_IDLE_SECS", "1");
+        std::env::set_var("CIRCUITS_RETENTION_SWEEP_SECS", "1");
+        std::env::set_var("CIRCUITS_SHAPE_DORMANT_TTL_SECS", "3600");
     }
 
     let state = FakeLog::default();

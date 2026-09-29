@@ -15,10 +15,10 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::ds::{DsClient, Envelope, EnvelopeHeaders};
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::schema::Schema;
-use electric_circuits_engine::table_ref::TableRef;
+use circuits_engine::ds::{DsClient, Envelope, EnvelopeHeaders};
+use circuits_engine::engine::Engine;
+use circuits_engine::schema::Schema;
+use circuits_engine::table_ref::TableRef;
 
 fn tref(name: &str) -> TableRef {
     TableRef::parse(name).unwrap()
@@ -161,7 +161,7 @@ async fn a_real_404_during_a_restore_append_fails_so_the_caller_retires() {
         .await
         .expect_err("a stream storage does not have cannot be appended to");
 
-    assert!(electric_circuits_engine::ds::is_stream_gone(&err), "unexpected error: {err:#}");
+    assert!(circuits_engine::ds::is_stream_gone(&err), "unexpected error: {err:#}");
     assert_eq!(ds.shape_appends.load(Ordering::SeqCst), 0);
 }
 

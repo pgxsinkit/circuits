@@ -12,7 +12,7 @@
 // The engine is booted with the reconciler effectively off (1 h) except in the test that exercises
 // it, so the other cases genuinely go through the ingest path rather than being swept up by a tick.
 
-import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Row, Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createShape, foldStream, pgQuery, sleep, waitFor } from './engine-native.js'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
@@ -39,7 +39,7 @@ afterEach(async () => {
 /** Boot with the reconciler parked at an hour unless the test is the one testing it. */
 async function boot(engineEnv: Record<string, string> = {}): Promise<Harness> {
   h = await bootHarness(schema, {
-    engineEnv: { ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS: '3600', ...engineEnv },
+    engineEnv: { CIRCUITS_SCHEMA_RECONCILE_SECS: '3600', ...engineEnv },
   })
   return h
 }
@@ -210,7 +210,7 @@ describe('schema drift retires every dependent of the affected table (ADR-0005)'
   }, 120000)
 
   it('DDL with no following DML is caught by the reconciler', async () => {
-    await boot({ ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS: '1' })
+    await boot({ CIRCUITS_SCHEMA_RECONCILE_SECS: '1' })
     await pg('INSERT INTO items (id, n, label) VALUES (1, 10, $1)', ['a'])
     await pg('INSERT INTO other (id, n) VALUES (1, 1)')
     await drainEngine(h!)
@@ -269,7 +269,7 @@ describe('schema drift retires every dependent of the affected table (ADR-0005)'
 
   it('a table no longer selected at restart retires only its shapes; the other table restores', async () => {
     // The harness reads `engineEnv` at every start, so changing it here changes the restarted engine.
-    const engineEnv: Record<string, string> = { ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS: '3600' }
+    const engineEnv: Record<string, string> = { CIRCUITS_SCHEMA_RECONCILE_SECS: '3600' }
     h = await bootHarness(schema, { engineEnv })
     await pg('INSERT INTO items (id, n, label) VALUES (1, 10, $1)', ['a'])
     await pg('INSERT INTO other (id, n) VALUES (1, 1)')
@@ -280,7 +280,7 @@ describe('schema drift retires every dependent of the affected table (ADR-0005)'
     // `items` leaves the compiled set, exactly as if it had been dropped while the engine was down.
     // Its shapes cannot resume on a table the engine no longer has; that retires them — per table
     // (ADR-0005, ADR-0009) — and must never fail the restore, which would take `other` down too.
-    engineEnv.ELECTRIC_CIRCUITS_PG_TABLES = 'other'
+    engineEnv.CIRCUITS_PG_TABLES = 'other'
     await h!.restartEngine()
 
     await waitRetired(items.shapeId, items.streamUrl)

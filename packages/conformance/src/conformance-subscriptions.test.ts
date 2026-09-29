@@ -6,7 +6,7 @@
 
 import { createServer, request } from 'node:http'
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, waitFor } from './engine-native.js'
@@ -124,9 +124,9 @@ function release(id: string, subscription?: string): Promise<Response> {
 
 /** Second-scale retention, so a lease that is not renewed lapses inside a test. */
 const fastRetention = {
-  ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '2',
-  ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '60',
-  ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+  CIRCUITS_SHAPE_IDLE_SECS: '2',
+  CIRCUITS_SHAPE_DORMANT_TTL_SECS: '60',
+  CIRCUITS_RETENTION_SWEEP_SECS: '1',
 }
 
 describe('native subscriptions are identified, idempotent and leased', () => {
@@ -286,7 +286,7 @@ describe('native subscriptions are identified, idempotent and leased', () => {
     // A generous idle window: this test is about what the catalog restores, not about leases, and a
     // second-scale window would reclaim the restored claims (correctly) mid-assertion.
     h = await bootHarness(schema, {
-      engineEnv: { ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '120', ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1' },
+      engineEnv: { CIRCUITS_SHAPE_IDLE_SECS: '120', CIRCUITS_RETENTION_SWEEP_SECS: '1' },
     })
 
     const first = await createShape(h, { table: 'items', subscription: 'sub-one' })
@@ -315,7 +315,7 @@ describe('native subscriptions are identified, idempotent and leased', () => {
     // subscriber. A long idle window keeps leases out of it — this is about the fold.
     let proxy: LossProxy | undefined
     h = await bootHarness(schema, {
-      engineEnv: { ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '120', ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1' },
+      engineEnv: { CIRCUITS_SHAPE_IDLE_SECS: '120', CIRCUITS_RETENTION_SWEEP_SECS: '1' },
       wrapEngineDs: async (upstreamUrl) => {
         proxy = await startLossProxy(upstreamUrl)
         return proxy

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in Electric Circuits. Issues and pull requests are welcome.
+Thanks for your interest in Circuits. Issues and pull requests are welcome.
 
 ## Getting started
 
@@ -16,7 +16,7 @@ You need Node 20+, pnpm, Rust (pinned by `rust-toolchain.toml`), and Docker (for
 ```bash
 pnpm install
 pnpm engine:test                               # Rust unit + integration (fast)
-ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance
+CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance
 ```
 
 A change that touches the engine must pass both suites. The full runbook — conformance against

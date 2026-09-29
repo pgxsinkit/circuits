@@ -1,4 +1,4 @@
-# electric-circuits — architecture
+# Circuits — architecture
 
 The as-built system architecture. Companion documents:
 
@@ -31,7 +31,7 @@ The as-built system architecture. Companion documents:
                                   │ read / long-poll
                                   ▼
                                CLIENTS
-                                  ├─ @electric-circuits/client  (shapes, subset queries, aggregations)
+                                  ├─ @circuits/client  (shapes, subset queries, aggregations)
                                   └─ ElectricSQL client     (GET /v1/shape on the engine)
 ```
 
@@ -61,7 +61,7 @@ Three ideas carry the whole design:
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
   shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
   `GET /v1/shape` endpoint.
-- **API** (`apps/api`, tRPC) — the extended surface used by `@electric-circuits/client`: `schema.define`,
+- **API** (`apps/api`, tRPC) — the extended surface used by `@circuits/client`: `schema.define`,
   `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
@@ -150,11 +150,11 @@ when no tracked table is changing without weakening append-before-ack durability
 transaction cannot be appended before its commit frame (the commit LSN is unknown and it may still
 abort), so it must be held — and a million-row `UPDATE` under `REPLICA IDENTITY FULL` carries old and
 new for every row. The buffer holds `Envelope` structs (nothing is serialized on the way in) and
-measures them as held memory; once that reaches `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (128 MiB) it is
-serialized out to one NDJSON file under `ELECTRIC_CIRCUITS_TXN_SPILL_DIR`, memory is released, and
+measures them as held memory; once that reaches `CIRCUITS_TXN_MEMORY_BYTES` (128 MiB) it is
+serialized out to one NDJSON file under `CIRCUITS_TXN_SPILL_DIR`, memory is released, and
 every further change of that transaction goes straight to the file. At the commit the transaction is
 streamed back in order, stamped, and appended in chunks of at most
-`ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
+`CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
 the slot, publishing `last_lsn` and releasing the drain barrier only after the LAST chunk lands**.
 Peak **ingestor** memory is the cap plus one chunk (the sequencer's own read page, held run and
 pending appends are bounded by the transaction's size, not by this knob), and transaction size never
@@ -191,7 +191,7 @@ partial commit is a prefix of the same rows.)
 stream, because durable-streams offers whole-stream TTL but no prefix trimming and one ever-growing
 log fills the disk. At a transaction boundary, after the commit is appended and acknowledged, the
 ingestor rotates if the current segment is over its byte or age budget
-(`ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` / `_SECS`): create `changes/<n+1>`, append one **control
+(`CIRCUITS_CHANGES_SEGMENT_BYTES` / `_SECS`): create `changes/<n+1>`, append one **control
 envelope** naming the successor to `changes/<n>`, close `changes/<n>`, record `ChangesRotated` in the
 catalog, continue in `changes/<n+1>`. Nothing ever appends to a closed segment. Control envelopes are
 recognised by TYPE (`__circuits.control`, a reserved schema no tracked table may use) and dropped
@@ -216,7 +216,7 @@ exactly-once **effect**:
 — live columns in `attnum` order with `(name, type OID, typmod)`, plus `relreplident` and the primary
 key — and Postgres re-sends a `Relation` message after any DDL that changes a table, so every `R` is
 compared with it. Four triggers reach one **retirement**: a fingerprint difference, a replica identity
-that is no longer FULL, a `TRUNCATE`, and the reconciler (`ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS`,
+that is no longer FULL, a `TRUNCATE`, and the reconciler (`CIRCUITS_SCHEMA_RECONCILE_SECS`,
 default 60 s — for DDL with no following DML, and for the primary key, which the wire cannot describe).
 Every dependent of the table — shapes, aggregates, subquery shapes whose predicate references it — is
 purged by closing then deleting its stream.
@@ -255,7 +255,7 @@ available anywhere. (A slot merely held by another walsender is not a break — 
 and a changed `timeline_id` is recorded, not acted on.) The default policy is auto-reset: every shape,
 active and dormant, is retired (closed, then deleted), the slot is recreated and a new `SlotBound` is
 written — that record is the new epoch, and clients re-subscribe.
-`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` refuses instead: ingest does not start, shape reads
+`CIRCUITS_RESET_ON_SLOT_LOSS=false` refuses instead: ingest does not start, shape reads
 degrade fail-closed with a named reason (`GET /replication/lsn` → `epoch.state`/`epoch.reason`), and
 `POST /epoch/reset` is the operator's recovery. Reconnects back off exponentially with jitter
 (1 s → 30 s), reset only by a connection that actually delivered — a rejected `START_REPLICATION`
@@ -274,7 +274,7 @@ the `SELECT`. Live and backfill must then be reconciled so every change counts e
 
 **The snapshot is streamed, not materialised.** The rows arrive over a `query_raw` cursor (with
 tokio-postgres's own backpressure) and are appended to the still-**pending** shape stream in chunks
-bounded by `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB), so engine memory per backfill is one
+bounded by `CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB), so engine memory per backfill is one
 chunk whatever the table's size. No protocol change was needed: shape creation is already two-phase
 (`BeginShape` registers a pending buffer, `ActivateShape` goes live), so nothing reads the stream
 until activation and a failure part-way aborts the pending shape and rolls the creation back exactly
@@ -373,7 +373,7 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   subquery form — the registry is the one membership implementation (row data lives in
   Postgres; see §6b).
 
-**Aggregations** (electric-circuits extension, not part of the Electric-compatible API): a scalar
+**Aggregations** (Circuits extension, not part of the Electric-compatible API): a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
 delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
 restore the previous extreme. A COUNT whose predicate decomposes over a counts pipeline's group
@@ -411,7 +411,7 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   refused (409). Releasing names the id, so a repeat is a no-op instead of a second decrement — the
   ambiguity that used to let one client's retried `DELETE` evict a shape under another. A
   subscription is also a **lease**: native reads bypass the engine entirely, so a claim counts as
-  live only while renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`, and the retention sweeper
+  live only while renewed within `CIRCUITS_SHAPE_IDLE_SECS`, and the retention sweeper
   releases an unrenewed one exactly as an explicit delete would.
 - **A join verifies the retained stream still exists** — one `HEAD` per join. The record is engine
   state; the stream is storage's, and storage can lose it (an operator `DELETE`, a restore from an
@@ -521,11 +521,11 @@ sequencer feeds every table's deltas into:
 - **Edges** — `node → dependent` (an outer shape, or a *parent node* for nested subqueries), labeled
   with the connecting column. When a node **flips** a value (∅→non-empty or back), the dependent rows
   with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
-  propagation runs on a **semaphore-bounded worker pool** (`ELECTRIC_CIRCUITS_FLIP_WORKERS`, default 8),
+  propagation runs on a **semaphore-bounded worker pool** (`CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
   `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
   **enqueue** of the resulting envelopes happen atomically under the lock, and each shape stream
-  drains through one ordered **emission lane** (`engine/emission.rs`, `ELECTRIC_CIRCUITS_EMIT_LANES`),
+  drains through one ordered **emission lane** (`engine/emission.rs`, `CIRCUITS_EMIT_LANES`),
   so per-shape append order equals evaluation order — without network under the lock. (Evaluation
   order alone is not freshness for a query-back, whose rows were read before it took the lock; the
   per-pk recency fence below closes that gap.) The engine exposes the in-flight count
@@ -613,10 +613,10 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   Postgres like any backfill. The contributor relation **spills to disk by default** (dbsp's
   storage backend: spine batches page to layer files under a per-boot temp dir with a bounded
   buffer cache; without checkpointing the files are a disposable cache, auto-removed at
-  shutdown). `ELECTRIC_CIRCUITS_SUBQ_STORAGE=0` keeps it fully in-memory;
-  `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` pins an explicit location.
+  shutdown). `CIRCUITS_SUBQ_STORAGE=0` keeps it fully in-memory;
+  `CIRCUITS_SUBQ_STORAGE_DIR` pins an explicit location.
 
-- **Counts pipelines** — `ELECTRIC_CIRCUITS_DBSP_COUNTS=table:col+col,…` compiles, per table (at
+- **Counts pipelines** — `CIRCUITS_DBSP_COUNTS=table:col+col,…` compiles, per table (at
   most one spec each), a `map_index(group) → weighted_count` pipeline: a live COUNT per
   distinct projection of the group columns.
 - **Serving**: COUNT aggregates whose predicate decomposes over a counts pipeline's group
@@ -629,7 +629,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   replay exactly like a shape backfill.
 - **Row lookups** (subquery flip re-derivations, full re-derives, membership move-ins) are
   pooled Postgres queries (`engine/membership.rs`) — parallel across the flip-worker pool,
-  bounded by `ELECTRIC_DB_POOL_SIZE`. `ELECTRIC_CIRCUITS_DBSP_INDEXES` is **deprecated** and ignored
+  bounded by `ELECTRIC_DB_POOL_SIZE`. `CIRCUITS_DBSP_INDEXES` is **deprecated** and ignored
   (it configured the removed row arrangements).
 - **Membership shapes** — including single-level non-negated `col IN (SELECT …)` — are served
   by the subquery registry (§6): two-phase creation (Postgres backfill + gate), shared inner-set
@@ -640,17 +640,17 @@ bullet). Neither circuit checkpoints: both reseed on boot.
 
 | variable | default | meaning |
 |---|---|---|
-| `ELECTRIC_CIRCUITS_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
-| `ELECTRIC_CIRCUITS_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
-| `ELECTRIC_CIRCUITS_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
-| `ELECTRIC_CIRCUITS_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
-| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
-| `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types). |
-| `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
+| `CIRCUITS_DBSP_COUNTS` | none | counts pipelines: `table:col+col[,…]`; at most one per table. Empty = no circuit. |
+| `CIRCUITS_FLIP_WORKERS` | `8` | concurrent flip-propagation workers (Postgres query-backs). |
+| `CIRCUITS_EMIT_LANES` | `8` | ordered emission lanes for subquery-shape appends. |
+| `CIRCUITS_SUBQ_STORAGE` | `1` | `0` disables membership-circuit disk spilling (relations stay fully in-memory). |
+| `CIRCUITS_SUBQ_STORAGE_DIR` | per-boot temp dir | explicit spill location (kept on shutdown; the default temp dir is auto-removed). |
+| `CIRCUITS_SUBQ_STORAGE_CACHE_MIB` | `64` | storage buffer-cache budget, in MiB, TOTAL (dbsp uses the value verbatim, not multiplied by workers/thread-types). Bounds dbsp's own unset-default, which for this circuit's 1-worker layout would be 512 MiB (256 MiB × 1 worker × 2 thread-types). |
+| `CIRCUITS_SUBQ_MIN_STORAGE_KB` | `128` | spine batches above this size page to disk. |
 
-(The former `ELECTRIC_CIRCUITS_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
+(The former `CIRCUITS_DBSP_DIR`/`_CACHE_MIB`/`_MIN_STORAGE_KB`/`_MAX_RSS_MB`/
 `_CHECKPOINT_SECS`/`_INDEXES` storage knobs are deprecated no-ops: there is no on-disk circuit
-state to tune. `ELECTRIC_CIRCUITS_FEED_TRACE` is likewise removed — the feed relation now lives
+state to tune. `CIRCUITS_FEED_TRACE` is likewise removed — the feed relation now lives
 host-side (Phase 2), so there is no enumeration copy left to toggle.)
 
 - **Observability**: `/graph` carries an `arrangements` section — the counts pipelines as
@@ -765,15 +765,15 @@ absolute membership emission makes them unnecessary for convergence).
 | seam | mechanism | guarantee |
 |---|---|---|
 | backfill ↔ live | `SnapshotGate` (xid visibility; LSN fallback) | each change counts exactly once per shape/aggregate/node |
-| ingestor → change log | append (chunked past `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; between transactions, acknowledge server keepalive WAL ends so idle WAL is recyclable; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; no transaction is acknowledged before durability, a commit of any size stays one unit of visibility, and an idle slot does not retain forced WAL indefinitely |
+| ingestor → change log | append (chunked past `CIRCUITS_CHANGES_APPEND_BYTES`; contiguous on one segment, last envelope marked `headers.last`) → acknowledge **after the last chunk**; between transactions, acknowledge server keepalive WAL ends so idle WAL is recyclable; reader holds an unterminated run + `(lsn,seq)` de-dup, checkpointed together — ADR-0003 | at-least-once delivery, exactly-once effect; no transaction is acknowledged before durability, a commit of any size stays one unit of visibility, and an idle slot does not retain forced WAL indefinitely |
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
-| subscriber liveness | a subscription is a **lease**: created/renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| subscriber liveness | a subscription is a **lease**: created/renewed within `CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
-| client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset, retention and the `/v1/shape` adapter. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
+| client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset, retention and the `/v1/shape` adapter. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
 | shape ids → streams | the boot resumes `next_shape_id` past the maximum id of every `Created` in the log, dropped ones included (`CatalogFold::max_shape_id`) | an id is never re-minted while the `shape/*` stream it named still exists: a new shape can never inherit a dead one\'s stream (and its rows), and a pending retirement can never delete a live shape\'s stream |
 | shape removal → stream removal | `Dropped` (intent) is written BEFORE the retirement, `Retired` (completion) only after storage accepts the delete; failures go to a background queue that retries to completion, and every boot re-queues each `Dropped` with no `Retired` — ADR-0007 | no shape stream outlives its shape, whatever storage was doing at the moment it was retired or which process was alive at the time; this is also the orphan-`shape/*` GC, bounded by the catalog rather than a storage listing |
 | change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no shape pinning it; a dormant shape pinning past the retain window is evicted first, a reactivating one is never evicted mid-replay) — ADR-0006 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
@@ -801,8 +801,8 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | shapes (any kind) | **0** | no per-shape thread or circuit |
 | replication ingestor | 1 task | stream pgoutput/decode/buffer (spilling past the memory cap)/append in chunks/acknowledge |
 | subquery registry | 0 (a mutex) | eval + emission-lane enqueue under it (in-memory only; no network under the lock) |
-| flip workers | ≤ `ELECTRIC_CIRCUITS_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
-| emission lanes | `ELECTRIC_CIRCUITS_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
+| flip workers | ≤ `CIRCUITS_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock |
+| emission lanes | `CIRCUITS_EMIT_LANES` tasks (default 8) | per-stream FIFO writers: append order = eval order per shape |
 | circuit (counts) | 1 OS thread | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer) |
 | circuit (membership) | 1 OS thread | owns the membership `DBSPHandle`; stepped per envelope by the registry (subquery tables only) |
 
@@ -925,7 +925,7 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `ELECTRIC_CIRCUITS_*` env + Electric fleet-surface mapping |
+| `apps/engine/src/config.rs` | boot config: `CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |

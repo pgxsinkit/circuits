@@ -1,4 +1,4 @@
-# @electric-circuits/conformance
+# @circuits/conformance
 
 The end-to-end conformance suite. The invariant it asserts, through the **real** stack (Postgres →
 replication → engine → durable-streams → client), against the
@@ -17,7 +17,7 @@ test files stay isolated). Per harness:
 - a `DurableStreamTestServer` (the log),
 - the Rust engine as a child process in Postgres mode (spawned from `target/debug/`, discovered
   via its `ENGINE_LISTENING` stdout line),
-- the tRPC API (`createApiServer`) and a real `@electric-circuits/client`.
+- the tRPC API (`createApiServer`) and a real `@circuits/client`.
 
 Comparison (`src/compare.ts`) is set equality over declared columns, keyed by stringified pk.
 

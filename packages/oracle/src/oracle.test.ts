@@ -1,4 +1,4 @@
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createOracle, type Oracle } from './index.js'
 

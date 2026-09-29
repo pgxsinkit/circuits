@@ -117,14 +117,14 @@ struct SpillConfig {
 }
 
 /// The engine's own default for [`SpillConfig::cache_mib`] when
-/// `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` is unset — a hard bound on dbsp's unset-default, which
+/// `CIRCUITS_SUBQ_STORAGE_CACHE_MIB` is unset — a hard bound on dbsp's unset-default, which
 /// for this circuit's 1-worker layout resolves to 256 MiB × 1 worker × 2 thread-types = 512 MiB.
 /// Operator state across all circuits is small and independent of table size, so the LRU was
 /// filling toward an oversized ceiling regardless of working set; a smaller explicit cache
 /// noticeably reduces process RSS with identical semantics.
 const DEFAULT_STORAGE_CACHE_MIB: usize = 64;
 
-/// Parses `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB`'s raw value (`None` if the var is unset), giving
+/// Parses `CIRCUITS_SUBQ_STORAGE_CACHE_MIB`'s raw value (`None` if the var is unset), giving
 /// the storage buffer-cache budget in MiB — TOTAL across every worker and thread-type (see
 /// [`SpillConfig::cache_mib`]). Unset or unparseable ⇒ [`DEFAULT_STORAGE_CACHE_MIB`]; a valid
 /// value overrides it exactly (dbsp uses it verbatim as the total, so `=64` here means the same
@@ -137,32 +137,32 @@ fn storage_cache_mib(raw: Option<&str>) -> usize {
 /// so the default location is a per-circuit temp dir (unique per process + circuit, removed
 /// on shutdown; stale dirs from dead processes are swept best-effort at start).
 ///
-/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE=0` — disable (fully in-memory relations).
-/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
-/// - `ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB` (default 128).
-/// - `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` (default 64, TOTAL across all workers/thread-types —
+/// - `CIRCUITS_SUBQ_STORAGE=0` — disable (fully in-memory relations).
+/// - `CIRCUITS_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
+/// - `CIRCUITS_SUBQ_MIN_STORAGE_KB` (default 128).
+/// - `CIRCUITS_SUBQ_STORAGE_CACHE_MIB` (default 64, TOTAL across all workers/thread-types —
 ///   see [`storage_cache_mib`]; dbsp's own unset-default would be 512 MiB for this circuit).
 fn spill_config_from_env() -> Result<Option<SpillConfig>> {
-    if std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
+    if std::env::var("CIRCUITS_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
         return Ok(None);
     }
     let min_kb: usize =
-        std::env::var("ELECTRIC_CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
-    let cache_mib = storage_cache_mib(std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
-    let (dir, auto) = match std::env::var("ELECTRIC_CIRCUITS_SUBQ_STORAGE_DIR") {
+        std::env::var("CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let cache_mib = storage_cache_mib(std::env::var("CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
+    let (dir, auto) = match std::env::var("CIRCUITS_SUBQ_STORAGE_DIR") {
         Ok(d) if !d.is_empty() => (d, false),
         _ => (default_spill_dir(), true),
     };
     Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib, auto }))
 }
 
-/// A unique engine-owned spill dir: `<tmp>/electric-circuits-subq/<pid>-<seq>`. Sweeps sibling
+/// A unique engine-owned spill dir: `<tmp>/circuits-subq/<pid>-<seq>`. Sweeps sibling
 /// dirs whose owning process is gone (best-effort — a crash leaves the dir behind, and the
 /// next boot on the machine reclaims it).
 fn default_spill_dir() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join("electric-circuits-subq");
+    let base = std::env::temp_dir().join("circuits-subq");
     if let Ok(entries) = std::fs::read_dir(&base) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -204,7 +204,7 @@ enum Cmd {
 /// circuit state the host can size without dbsp's (heavy) profiler. Each byte field is dbsp's
 /// [`dbsp::trace::BatchReader::approximate_byte_size`]: exact in-memory columnar bytes (keys +
 /// weights) when the batch is resident, the on-disk file size when the batch is spilled (so
-/// under `ELECTRIC_CIRCUITS_SUBQ_STORAGE` these undercount RAM — spilling's whole point). `len` is the
+/// under `CIRCUITS_SUBQ_STORAGE` these undercount RAM — spilling's whole point). `len` is the
 /// total tuple count across all batches the snapshot pins, **including superseded, not-yet-
 /// compacted `(key,+1)/(key,-1)` pairs** — the direct signal for compaction/pinning growth.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
@@ -544,7 +544,7 @@ fn circuit_thread(
 mod tests {
     use super::*;
 
-    /// Pins the default: `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` unset (or unparseable) bounds the
+    /// Pins the default: `CIRCUITS_SUBQ_STORAGE_CACHE_MIB` unset (or unparseable) bounds the
     /// cache at [`DEFAULT_STORAGE_CACHE_MIB`] (64 MiB TOTAL) rather than falling through to
     /// dbsp's own unset-default (512 MiB for this circuit's 1-worker layout). A pure function
     /// (not `spill_config_from_env` itself) so the test doesn't mutate process-global env vars
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(storage_cache_mib(Some("not-a-number")), 64);
     }
 
-    /// An explicit `ELECTRIC_CIRCUITS_SUBQ_STORAGE_CACHE_MIB` value overrides the default exactly —
+    /// An explicit `CIRCUITS_SUBQ_STORAGE_CACHE_MIB` value overrides the default exactly —
     /// dbsp uses it verbatim as the TOTAL cache size, so `"64"` here means the same 64 MiB total
     /// as the default (not per-thread-type), and other values scale linearly from there.
     #[test]

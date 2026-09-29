@@ -1,6 +1,6 @@
 {
-  "name": "@electric-circuits/api",
-  "description": "The extended tRPC API server — the surface @electric-circuits/client talks to, sitting beside the engine's Electric-protocol endpoint.",
+  "name": "@circuits/api",
+  "description": "The extended tRPC API server — the surface @circuits/client talks to, sitting beside the engine's Electric-protocol endpoint.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-circuits/protocol": "workspace:*",
+    "@circuits/protocol": "workspace:*",
     "@trpc/server": "^11.18.0",
     "zod": "^4.4.3"
   }

@@ -675,7 +675,7 @@ fn unrestorable(
         return Some((
             Reason::TableGone,
             "its table is no longer in the compiled set (dropped under a wildcard selector, or no longer selected by \
-             ELECTRIC_CIRCUITS_PG_TABLES)"
+             CIRCUITS_PG_TABLES)"
                 .to_string(),
         ));
     }
@@ -2024,9 +2024,9 @@ mod tests {
     /// catalog is one log, and its epoch is part of it.
     #[test]
     fn slot_bound_round_trips_on_the_wire() {
-        let json = serde_json::to_value(bound("electric_circuits", "73", "2026-08-21T11:30:00.000Z")).unwrap();
+        let json = serde_json::to_value(bound("circuits", "73", "2026-08-21T11:30:00.000Z")).unwrap();
         assert_eq!(json["t"], "slotBound");
-        assert_eq!(json["slot"], "electric_circuits");
+        assert_eq!(json["slot"], "circuits");
         assert_eq!(json["system_identifier"], "73");
         assert_eq!(json["timeline_id"], 1);
         assert_eq!(json["bound_at"], "2026-08-21T11:30:00.000Z");

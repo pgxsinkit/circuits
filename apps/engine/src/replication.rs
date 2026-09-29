@@ -20,9 +20,9 @@
 //! exactly-once effect by de-duplicating on the stamped `(lsn, seq)`.)
 //!
 //! **Large transactions do not have to fit in memory** (ADR-0003). The buffer between `Begin` and
-//! `Commit` is a [`TxnBuffer`]: past `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` it spills to a local
+//! `Commit` is a [`TxnBuffer`]: past `CIRCUITS_TXN_MEMORY_BYTES` it spills to a local
 //! temporary file, and at `Commit` the transaction is streamed back out in **chunks**, each
-//! appended to the current segment and each within `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES`. The
+//! appended to the current segment and each within `CIRCUITS_CHANGES_APPEND_BYTES`. The
 //! slot is acknowledged — `last_lsn` published, the drain barrier's sentinel released — only after
 //! the **last** chunk has landed. A failure on any chunk tears the connection down unacknowledged,
 //! so Postgres re-delivers the whole transaction and the sequencer's `(lsn, seq)` de-duplication
@@ -123,7 +123,7 @@ pub trait SchemaEvents: Send + Sync {
 /// (`SlotBusy`), or Postgres coming back (`CheckFailed`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// The epoch is broken and `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`: ingest stays stopped
+    /// The epoch is broken and `CIRCUITS_RESET_ON_SLOT_LOSS=false`: ingest stays stopped
     /// until an operator posts `/epoch/reset` (ADR-0004).
     EpochBroken(&'static str),
     /// Another walsender holds the slot — Postgres allows exactly one, so this is a second engine

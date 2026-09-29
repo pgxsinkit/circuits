@@ -162,7 +162,7 @@ pub fn failure_of(e: &tokio_postgres::Error) -> PgFailure<'_> {
 
 /// What the boot should do about an `anyhow` error from the Postgres setup path.
 ///
-/// Anything that is **not** a Postgres failure — an unusable `ELECTRIC_CIRCUITS_PG_TABLES` entry, a
+/// Anything that is **not** a Postgres failure — an unusable `CIRCUITS_PG_TABLES` entry, a
 /// publication with a column list, a `wal_level` that is not `logical`, a durable catalog the engine
 /// could not read — is fatal: those are the strictness refusals the engine already refused to boot
 /// past, and none of them changes by waiting.
@@ -174,7 +174,7 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
     // that is not up yet is the same kind of "not yet" as a database that is not up yet — and in a
     // compose/Kubernetes start it is the NORMAL one — so it backs off rather than exiting 78. Only
     // the transport is forgiven: a malformed catalog, a change-log segment that is gone, an unusable
-    // ELECTRIC_CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`). A SHAPE stream that is gone is
+    // CIRCUITS_DS_URL stay fatal (see `ds::is_unavailable`). A SHAPE stream that is gone is
     // not a boot failure at all: the catalog restore retires that one shape (ADR-0009). The restore
     // itself is the other place both halves meet — a Postgres blip during an aggregate re-seed, or
     // storage failing a stream `HEAD`, reaches here typed and retries like any other.
@@ -417,7 +417,7 @@ fn map_pg_type(data_type: &str) -> ColumnType {
 
 /// List all base tables in `schema` that have a primary key, skipping the engine's own bookkeeping
 /// table — which is `public.__el_sync` **specifically**: a user table that happens to be called
-/// `__el_sync` in another schema is ordinary data and is replicated like any other. Used by "introspect all" mode (`ELECTRIC_CIRCUITS_PG_TABLES=*` → `public`,
+/// `__el_sync` in another schema is ordinary data and is replicated like any other. Used by "introspect all" mode (`CIRCUITS_PG_TABLES=*` → `public`,
 /// `schema.*` → that schema), where the set of tables isn't known up front (e.g. driving Electric's
 /// integration tests over varied schemas). The schema is a bound parameter, and `to_regclass` gets
 /// the properly quoted qualified name, so an odd schema name can neither inject nor mis-resolve.
@@ -928,7 +928,7 @@ impl SnapshotGate {
 // ---- streamed backfill (issue #13) -------------------------------------------------------------
 
 /// Byte budget for one backfill append, and the optional slow-backfill guard. Resolved once at boot
-/// (`ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS`)
+/// (`CIRCUITS_BACKFILL_APPEND_BYTES`, `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS`)
 /// and published process-wide, like the pool size — every backfill site is deep inside the engine
 /// and none of them has a config handle to thread.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1438,7 +1438,7 @@ mod tests {
 
     /// An unparseable connection string must be refused at boot, not retried: to [`classify`] it is
     /// indistinguishable from "the database is not up yet" (no SQLSTATE, no server answer), so
-    /// without this check a typo in `ELECTRIC_CIRCUITS_PG_URL` would back off and re-parse the same
+    /// without this check a typo in `CIRCUITS_PG_URL` would back off and re-parse the same
     /// broken string forever.
     #[test]
     fn an_unusable_pg_url_is_refused_with_its_password_redacted() {
@@ -1458,7 +1458,7 @@ mod tests {
     /// them changes by waiting.
     #[test]
     fn non_postgres_boot_failures_are_fatal() {
-        let e = anyhow::anyhow!("ELECTRIC_CIRCUITS_PG_TABLES has 1 unusable entry");
+        let e = anyhow::anyhow!("CIRCUITS_PG_TABLES has 1 unusable entry");
         assert_eq!(boot_disposition(&e), BootFailure::Fatal);
         assert_eq!(boot_failure_name(&e), "not a transient Postgres condition");
     }

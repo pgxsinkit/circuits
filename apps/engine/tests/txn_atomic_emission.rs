@@ -37,11 +37,11 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::changelog::LogPosition;
-use electric_circuits_engine::ds::{DsClient, Envelope};
-use electric_circuits_engine::engine::{Engine, EpochBroken};
-use electric_circuits_engine::schema::Schema;
-use electric_circuits_engine::table_ref::TableRef;
+use circuits_engine::changelog::LogPosition;
+use circuits_engine::ds::{DsClient, Envelope};
+use circuits_engine::engine::{Engine, EpochBroken};
+use circuits_engine::schema::Schema;
+use circuits_engine::table_ref::TableRef;
 
 /// One recorded append: the stream path and the envelopes it carried.
 type ShapeAppend = (String, Vec<Envelope>);
@@ -453,7 +453,7 @@ async fn a_failure_after_a_held_prefix_rewinds_to_the_held_boundary() {
 async fn an_uncompiled_table_is_consumed_and_an_unspellable_type_parks() {
     let (engine, log, stream, _t) = boot().await;
     let skipped = || {
-        electric_circuits_engine::metrics::metrics()
+        circuits_engine::metrics::metrics()
             .sequencer_unknown_table_skipped
             .load(std::sync::atomic::Ordering::Relaxed)
     };

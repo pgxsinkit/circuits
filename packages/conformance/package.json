@@ -1,5 +1,5 @@
 {
-  "name": "@electric-circuits/conformance",
+  "name": "@circuits/conformance",
   "description": "End-to-end conformance suite: asserts the real stack (Postgres, engine, wire protocol) agrees with the oracle on every shape.",
   "version": "0.0.0",
   "private": true,
@@ -8,11 +8,11 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-circuits/protocol": "workspace:*",
-    "@electric-circuits/oracle": "workspace:*",
-    "@electric-circuits/api": "workspace:*",
-    "@electric-circuits/client": "workspace:*",
-    "@electric-circuits/ds-rust": "workspace:*",
+    "@circuits/protocol": "workspace:*",
+    "@circuits/oracle": "workspace:*",
+    "@circuits/api": "workspace:*",
+    "@circuits/client": "workspace:*",
+    "@circuits/ds-rust": "workspace:*",
     "@durable-streams/client": "^0.2.6",
     "@durable-streams/state": "^0.3.1",
     "@tanstack/db": "^0.6.12",

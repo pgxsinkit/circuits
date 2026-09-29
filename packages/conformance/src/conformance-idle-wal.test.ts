@@ -2,7 +2,7 @@
 // replication stream with keepalives between transactions; the engine may acknowledge that safe
 // position because there is no buffered transaction whose durable-stream append is still pending.
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'

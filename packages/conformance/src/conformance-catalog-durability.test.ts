@@ -6,7 +6,7 @@
 
 import { createServer, request } from 'node:http'
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, type ShapeResp, waitFor } from './engine-native.js'
@@ -243,9 +243,9 @@ describe('native catalog durability under a durable-streams status failure', () 
         return proxy
       },
       engineEnv: {
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '1',
+        CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -303,8 +303,8 @@ describe('native catalog durability under a durable-streams status failure', () 
       engineEnv: {
         // Zero is a supported production setting: it disables dormancy and, under ADR-0008, lease
         // expiry. A purge acknowledgement still has to survive a process boundary in this mode.
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '0',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -364,8 +364,8 @@ describe('native catalog durability under a durable-streams status failure', () 
       engineEnv: {
         // Zero disables lease repair, so the abandoned purge is the ONLY thing that can retire this
         // stream: no background sweep can finish the job for it and hide the leak.
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '0',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -547,9 +547,9 @@ describe('native catalog durability under a durable-streams status failure', () 
         // this test is about what the FOLD does with a duplicated `Left` — not about leases. Under a
         // second-scale window the sweeper would (correctly, ADR-0008) reclaim the survivor
         // mid-assertion and hide the very thing being measured.
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '120',
-        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '120',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '120',
+        CIRCUITS_SHAPE_DORMANT_TTL_SECS: '120',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -602,9 +602,9 @@ describe('native catalog durability under a durable-streams status failure', () 
         return proxy
       },
       engineEnv: {
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '1',
+        CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -641,9 +641,9 @@ describe('native catalog durability under a durable-streams status failure', () 
         return proxy
       },
       engineEnv: {
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-        ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '1',
+        CIRCUITS_SHAPE_DORMANT_TTL_SECS: '1',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 
@@ -710,8 +710,8 @@ describe('native catalog durability under a durable-streams status failure', () 
         return proxy
       },
       engineEnv: {
-        ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '0',
-        ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+        CIRCUITS_SHAPE_IDLE_SECS: '0',
+        CIRCUITS_RETENTION_SWEEP_SECS: '1',
       },
     })
 

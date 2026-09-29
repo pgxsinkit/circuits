@@ -1,4 +1,4 @@
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { waitFor } from './engine-native.js'
@@ -32,7 +32,7 @@ describe('Postgres pooled-connection check-in', () => {
   beforeAll(async () => {
     harness = await bootHarness(schema, {
       engineEnv: {
-        ELECTRIC_CIRCUITS_LOG: 'info',
+        CIRCUITS_LOG: 'info',
         ELECTRIC_DB_POOL_SIZE: '1',
       },
     })

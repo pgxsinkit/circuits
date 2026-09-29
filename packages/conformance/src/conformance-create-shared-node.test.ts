@@ -17,7 +17,7 @@
 // through the shared node (observed on the live sibling), and only then is the create released.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 import { createShape, lockTable, pgQuery, streamKeys, waitFor, waitForLockWaiter } from './engine-native.js'

@@ -8,7 +8,7 @@
 # repo IS the package, so the paths are repo-relative.
 
 # ---- build stage: compile the release binary (glibc, matches the runtime) ----
-# Pinned to the same rustc as rust-toolchain.toml (and as pgxsinkit/electric-circuits)
+# Pinned to the same rustc as rust-toolchain.toml (and as pgxsinkit/circuits)
 # so the image build cannot drift from what CI and local builds produce. Upstream
 # floated this at `rust:1-bookworm`.
 FROM rust:1.96.0-bookworm AS build

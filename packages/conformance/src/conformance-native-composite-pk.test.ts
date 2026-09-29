@@ -1,7 +1,7 @@
 // PostgreSQL composite primary keys are supported by native introspection. Distinct key tuples must
 // therefore remain distinct through backfill, routing, and durable-stream emission.
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery } from './engine-native.js'

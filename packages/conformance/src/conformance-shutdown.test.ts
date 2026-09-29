@@ -20,7 +20,7 @@
 //      no duplicates either — the ingestor either finished the chunked append (and acknowledged) or
 //      finished nothing (and Postgres re-delivers).
 
-import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Row, Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { bootHarness, type BootOptions, drainEngine, type Harness } from './harness.js'
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
@@ -224,7 +224,7 @@ describe('graceful shutdown (SIGTERM)', () => {
     // exactly the situation an impatient operator (or a kubelet whose own grace is running out) is
     // in, and the contract is "stop now" — a non-zero exit that says the drain did not complete,
     // not a silent 0.
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS: '10' } })
+    await boot({ engineEnv: { CIRCUITS_SHUTDOWN_DRAIN_SECS: '10' } })
     const shape = await createShape(h!, { table: 'items', where: matchAll })
     await pg('INSERT INTO items (id, n, label) VALUES (1, 1, $1)', ['one'])
     await drainEngine(h!)
@@ -258,8 +258,8 @@ describe('graceful shutdown (SIGTERM)', () => {
     // is about — the ingestor spills and the commit goes out in many chunks.
     await boot({
       engineEnv: {
-        ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES: '4096',
-        ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES: '16384',
+        CIRCUITS_TXN_MEMORY_BYTES: '4096',
+        CIRCUITS_CHANGES_APPEND_BYTES: '16384',
       },
     })
     const shape = await createShape(h!, { table: 'items', where: matchAll })

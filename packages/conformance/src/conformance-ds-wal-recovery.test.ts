@@ -3,7 +3,7 @@
 // client materialization.  The named drain barrier, rather than elapsed time, fences each source
 // transaction before the storage crash.
 
-import type { Schema, ShapeDef } from '@electric-circuits/protocol'
+import type { Schema, ShapeDef } from '@circuits/protocol'
 import pgpkg from 'pg'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 

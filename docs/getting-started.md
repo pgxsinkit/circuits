@@ -1,8 +1,8 @@
 # Getting started: your first live queries
 
-This is the from-zero walkthrough: point Electric Circuits at a fresh Postgres database, then create
+This is the from-zero walkthrough: point Circuits at a fresh Postgres database, then create
 and consume live queries with **nothing but HTTP** — regular live queries, subqueries, and
-aggregations. Everything here is bare `curl`; the client SDK (`@electric-circuits/client`) wraps
+aggregations. Everything here is bare `curl`; the client SDK (`@circuits/client`) wraps
 exactly these requests. Companion docs: [live queries guide](live-queries-guide.md) (concepts + the
 SDK), [deployment-postgres.md](deployment-postgres.md) (production Postgres notes),
 [how queries become live](how-queries-become-live.md) (how it works).
@@ -95,28 +95,28 @@ max_wal_senders = 10
 DS_PORT=8791 node docker/ds-server.ts
 
 # 2. the engine, pointed at your database
-export ELECTRIC_CIRCUITS_DS_URL="http://127.0.0.1:8791"
-export ELECTRIC_CIRCUITS_PG_URL="postgres://user:pass@127.0.0.1:5432/appdb"
-export ELECTRIC_CIRCUITS_PG_TABLES="*"        # or "users,projects,project_members,issues"
-export ELECTRIC_CIRCUITS_BIND="0.0.0.0:7010"
-target/release/electric-circuits-engine       # prints ENGINE_LISTENING <addr> when ready
+export CIRCUITS_DS_URL="http://127.0.0.1:8791"
+export CIRCUITS_PG_URL="postgres://user:pass@127.0.0.1:5432/appdb"
+export CIRCUITS_PG_TABLES="*"        # or "users,projects,project_members,issues"
+export CIRCUITS_BIND="0.0.0.0:7010"
+target/release/circuits-engine       # prints ENGINE_LISTENING <addr> when ready
 
 # 3. the extended API server
 DS_URL=http://127.0.0.1:8791 ENGINE_URL=http://127.0.0.1:7010 API_PORT=8790 \
   node docker/api-server.ts
 ```
 
-`ELECTRIC_CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every `public` table that has a
+`CIRCUITS_PG_TABLES="*"` (or empty) means *introspect every `public` table that has a
 primary key* — never every schema. List entries individually as `schema.name` or a bare `name`
 (= `public.<name>`), or opt a whole schema in with `schema.*`. On boot, per table, the engine: introspects columns/types/pk, sets
 `REPLICA IDENTITY FULL`, ensures the current `changes/<n>` change-log segment, creates the logical
-replication slot (`pgoutput` + a `<slot>_pub` publication, name from `ELECTRIC_CIRCUITS_PG_SLOT`,
-default `electric_circuits`),
+replication slot (`pgoutput` + a `<slot>_pub` publication, name from `CIRCUITS_PG_SLOT`,
+default `circuits`),
 and starts the ingestor. Nothing else to migrate or install in the database.
 
 The engine's circuit tier — disk-spillable table arrangements, counts pipelines, and circuit
 serving — is always on. Tune it (state dir, cache/spill budgets, which lookup indexes and
-counts pipelines to compile) with the `ELECTRIC_CIRCUITS_DBSP_*` variables; the full reference table
+counts pipelines to compile) with the `CIRCUITS_DBSP_*` variables; the full reference table
 is in `ARCHITECTURE.md` §6b. The LinearLite demo (`pnpm demo:linearlite`) runs the engine with
 the full circuit configuration by default.
 

@@ -9,7 +9,7 @@
 //! So shutdown is **cooperative and ordered**:
 //!
 //! 1. the token flips. `GET /ready` answers `503 {"status":"shutting_down"}` from that instant, and
-//!    the server KEEPS ACCEPTING for `ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS` so a load balancer
+//!    the server KEEPS ACCEPTING for `CIRCUITS_SHUTDOWN_DRAIN_SECS` so a load balancer
 //!    actually gets to poll it and take the pod out of rotation. A probe that connection-refuses
 //!    also reads as "not ready", but only after the LB has already sent requests into a closing
 //!    socket; answering 503 for one probe interval first is what makes the drain graceful rather
@@ -29,7 +29,7 @@
 //! 4. the catalog writer drains, and the process exits 0 — or [`EXIT_SHUTDOWN_INCOMPLETE`] when it
 //!    could not, because the checkpoint the next boot resumes from may then be missing.
 //!
-//! The whole thing is bounded (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`, default 25 s — under a
+//! The whole thing is bounded (`CIRCUITS_SHUTDOWN_GRACE_SECS`, default 25 s — under a
 //! typical Kubernetes `terminationGracePeriodSeconds: 30`), and a **second** signal during the grace
 //! period stops waiting and exits non-zero. Streams are never closed or retired on shutdown: a
 //! restored shape continues its stream, exactly as after a crash.
@@ -198,7 +198,7 @@ pub fn grace_expiry_message(outstanding: &[&'static str], grace: Duration) -> St
     format!(
         "the {grace:?} shutdown grace elapsed with work still in flight — waiting on: {who}. \
          Exiting {EXIT_SHUTDOWN_FORCED}. Nothing is corrupted: an unacknowledged commit is \
-         re-delivered and the last checkpoint stands. Raise ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS \
+         re-delivered and the last checkpoint stands. Raise CIRCUITS_SHUTDOWN_GRACE_SECS \
          if this is a commit that legitimately needs longer."
     )
 }
@@ -219,10 +219,10 @@ impl Drop for ShutdownParty {
 /// boot-fatal rather than silently replaced, exactly like the large-transaction knobs — a grace
 /// period the operator meant to set and that silently did not apply is the worst of both worlds.
 pub fn resolve_grace(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Duration> {
-    let secs = secs_var(&get, "ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS", DEFAULT_GRACE.as_secs())?;
+    let secs = secs_var(&get, "CIRCUITS_SHUTDOWN_GRACE_SECS", DEFAULT_GRACE.as_secs())?;
     if secs == 0 {
         anyhow::bail!(
-            "ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS must be > 0 (it bounds the graceful shutdown; 0 \
+            "CIRCUITS_SHUTDOWN_GRACE_SECS must be > 0 (it bounds the graceful shutdown; 0 \
              would forbid finishing an in-flight commit)"
         );
     }
@@ -232,7 +232,7 @@ pub fn resolve_grace(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Dur
 /// Resolve the readiness-drain window (see [`DEFAULT_READY_DRAIN`]). `0` is legal and means "stop
 /// accepting at once" — correct when nothing in front of the engine polls `/ready`.
 pub fn resolve_ready_drain(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Duration> {
-    Ok(Duration::from_secs(secs_var(&get, "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS", DEFAULT_READY_DRAIN.as_secs())?))
+    Ok(Duration::from_secs(secs_var(&get, "CIRCUITS_SHUTDOWN_DRAIN_SECS", DEFAULT_READY_DRAIN.as_secs())?))
 }
 
 fn secs_var(get: impl Fn(&str) -> Option<String>, name: &str, default: u64) -> anyhow::Result<u64> {

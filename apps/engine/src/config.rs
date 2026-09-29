@@ -1,8 +1,8 @@
 //! Boot configuration resolved from the environment.
 //!
-//! The engine grew up on `ELECTRIC_CIRCUITS_*` vars (see `README.md`); the benchmarking-fleet drives the
+//! The engine grew up on `CIRCUITS_*` vars (see `README.md`); the benchmarking-fleet drives the
 //! image with Electric's own `ELECTRIC_*` / `DATABASE_URL` surface (see `docs/fleet-conformance.md`).
-//! This module maps the fleet surface onto the engine, keeping the `ELECTRIC_CIRCUITS_*` vars as the
+//! This module maps the fleet surface onto the engine, keeping the `CIRCUITS_*` vars as the
 //! higher-precedence override so the existing dev/test workflow is unchanged. Resolution is a pure
 //! function of an env getter ([`Config::resolve`]) so precedence is unit-testable without touching the
 //! process environment.
@@ -33,9 +33,9 @@ impl StatsdTarget {
 /// Fully-resolved boot configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// Postgres connection string (enables Postgres mode). `ELECTRIC_CIRCUITS_PG_URL` wins over `DATABASE_URL`.
+    /// Postgres connection string (enables Postgres mode). `CIRCUITS_PG_URL` wins over `DATABASE_URL`.
     pub pg_url: Option<String>,
-    /// Durable-streams base URL (`ELECTRIC_CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
+    /// Durable-streams base URL (`CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
     /// HTTP bind address for the control plane + `/v1/shape` + `/v1/health`.
     pub bind: String,
@@ -43,13 +43,13 @@ pub struct Config {
     pub log_filter: String,
     /// Logical-replication slot name.
     pub slot: String,
-    /// Tables to replicate (`ELECTRIC_CIRCUITS_PG_TABLES`): `schema.name`, a bare name (=
+    /// Tables to replicate (`CIRCUITS_PG_TABLES`): `schema.name`, a bare name (=
     /// `public.<name>`), or `schema.*` / `*` for "every table with a primary key in that schema"
     /// (`*` and an empty setting both mean `public.*` — see [`TableSelector`]). Malformed entries
     /// are dropped with a warning rather than crashing the boot.
     pub tables: Vec<TableSelector>,
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
-    /// delivery); still parsed so existing `ELECTRIC_CIRCUITS_PG_POLL_MS` settings are accepted.
+    /// delivery); still parsed so existing `CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
     /// This instance's id — tags every StatsD metric.
     pub instance_id: String,
@@ -68,7 +68,7 @@ pub struct Config {
     /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
-    /// the pipeline-visualizer backend). `ELECTRIC_CIRCUITS_TRACE=0|false|off` disables it: the routes
+    /// the pipeline-visualizer backend). `CIRCUITS_TRACE=0|false|off` disables it: the routes
     /// are never registered, so nothing can subscribe and the hot-path trace gating stays on its
     /// zero-subscriber fast path. Default on. Note: the surface is unauthenticated either way.
     pub trace: bool,
@@ -82,45 +82,45 @@ pub struct Config {
     /// slow-backfill `statement_timeout`.
     pub backfill: crate::pg::BackfillConfig,
     /// How long a graceful shutdown may take before it is forced
-    /// (`ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS`).
+    /// (`CIRCUITS_SHUTDOWN_GRACE_SECS`).
     pub shutdown_grace: Duration,
     /// How long the HTTP server keeps accepting after a signal, answering `GET /ready` with 503, so
-    /// a load balancer's probe sees the drain (`ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
+    /// a load balancer's probe sees the drain (`CIRCUITS_SHUTDOWN_DRAIN_SECS`). Comes out
     /// of `shutdown_grace`, not on top of it.
     pub shutdown_ready_drain: Duration,
     /// Unknown/unimplemented `ELECTRIC_*` vars, accepted as no-ops and logged once at boot.
     pub noop_vars: Vec<String>,
 }
 
-/// Settings for the dbsp arrangement layer (all under `ELECTRIC_CIRCUITS_DBSP*`).
+/// Settings for the dbsp arrangement layer (all under `CIRCUITS_DBSP*`).
 #[derive(Clone, Debug)]
 pub struct DbspConfig {
-    /// State directory (`ELECTRIC_CIRCUITS_DBSP_DIR`; default
+    /// State directory (`CIRCUITS_DBSP_DIR`; default
     /// `<ELECTRIC_STORAGE_DIR|./data>/dbsp/<slot>` — slot-keyed so parallel engines and
     /// different source databases never share dbsp state).
     pub dir: std::path::PathBuf,
-    /// Storage-cache budget in MiB (`ELECTRIC_CIRCUITS_DBSP_CACHE_MIB`).
+    /// Storage-cache budget in MiB (`CIRCUITS_DBSP_CACHE_MIB`).
     pub cache_mib: Option<usize>,
-    /// Spill threshold in KiB (`ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB`; default 1024 = 1 MiB;
+    /// Spill threshold in KiB (`CIRCUITS_DBSP_MIN_STORAGE_KB`; default 1024 = 1 MiB;
     /// 0 spills everything eligible).
     pub min_storage_bytes: Option<usize>,
-    /// Memory ceiling in MiB driving dbsp's pressure-based spilling (`ELECTRIC_CIRCUITS_DBSP_MAX_RSS_MB`).
+    /// Memory ceiling in MiB driving dbsp's pressure-based spilling (`CIRCUITS_DBSP_MAX_RSS_MB`).
     pub max_rss_bytes: Option<u64>,
-    /// Checkpoint cadence in seconds (`ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS`; default 60; 0 = only
+    /// Checkpoint cadence in seconds (`CIRCUITS_DBSP_CHECKPOINT_SECS`; default 60; 0 = only
     /// at shutdown).
     pub checkpoint_every: Option<Duration>,
     /// Extra lookup indexes beyond the per-table primary key: `table.column[,table.column…]`
-    /// (`ELECTRIC_CIRCUITS_DBSP_INDEXES`). Deprecated and ignored. The table part may itself be
+    /// (`CIRCUITS_DBSP_INDEXES`). Deprecated and ignored. The table part may itself be
     /// qualified (`schema.name.column`), so the COLUMN is split off the END.
     pub indexes: Vec<(TableRef, String)>,
-    /// Counts pipelines: `table:col+col[,table:col…]` (`ELECTRIC_CIRCUITS_DBSP_COUNTS`). The circuit
+    /// Counts pipelines: `table:col+col[,table:col…]` (`CIRCUITS_DBSP_COUNTS`). The circuit
     /// maintains a live COUNT per distinct group projection; COUNT aggregates whose predicate
     /// decomposes over these columns are served from the groups.
     pub counts: Vec<(TableRef, Vec<String>)>,
 }
 
 /// `ELECTRIC_*` vars the engine actually reads and acts on. Anything else matching `^ELECTRIC_`
-/// (and not the internal `ELECTRIC_CIRCUITS_*` namespace) is an accepted no-op.
+/// (and not the internal `CIRCUITS_*` namespace) is an accepted no-op.
 const HANDLED: &[&str] = &[
     "ELECTRIC_PORT",
     "ELECTRIC_INSTANCE_ID",
@@ -175,7 +175,7 @@ pub fn parse_human_duration(s: &str) -> Option<Duration> {
 
 impl Config {
     /// Resolve configuration from an env getter. Pure (no process-env access) so precedence is
-    /// testable. `Err` is a boot-fatal misconfiguration (an unparseable `ELECTRIC_CIRCUITS_PG_TABLES`
+    /// testable. `Err` is a boot-fatal misconfiguration (an unparseable `CIRCUITS_PG_TABLES`
     /// entry, or a large-transaction knob that could never work — see [`TxnBufferConfig::resolve`]).
     pub fn resolve(get: impl Fn(&str) -> Option<String>) -> Result<Config> {
         let g = |k: &str| nonempty(get(k));
@@ -185,15 +185,15 @@ impl Config {
         // fails identically forever: to the boot classifier a `Config::from_str` failure looks
         // exactly like "the database is not up yet" (no SQLSTATE, no server answer), so without
         // this a typo would back off and re-parse the same broken string every 30 s for ever.
-        let pg_url = g("ELECTRIC_CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
+        let pg_url = g("CIRCUITS_PG_URL").or_else(|| g("DATABASE_URL"));
         if let Some(url) = pg_url.as_deref() {
-            crate::pg::parse_pg_url(url).context("ELECTRIC_CIRCUITS_PG_URL / DATABASE_URL")?;
+            crate::pg::parse_pg_url(url).context("CIRCUITS_PG_URL / DATABASE_URL")?;
         }
-        let ds_url = g("ELECTRIC_CIRCUITS_DS_URL");
+        let ds_url = g("CIRCUITS_DS_URL");
 
-        // Bind address. ELECTRIC_CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
+        // Bind address. CIRCUITS_BIND always wins (preserves 127.0.0.1:0 dev behavior). Otherwise,
         // if the fleet surface is present (ELECTRIC_PORT or DATABASE_URL) bind 0.0.0.0:<port|3000>.
-        let bind = if let Some(b) = g("ELECTRIC_CIRCUITS_BIND") {
+        let bind = if let Some(b) = g("CIRCUITS_BIND") {
             b
         } else if let Some(port) = g("ELECTRIC_PORT") {
             format!("0.0.0.0:{}", port.trim())
@@ -203,8 +203,8 @@ impl Config {
             "127.0.0.1:0".to_string()
         };
 
-        // Log filter: ELECTRIC_CIRCUITS_LOG (a raw EnvFilter) wins; else map ELECTRIC_LOG_LEVEL; else info.
-        let log_filter = g("ELECTRIC_CIRCUITS_LOG").unwrap_or_else(|| match g("ELECTRIC_LOG_LEVEL").as_deref() {
+        // Log filter: CIRCUITS_LOG (a raw EnvFilter) wins; else map ELECTRIC_LOG_LEVEL; else info.
+        let log_filter = g("CIRCUITS_LOG").unwrap_or_else(|| match g("ELECTRIC_LOG_LEVEL").as_deref() {
             Some("error") => "error".into(),
             Some("warning") | Some("warn") => "warn".into(),
             Some("debug") => "debug".into(),
@@ -212,11 +212,11 @@ impl Config {
             _ => "info".into(),
         });
 
-        // Slot name: ELECTRIC_CIRCUITS_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
+        // Slot name: CIRCUITS_PG_SLOT wins; else electric_slot_<stream id>; else the legacy default.
         let stream_id = g("ELECTRIC_REPLICATION_STREAM_ID");
-        let slot = g("ELECTRIC_CIRCUITS_PG_SLOT").unwrap_or_else(|| match &stream_id {
+        let slot = g("CIRCUITS_PG_SLOT").unwrap_or_else(|| match &stream_id {
             Some(id) => format!("electric_slot_{id}"),
-            None => "electric_circuits".to_string(),
+            None => "circuits".to_string(),
         });
 
         // `schema.name` / bare name (= `public.<name>`) / `schema.*` / `*`. An empty setting leaves
@@ -226,7 +226,7 @@ impl Config {
         // replication — every shape on it refused, every change to it invisible — for a typo, while
         // the neighbouring failure mode (a well-formed name for a table that does not exist) already
         // aborts the boot at introspection. Loud and symmetric beats quietly half-configured.
-        let raw_tables = g("ELECTRIC_CIRCUITS_PG_TABLES").unwrap_or_default();
+        let raw_tables = g("CIRCUITS_PG_TABLES").unwrap_or_default();
         let mut tables: Vec<TableSelector> = Vec::new();
         let mut table_errors: Vec<String> = Vec::new();
         for entry in raw_tables.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -237,7 +237,7 @@ impl Config {
         }
         if !table_errors.is_empty() {
             bail!(
-                "ELECTRIC_CIRCUITS_PG_TABLES has {} unusable entr{} ({}). Each entry must be \
+                "CIRCUITS_PG_TABLES has {} unusable entr{} ({}). Each entry must be \
                  `schema.name`, a bare `name` (meaning `public.<name>`), `schema.*` (every table with \
                  a primary key in that schema), or `*` (= `public.*`).",
                 table_errors.len(),
@@ -246,7 +246,7 @@ impl Config {
             );
         }
 
-        let poll_ms = g("ELECTRIC_CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
+        let poll_ms = g("CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
         let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let stack_id = stream_id.clone().unwrap_or_else(|| "single_stack".to_string());
@@ -277,7 +277,7 @@ impl Config {
         let db_pool_size =
             g("ELECTRIC_DB_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
 
-        let trace = g("ELECTRIC_CIRCUITS_TRACE")
+        let trace = g("CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
             .unwrap_or(true);
 
@@ -289,25 +289,25 @@ impl Config {
             // Default dir is keyed by the replication slot: dbsp state is only valid for the
             // database identity it was built from, and parallel engines (conformance harnesses)
             // get disjoint state dirs for free.
-            dir: g("ELECTRIC_CIRCUITS_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
+            dir: g("CIRCUITS_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
                 std::path::Path::new(storage_dir.as_deref().unwrap_or("./data")).join("dbsp").join(&slot)
             }),
-            cache_mib: g("ELECTRIC_CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
+            cache_mib: g("CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
             min_storage_bytes: Some(
-                g("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024)
+                g("CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024)
                     * 1024,
             ),
-            max_rss_bytes: g("ELECTRIC_CIRCUITS_DBSP_MAX_RSS_MB")
+            max_rss_bytes: g("CIRCUITS_DBSP_MAX_RSS_MB")
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|mb| mb * 1024 * 1024),
-            checkpoint_every: match g("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS")
+            checkpoint_every: match g("CIRCUITS_DBSP_CHECKPOINT_SECS")
                 .and_then(|s| s.trim().parse::<u64>().ok())
             {
                 Some(0) => None,
                 Some(s) => Some(Duration::from_secs(s)),
                 None => Some(Duration::from_secs(60)),
             },
-            indexes: g("ELECTRIC_CIRCUITS_DBSP_INDEXES")
+            indexes: g("CIRCUITS_DBSP_INDEXES")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|s| {
@@ -317,7 +317,7 @@ impl Config {
                     Some((TableRef::parse(t.trim()).ok()?, c.trim().to_string()))
                 })
                 .collect(),
-            counts: g("ELECTRIC_CIRCUITS_DBSP_COUNTS")
+            counts: g("CIRCUITS_DBSP_COUNTS")
                 .unwrap_or_default()
                 .split(',')
                 .filter_map(|s| {
@@ -336,30 +336,30 @@ impl Config {
         // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
         // to be applied and silently was not is worse than a refused boot.
         let d = crate::pg::BackfillConfig::default();
-        let append_bytes = match g("ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES") {
+        let append_bytes = match g("CIRCUITS_BACKFILL_APPEND_BYTES") {
             None => d.append_bytes,
             Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
-                anyhow::anyhow!("ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a byte count, got '{}'", raw.trim())
+                anyhow::anyhow!("CIRCUITS_BACKFILL_APPEND_BYTES must be a byte count, got '{}'", raw.trim())
             })?,
         };
         if append_bytes == 0 {
             bail!(
-                "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES must be a positive byte count (it bounds one \
+                "CIRCUITS_BACKFILL_APPEND_BYTES must be a positive byte count (it bounds one \
                  backfill append's request body); 0 would make every shape unbackfillable"
             );
         }
         if append_bytes > crate::txn_buffer::DS_MAX_BODY_BYTES {
             bail!(
-                "ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES is {append_bytes}, above the durable-streams \
+                "CIRCUITS_BACKFILL_APPEND_BYTES is {append_bytes}, above the durable-streams \
                  request-body cap of {} bytes; an append that large could never land",
                 crate::txn_buffer::DS_MAX_BODY_BYTES
             );
         }
-        let statement_timeout_ms = match g("ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS") {
+        let statement_timeout_ms = match g("CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS") {
             None => d.statement_timeout_ms,
             Some(raw) => raw.trim().parse::<u64>().map_err(|_| {
                 anyhow::anyhow!(
-                    "ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS must be a whole number of \
+                    "CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS must be a whole number of \
                      milliseconds (0 = off), got '{}'",
                     raw.trim()
                 )
@@ -371,8 +371,8 @@ impl Config {
         let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
         if shutdown_ready_drain >= shutdown_grace {
             bail!(
-                "ELECTRIC_CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \
-                 ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS ({}s): the drain comes OUT of the grace, and \
+                "CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \
+                 CIRCUITS_SHUTDOWN_GRACE_SECS ({}s): the drain comes OUT of the grace, and \
                  spending all of it advertising 503 leaves nothing to finish an in-flight commit in",
                 shutdown_ready_drain.as_secs(),
                 shutdown_grace.as_secs(),
@@ -445,9 +445,9 @@ impl Config {
 }
 
 /// Is `k` an `ELECTRIC_*` var the engine does not act on (so it should be accepted as a no-op)?
-/// Internal `ELECTRIC_CIRCUITS_*` vars are ours (handled) and never counted here.
+/// Internal `CIRCUITS_*` vars are ours (handled) and never counted here.
 pub fn is_noop_var(k: &str) -> bool {
-    k.starts_with("ELECTRIC_") && !k.starts_with("ELECTRIC_CIRCUITS_") && !HANDLED.contains(&k)
+    k.starts_with("ELECTRIC_") && !k.starts_with("CIRCUITS_") && !HANDLED.contains(&k)
 }
 
 /// Redact `user:pass@` credentials from a Postgres/URL connection string for logging.
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn pg_url_precedence_ivm_wins_over_database_url() {
-        let c = cfg(&[("ELECTRIC_CIRCUITS_PG_URL", "postgres://ivm"), ("DATABASE_URL", "postgres://fleet")]);
+        let c = cfg(&[("CIRCUITS_PG_URL", "postgres://ivm"), ("DATABASE_URL", "postgres://fleet")]);
         assert_eq!(c.pg_url.as_deref(), Some("postgres://ivm"));
         let c = cfg(&[("DATABASE_URL", "postgres://fleet")]);
         assert_eq!(c.pg_url.as_deref(), Some("postgres://fleet"));
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn an_unparseable_pg_url_refuses_the_boot() {
         let e = Config::resolve(|k| match k {
-            "ELECTRIC_CIRCUITS_PG_URL" => Some("postgres://u@host:notaport/db".into()),
+            "CIRCUITS_PG_URL" => Some("postgres://u@host:notaport/db".into()),
             _ => None,
         })
         .expect_err("an unusable connection string must not resolve");
@@ -570,8 +570,8 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_PORT", "3000")]).bind, "0.0.0.0:3000");
         // DATABASE_URL present, no port -> 0.0.0.0:3000
         assert_eq!(cfg(&[("DATABASE_URL", "postgres://x")]).bind, "0.0.0.0:3000");
-        // ELECTRIC_CIRCUITS_BIND always wins
-        assert_eq!(cfg(&[("ELECTRIC_CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind, "127.0.0.1:9");
+        // CIRCUITS_BIND always wins
+        assert_eq!(cfg(&[("CIRCUITS_BIND", "127.0.0.1:9"), ("ELECTRIC_PORT", "3000")]).bind, "127.0.0.1:9");
     }
 
     #[test]
@@ -580,20 +580,20 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "warning")]).log_filter, "warn");
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "error")]).log_filter, "error");
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "debug")]).log_filter, "debug");
-        // ELECTRIC_CIRCUITS_LOG wins and passes through verbatim
+        // CIRCUITS_LOG wins and passes through verbatim
         assert_eq!(
-            cfg(&[("ELECTRIC_CIRCUITS_LOG", "electric_circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")])
+            cfg(&[("CIRCUITS_LOG", "circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")])
                 .log_filter,
-            "electric_circuits_engine=debug"
+            "circuits_engine=debug"
         );
     }
 
     #[test]
     fn slot_name_from_stream_id() {
-        assert_eq!(cfg(&[]).slot, "electric_circuits");
+        assert_eq!(cfg(&[]).slot, "circuits");
         assert_eq!(cfg(&[("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "electric_slot_bench");
         assert_eq!(
-            cfg(&[("ELECTRIC_CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot,
+            cfg(&[("CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot,
             "custom"
         );
     }
@@ -657,11 +657,11 @@ mod tests {
     #[test]
     fn trace_flag() {
         assert!(cfg(&[]).trace, "introspection defaults on");
-        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "0")]).trace);
-        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "false")]).trace);
-        assert!(!cfg(&[("ELECTRIC_CIRCUITS_TRACE", "off")]).trace);
-        assert!(cfg(&[("ELECTRIC_CIRCUITS_TRACE", "1")]).trace);
-        assert!(cfg(&[("ELECTRIC_CIRCUITS_TRACE", "true")]).trace);
+        assert!(!cfg(&[("CIRCUITS_TRACE", "0")]).trace);
+        assert!(!cfg(&[("CIRCUITS_TRACE", "false")]).trace);
+        assert!(!cfg(&[("CIRCUITS_TRACE", "off")]).trace);
+        assert!(cfg(&[("CIRCUITS_TRACE", "1")]).trace);
+        assert!(cfg(&[("CIRCUITS_TRACE", "true")]).trace);
     }
 
     #[test]
@@ -671,7 +671,7 @@ mod tests {
         let c = cfg(&[]);
         assert!(c.dbsp.indexes.is_empty(), "empty _INDEXES is valid");
         assert!(c.dbsp.counts.is_empty(), "empty _COUNTS is valid");
-        assert!(c.dbsp.dir.ends_with("dbsp/electric_circuits"), "default dir is slot-keyed: {:?}", c.dbsp.dir);
+        assert!(c.dbsp.dir.ends_with("dbsp/circuits"), "default dir is slot-keyed: {:?}", c.dbsp.dir);
         assert_eq!(c.dbsp.checkpoint_every, Some(Duration::from_secs(60)));
         assert_eq!(c.dbsp.min_storage_bytes, Some(1024 * 1024));
     }
@@ -679,11 +679,11 @@ mod tests {
     #[test]
     fn dbsp_tunables_parse() {
         let c = cfg(&[
-            ("ELECTRIC_CIRCUITS_DBSP_DIR", "/tmp/dbsp"),
-            ("ELECTRIC_CIRCUITS_DBSP_INDEXES", "todos.list_id, list_members.user_id"),
-            ("ELECTRIC_CIRCUITS_DBSP_COUNTS", "todos:list_id+done"),
-            ("ELECTRIC_CIRCUITS_DBSP_CHECKPOINT_SECS", "0"),
-            ("ELECTRIC_CIRCUITS_DBSP_MIN_STORAGE_KB", "2048"),
+            ("CIRCUITS_DBSP_DIR", "/tmp/dbsp"),
+            ("CIRCUITS_DBSP_INDEXES", "todos.list_id, list_members.user_id"),
+            ("CIRCUITS_DBSP_COUNTS", "todos:list_id+done"),
+            ("CIRCUITS_DBSP_CHECKPOINT_SECS", "0"),
+            ("CIRCUITS_DBSP_MIN_STORAGE_KB", "2048"),
         ]);
         assert_eq!(c.dbsp.dir, std::path::PathBuf::from("/tmp/dbsp"));
         assert_eq!(
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn pg_tables_selectors_parse_and_typos_are_fatal() {
         use crate::table_ref::TableRef;
-        let c = cfg(&[("ELECTRIC_CIRCUITS_PG_TABLES", "items, other.items , reporting.*, *")]);
+        let c = cfg(&[("CIRCUITS_PG_TABLES", "items, other.items , reporting.*, *")]);
         assert_eq!(
             c.tables,
             vec![
@@ -719,10 +719,10 @@ mod tests {
         assert!(cfg(&[]).tables.is_empty(), "empty setting stays empty (setup_postgres reads it as public.*)");
 
         for bad in ["a.b.c", "items, a.b.c", "*.*", "foo.*bar", "."] {
-            let err = try_cfg(&[("ELECTRIC_CIRCUITS_PG_TABLES", bad)])
+            let err = try_cfg(&[("CIRCUITS_PG_TABLES", bad)])
                 .expect_err(&format!("{bad:?} must abort the boot, not be skipped"));
             let msg = format!("{err:#}");
-            assert!(msg.contains("ELECTRIC_CIRCUITS_PG_TABLES"), "{msg}");
+            assert!(msg.contains("CIRCUITS_PG_TABLES"), "{msg}");
             assert!(msg.contains("schema.*"), "the message must state the rule: {msg}");
         }
     }
@@ -733,7 +733,7 @@ mod tests {
         assert!(is_noop_var("ELECTRIC_OTLP_ENDPOINT"));
         assert!(!is_noop_var("ELECTRIC_DB_POOL_SIZE")); // handled: sizes the backfill pool
         assert!(!is_noop_var("ELECTRIC_PORT")); // handled
-        assert!(!is_noop_var("ELECTRIC_CIRCUITS_PG_URL")); // internal
+        assert!(!is_noop_var("CIRCUITS_PG_URL")); // internal
         assert!(!is_noop_var("DATABASE_URL")); // not an ELECTRIC_ var
     }
 }

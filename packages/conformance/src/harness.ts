@@ -5,18 +5,18 @@
 // Topology:
 //   Vitest worker:  per-test Postgres database (in the shared ephemeral PG) + DurableStreamTestServer
 //                   + tRPC API + streamdb client + pg-backed oracle
-//   child process:  electric-circuits-engine (Rust) in Postgres mode (ingestor + query-back backfill)
+//   child process:  circuits-engine (Rust) in Postgres mode (ingestor + query-back backfill)
 
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { DurableStreamTestServer, type TestServerOptions } from '@electric-circuits/ds-rust'
-import { type ApiServer, createApiServer } from '@electric-circuits/api'
-import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@electric-circuits/client'
-import { createPgOracle, createPgTables, type Oracle } from '@electric-circuits/oracle'
-import type { ChangeEvent, Row, Schema, ShapeDef } from '@electric-circuits/protocol'
+import { DurableStreamTestServer, type TestServerOptions } from '@circuits/ds-rust'
+import { type ApiServer, createApiServer } from '@circuits/api'
+import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@circuits/client'
+import { createPgOracle, createPgTables, type Oracle } from '@circuits/oracle'
+import type { ChangeEvent, Row, Schema, ShapeDef } from '@circuits/protocol'
 import pgpkg from 'pg'
 
 import { compareShapeSets, type CompareResult } from './compare.js'
@@ -35,13 +35,13 @@ function repoRoot(): string {
 let engineBuilt = false
 /** Build the engine binary once per process. Skipped when the vitest globalSetup already built it. */
 export function buildEngine(): void {
-  if (engineBuilt || process.env.ELECTRIC_CIRCUITS_ENGINE_PREBUILT === '1') return
-  execFileSync('cargo', ['build', '-p', 'electric-circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
+  if (engineBuilt || process.env.CIRCUITS_ENGINE_PREBUILT === '1') return
+  execFileSync('cargo', ['build', '-p', 'circuits-engine'], { cwd: repoRoot(), stdio: 'inherit' })
   engineBuilt = true
 }
 
 function engineBin(): string {
-  return join(repoRoot(), 'target', 'debug', 'electric-circuits-engine')
+  return join(repoRoot(), 'target', 'debug', 'circuits-engine')
 }
 
 /** How an engine process exited: `code` for a normal exit, `signal` when it was killed. */
@@ -136,14 +136,14 @@ async function spawnEngine(
   extraEnv?: Record<string, string>,
 ): Promise<{ url: string; proc: ChildProcess; stderr: () => string; raw: RawEngine }> {
   const raw = spawnRawEngine({
-    ELECTRIC_CIRCUITS_DS_URL: dsUrl,
-    ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
-    ELECTRIC_CIRCUITS_LOG: process.env.ELECTRIC_CIRCUITS_LOG ?? 'warn',
-    ELECTRIC_CIRCUITS_PG_URL: pgUrl,
-    ELECTRIC_CIRCUITS_PG_TABLES: tables.join(','),
-    ELECTRIC_CIRCUITS_PG_SLOT: slot,
-    ELECTRIC_CIRCUITS_PG_POLL_MS: '25',
-    ...(fault ? { ELECTRIC_CIRCUITS_FAULT: fault } : {}),
+    CIRCUITS_DS_URL: dsUrl,
+    CIRCUITS_BIND: '127.0.0.1:0',
+    CIRCUITS_LOG: process.env.CIRCUITS_LOG ?? 'warn',
+    CIRCUITS_PG_URL: pgUrl,
+    CIRCUITS_PG_TABLES: tables.join(','),
+    CIRCUITS_PG_SLOT: slot,
+    CIRCUITS_PG_POLL_MS: '25',
+    ...(fault ? { CIRCUITS_FAULT: fault } : {}),
     ...(extraEnv ?? {}),
   })
   const url = await raw.waitForListening(20000).catch((e: Error) => {
@@ -208,7 +208,7 @@ export interface BootOptions {
    * Postgres column types the coarse protocol Schema can't express (e.g. `uuid`). Must create every
    * table in `schema` with `REPLICA IDENTITY FULL`. */
   ddl?: string
-  /** Extra env vars for the engine process (e.g. retention tuning: `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`). */
+  /** Extra env vars for the engine process (e.g. retention tuning: `CIRCUITS_SHAPE_IDLE_SECS`). */
   engineEnv?: Record<string, string>
   /** TEST-ONLY: runs after the tables exist and before the engine's FIRST boot — the window for
    * state the engine is supposed to find already there (e.g. an operator-created replication slot). */
@@ -220,8 +220,8 @@ export interface BootOptions {
 }
 
 function adminUrl(): string {
-  const url = process.env.ELECTRIC_CIRCUITS_TEST_PG_URL
-  if (!url) throw new Error('ELECTRIC_CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
+  const url = process.env.CIRCUITS_TEST_PG_URL
+  if (!url) throw new Error('CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)')
   return url
 }
 

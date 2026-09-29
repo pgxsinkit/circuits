@@ -10,7 +10,7 @@
 // Both shape kinds a native consumer uses — a plain equality shape and a subquery shape — are covered.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 import { createShape, lockTable, pgQuery, sleep, streamKeys, waitForLockWaiter } from './engine-native.js'

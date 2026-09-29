@@ -1,6 +1,6 @@
 {
-  "name": "electric-circuits",
-  "description": "Monorepo for Electric Circuits — live queries for Postgres: a Rust engine ingests logical replication and keeps every query result (joins, aggregates, subqueries) in sync, speaking the Electric protocol plus an extended API.",
+  "name": "circuits",
+  "description": "Monorepo for Circuits — live queries for Postgres: a Rust engine ingests logical replication and keeps every query result (joins, aggregates, subqueries) in sync, speaking the Electric protocol plus an extended API.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -13,8 +13,8 @@
     "test": "vitest run",
     "test:conformance": "vitest run packages/conformance",
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
-    "engine:build": "cargo build -p electric-circuits-engine",
-    "engine:test": "cargo test -p electric-circuits-engine",
+    "engine:build": "cargo build -p circuits-engine",
+    "engine:test": "cargo test -p circuits-engine",
     "loop": "bash scripts/conformance-loop.sh"
   },
   "devDependencies": {

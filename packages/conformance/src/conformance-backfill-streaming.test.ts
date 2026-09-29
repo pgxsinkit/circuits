@@ -1,6 +1,6 @@
 // A backfill is STREAMED, never materialised (issue #13). The engine reads the snapshot over a
 // `query_raw` cursor and appends it to the pending shape stream in chunks bounded by
-// `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`, so its memory is one chunk for a table of any size —
+// `CIRCUITS_BACKFILL_APPEND_BYTES`, so its memory is one chunk for a table of any size —
 // where before, creating a shape over a large table read every matching row into a `Vec<Row>` first.
 //
 // Asserted end to end against the live engine, real Postgres and the real durable-streams server:
@@ -12,7 +12,7 @@
 //      MESSAGES, not over appends, so the append boundaries are not recoverable from the offsets
 //      afterwards; the counter is the direct evidence and this is what it says.)
 //   2. a `/v1/shape` snapshot over the same table returns every row;
-//   3. `ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS=1` fails THAT create with a clear error and
+//   3. `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS=1` fails THAT create with a clear error and
 //      leaves the ENGINE healthy — proved against the engine, not against Postgres: `/ready` is
 //      still 200, the ingestor and sequencer still carry a write end to end (`drainEngine`), and a
 //      shape created AFTER the failure still receives changes. (The guard is process-wide, so the
@@ -20,7 +20,7 @@
 //      would trip the same 1 ms timeout and prove nothing.);
 //   4. unset (the default), the same create works.
 
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { bootHarness, type BootOptions, drainEngine, type Harness } from './harness.js'
 import { foldStream, pgQuery, waitFor } from './engine-native.js'
@@ -92,7 +92,7 @@ async function readyStatus(): Promise<{ code: number; status: string }> {
 
 describe('streamed backfills', () => {
   it('writes a large snapshot in several appends and still equals Postgres', async () => {
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
+    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
     await seedRows()
 
     // The stream's offset must advance in STEPS while the create runs — proof that the snapshot
@@ -134,7 +134,7 @@ describe('streamed backfills', () => {
   })
 
   it('serves every row through the /v1/shape snapshot over the same table', async () => {
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
+    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
     await seedRows()
 
     const res = await fetch(`${h!.engineUrl}/v1/shape?table=items&offset=-1`)
@@ -148,8 +148,8 @@ describe('streamed backfills', () => {
   it('a 1ms statement timeout fails that create with a clear error and leaves the engine healthy', async () => {
     await boot({
       engineEnv: {
-        ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES: '65536',
-        ELECTRIC_CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS: '1',
+        CIRCUITS_BACKFILL_APPEND_BYTES: '65536',
+        CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS: '1',
       },
     })
     await seedRows()
@@ -184,7 +184,7 @@ describe('streamed backfills', () => {
   })
 
   it('the same create works with the guard unset (the default)', async () => {
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
+    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
     await seedRows()
     const shape = await createShape({ table: 'items', where: matchAll })
     expect((await foldStream(shape.streamUrl)).size).toBe(ROWS)

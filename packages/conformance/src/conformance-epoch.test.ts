@@ -6,13 +6,13 @@
 // Here the slot is genuinely destroyed underneath a running (and a stopped) engine, and the engine
 // has to notice and end the epoch. Under the default policy it resets itself: every shape retired
 // (stream closed, then deleted — ADR-0007), a fresh slot, a new `SlotBound` in the durable catalog.
-// Under `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false` it refuses instead — fail-closed with a named
+// Under `CIRCUITS_RESET_ON_SLOT_LOSS=false` it refuses instead — fail-closed with a named
 // reason, ingest stopped, and `POST /epoch/reset` as the deliberate human act that recovers it.
 //
 // What must NEVER happen (and is what these tests are really guarding): a fresh slot at the head,
 // shapes still being served, and nobody the wiser.
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
 import { bootHarness, type BootOptions, drainEngine, type Harness } from './harness.js'
@@ -163,7 +163,7 @@ describe('losing the replication slot ends the epoch (ADR-0004)', () => {
   }, 90000)
 
   it('refuse: with RESET_ON_SLOT_LOSS=false the engine fails closed until an operator resets it', async () => {
-    await boot({ engineEnv: { ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS: 'false' } })
+    await boot({ engineEnv: { CIRCUITS_RESET_ON_SLOT_LOSS: 'false' } })
     await pg('INSERT INTO items (id, n) VALUES (1, 1)')
     await drainEngine(h!)
     const items = await createShape(h!, { table: 'items', where: matchAll })

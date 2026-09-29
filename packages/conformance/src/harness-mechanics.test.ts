@@ -1,4 +1,4 @@
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import { describe, expect, it } from 'vitest'
 import { compareShapeSets } from './compare.js'
 import { createSimulator } from './simulator.js'

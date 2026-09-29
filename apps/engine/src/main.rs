@@ -1,10 +1,10 @@
-//! electric-circuits engine binary: a durable-streams client that incrementally maintains shapes
+//! Circuits engine binary: a durable-streams client that incrementally maintains shapes
 //! (key routing + stateless predicate evaluation over Z-set deltas).
 //!
-//! Boot configuration is resolved from the environment by [`electric_circuits_engine::config`], which maps
-//! the benchmarking-fleet's `ELECTRIC_*` / `DATABASE_URL` surface onto the engine's `ELECTRIC_CIRCUITS_*`
+//! Boot configuration is resolved from the environment by [`circuits_engine::config`], which maps
+//! the benchmarking-fleet's `ELECTRIC_*` / `DATABASE_URL` surface onto the engine's `CIRCUITS_*`
 //! internals (the latter still win, preserving the dev/test workflow). The durable-streams base URL
-//! comes from `ELECTRIC_CIRCUITS_DS_URL`; the engine binds `0.0.0.0:$ELECTRIC_PORT` (default 3000 under the
+//! comes from `CIRCUITS_DS_URL`; the engine binds `0.0.0.0:$ELECTRIC_PORT` (default 3000 under the
 //! fleet, `127.0.0.1:0` in dev). Two stdout lines are the discovery channel: `ENGINE_BINDING <url>`
 //! when the port is open (before Postgres is contacted, so `GET /ready` is answerable while the boot
 //! is still retrying) and `ENGINE_LISTENING <url>` once the boot has RESOLVED.
@@ -18,7 +18,7 @@
 //! | `71` | the shutdown was **incomplete**: every task finished, but the durable catalog writer did not drain ([`shutdown::EXIT_SHUTDOWN_INCOMPLETE`]) — the final checkpoint may be missing, so the next boot may replay from an earlier one |
 //! | `74` | the durable catalog **refused** an event (`EX_IOERR`): storage answered, and the answer will not change — or the catalog writer task itself panicked. Memory and storage disagree and only a re-fold at boot can reconcile them, so the process exits instead of serving state its record does not describe |
 //! | `75` | a counts pipeline must be rebuilt (schema drift or an epoch reset on a circuit-served table); restart to re-seed it |
-//! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `ELECTRIC_CIRCUITS_PG_URL`, an unusable `ELECTRIC_CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `ELECTRIC_CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
+//! | `78` | **boot refused** (`EX_CONFIG`): a misconfiguration retrying cannot fix — a setting the config resolver rejected (an unparseable `CIRCUITS_PG_URL`, an unusable `CIRCUITS_PG_TABLES`, an out-of-range byte budget, a missing `CIRCUITS_DS_URL`, an unwritable spill directory), or a fatal Postgres condition — bad credentials, a missing privilege, an unknown database, `wal_level` ≠ `logical`, a publication with a column list, an unreadable durable catalog |
 //!
 //! A **retryable** Postgres condition — connection refused, DNS, a timeout, "the database system is
 //! starting up" — is not an exit at all: the boot backs off (1 s → 30 s, jittered) and tries again
@@ -30,11 +30,11 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use electric_circuits_engine::config::{self, Config};
-use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::shutdown::{self, ShutdownToken};
-use electric_circuits_engine::{pg, statsd};
+use circuits_engine::config::{self, Config};
+use circuits_engine::ds::DsClient;
+use circuits_engine::engine::Engine;
+use circuits_engine::shutdown::{self, ShutdownToken};
+use circuits_engine::{pg, statsd};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,31 +73,31 @@ async fn main() -> Result<()> {
     let Some(ds_url) = config.ds_url.clone() else {
         refuse_boot(
             "configuration",
-            &anyhow::anyhow!("ELECTRIC_CIRCUITS_DS_URL must be set to the durable-streams server base URL"),
+            &anyhow::anyhow!("CIRCUITS_DS_URL must be set to the durable-streams server base URL"),
         )
     };
 
     // Large transactions spill to disk (ADR-0003), so the spill directory must exist, be private
     // and be writable NOW. A spill that fails mid-commit tears the replication connection down and
     // is retried forever against the same broken directory — an ingest stall nobody sees — so this
-    // is boot-fatal, like an unusable ELECTRIC_CIRCUITS_PG_TABLES entry. (Kept out of
+    // is boot-fatal, like an unusable CIRCUITS_PG_TABLES entry. (Kept out of
     // `Config::resolve`, which is a pure function of an env getter.)
     if let Err(e) = config.txn.probe().context("checking the large-transaction spill directory") {
         refuse_boot("configuration", &e);
     }
 
     // TEST-ONLY: surface an injected fault so a faulted run is never silent (no-op when unset).
-    if electric_circuits_engine::fault::active() != electric_circuits_engine::fault::Fault::None {
-        tracing::warn!("ELECTRIC_CIRCUITS_FAULT active: {:?}", electric_circuits_engine::fault::active());
+    if circuits_engine::fault::active() != circuits_engine::fault::Fault::None {
+        tracing::warn!("CIRCUITS_FAULT active: {:?}", circuits_engine::fault::active());
     }
 
     // Size the shared Postgres pool (backfills, query-backs, subset queries) and publish the
     // backfill streaming budget before first use.
-    electric_circuits_engine::pg::set_pool_size(config.db_pool_size);
-    electric_circuits_engine::pg::set_backfill_config(config.backfill);
+    circuits_engine::pg::set_pool_size(config.db_pool_size);
+    circuits_engine::pg::set_backfill_config(config.backfill);
 
     // Postgres mode: data lives in Postgres, ingested via logical replication and read back for
-    // backfill. Enabled by a resolved pg_url (ELECTRIC_CIRCUITS_PG_URL or DATABASE_URL).
+    // backfill. Enabled by a resolved pg_url (CIRCUITS_PG_URL or DATABASE_URL).
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
             let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
@@ -121,9 +121,9 @@ async fn main() -> Result<()> {
     // Memory probes via OpenTelemetry: register the meter provider + Prometheus exporter, publish an
     // initial sample, and start the background sampler. `_otel` is held for the process lifetime so the
     // provider (and its exporter) stays alive. Exposed at GET /metrics/prometheus and GET /memory.
-    let _otel = electric_circuits_engine::mem::init_otel();
-    electric_circuits_engine::mem::publish(&engine.mem_cardinalities().await);
-    electric_circuits_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
+    let _otel = circuits_engine::mem::init_otel();
+    circuits_engine::mem::publish(&engine.mem_cardinalities().await);
+    circuits_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
 
     // StatsD periodic samplers (no-ops when StatsD is off): system metrics + storage size.
     statsd::spawn_system_sampler(config.metrics_period);
@@ -133,7 +133,7 @@ async fn main() -> Result<()> {
     // Kept past the router so the Postgres setup and the shutdown path still have a handle.
     let engine_at_exit = engine.clone();
     let boot_engine = engine.clone();
-    let app = electric_circuits_engine::http::router_with_introspection(engine, config.trace);
+    let app = circuits_engine::http::router_with_introspection(engine, config.trace);
 
     let listener =
         tokio::net::TcpListener::bind(&config.bind).await.with_context(|| format!("binding {}", config.bind))?;
@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
     // at all. `ENGINE_BINDING` says the port is open; readiness is a separate question.
     println!("ENGINE_BINDING http://{addr}");
     std::io::stdout().flush().ok();
-    tracing::info!("electric-circuits engine listening on http://{addr}, ds={ds_url}");
+    tracing::info!("Circuits engine listening on http://{addr}, ds={ds_url}");
 
     let serve_shutdown = shutdown.clone();
     let ready_drain = config.shutdown_ready_drain;
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
             statsd::consumers_ready(tables as u64);
             // Replication-slot gauges (engine-owned: `/metrics`, `/metrics/prometheus` AND StatsD
             // read the same ~10 s sample, taken on a POOLED connection).
-            electric_circuits_engine::metrics::spawn_replication_slot_sampler(
+            circuits_engine::metrics::spawn_replication_slot_sampler(
                 url,
                 config.slot.clone(),
                 boot_engine.shutdown_token(),
@@ -238,9 +238,9 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
         // orchestrator the engine is making progress when it is in fact waiting to redial.
         engine.set_waiting();
         attempt = attempt.saturating_add(1);
-        let wait = electric_circuits_engine::replication::jitter(
-            electric_circuits_engine::replication::backoff_base(attempt.saturating_sub(1)),
-            electric_circuits_engine::replication::clock_nanos(),
+        let wait = circuits_engine::replication::jitter(
+            circuits_engine::replication::backoff_base(attempt.saturating_sub(1)),
+            circuits_engine::replication::clock_nanos(),
         );
         tracing::warn!(
             "boot: Postgres not ready ({}); attempt {attempt} failed, retrying in {wait:?}. \
@@ -325,7 +325,7 @@ async fn finish_shutdown(engine: &Engine, shutdown: &ShutdownToken, grace: Durat
     if !shutdown.wait_for_parties(left).await {
         tracing::error!(
             "shutdown grace of {grace:?} elapsed with {:?} still running; exiting {}. \
-             Raise ELECTRIC_CIRCUITS_SHUTDOWN_GRACE_SECS if a commit of this size needs longer.",
+             Raise CIRCUITS_SHUTDOWN_GRACE_SECS if a commit of this size needs longer.",
             shutdown.outstanding(),
             shutdown::EXIT_SHUTDOWN_FORCED
         );
@@ -368,7 +368,7 @@ fn refuse_boot(kind: &str, e: &anyhow::Error) -> ! {
 
 fn init_tracing(filter: &str) {
     use tracing_subscriber::{EnvFilter, fmt};
-    // `filter` already reflects ELECTRIC_CIRCUITS_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
+    // `filter` already reflects CIRCUITS_LOG / ELECTRIC_LOG_LEVEL precedence (see config.rs).
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
 }

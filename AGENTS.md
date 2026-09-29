@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Guidance for AI agents working in **electric-circuits** — an Electric-style reactive sync engine. App
+Guidance for AI agents working in **Circuits** — an Electric-style reactive sync engine. App
 writes go to **Postgres**; a Rust engine turns logical-replication changes into **live shapes**
 (incrementally maintained, fully de-duplicated); **durable streams** is the log between them. Two
 client surfaces: the Electric-compatible `GET /v1/shape` (works with the ElectricSQL TS client) and
-the extended `@electric-circuits/client` API (shapes + subset queries + live aggregations — the surface
+the extended `@circuits/client` API (shapes + subset queries + live aggregations — the surface
 the project is growing toward).
 
 ## Layout
@@ -75,9 +75,9 @@ The recipe for capturing an app's query set in one circuit:
 ## Build & test
 
 ```bash
-pnpm engine:build          # cargo build -p electric-circuits-engine
+pnpm engine:build          # cargo build -p circuits-engine
 cargo fmt --check          # rustfmt.toml at the root (120 cols, Max heuristics); CI enforces it
-pnpm engine:test           # cargo test  -p electric-circuits-engine   (fast)
+pnpm engine:test           # cargo test  -p circuits-engine   (fast)
 pnpm typecheck             # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
 pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)
 pnpm test:conformance      # just the conformance package
@@ -120,7 +120,7 @@ projects scale with it (users ~√issues). Boots PG + ds + engine + API + web UI
 explorer; `stop` tears down cleanly; `status` reports. One instance at a time (teardown is
 pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_VIZ=0` to skip.
 
-`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @electric-circuits/loadgen
+`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @circuits/loadgen
 loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
 The streams layer is the Rust durable-streams server (group-commit WAL — appends batch under
 concurrency); `DS_MEMORY=1` still removes durability entirely for max-throughput runs
@@ -141,15 +141,15 @@ Fixed URLs: LinearLite `http://localhost:5174` (HTTPS/HTTP-2 `https://localhost:
 `http://localhost:5180` (`https://localhost:5443`). Ephemeral ports for the rest — grep the log:
 `postgres →`, `engine →`, `api →`. `DEMO_SEED_COUNT=<n>` scales the faker seed (default 512 issues).
 Data resets every run. **Restarting:** kill the previous run first or Vite silently binds 5175 —
-`pkill -f electric-circuits-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
+`pkill -f circuits-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
 port lingers: `lsof -ti :5174 -ti :5180 | xargs kill`).
 
 The **visualizer** can also attach to any running engine on its own:
-`ELECTRIC_CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @electric-circuits/pipeline-viz dev`.
+`CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @circuits/pipeline-viz dev`.
 Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
 etc. work from the page — the backbone of the verification workflow below. A third way is the
 containerized visualizer (`docker/Dockerfile.viz`): `docker build -f docker/Dockerfile.viz -t
-electric-circuits-viz . && docker run -p 5180:5180 -p 5443:5443 electric-circuits-viz` serves
+circuits-viz . && docker run -p 5180:5180 -p 5443:5443 circuits-viz` serves
 `http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
 point it at another engine.
 
@@ -179,7 +179,7 @@ Use the Playwright MCP browser to drive both apps; keep LinearLite and the visua
 Retention interplay while testing: an open LinearLite tab holds subscriptions (refcount ≥ 1), which
 blocks dormancy for its shapes; `GET /shapes/{id}` is deliberately NOT a retention touch, so
 polling it never keeps a shape alive. To exercise dormancy/eviction fast, boot with second-scale
-knobs (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=1 ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
+knobs (`CIRCUITS_SHAPE_IDLE_SECS=1 CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
 `packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
 
 ### Testing checklist before claiming done
@@ -191,14 +191,14 @@ which ran and why the rest could not) before closing the task.**
 ```bash
 pnpm typecheck                            # tsc --noEmit over the TS workspace (vitest cannot see type errors)
 pnpm engine:test                          # Rust unit + integration (fast)
-ELECTRIC_CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
+CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
 ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
   ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
 ```
 
 The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
 against the always-on circuit on every run (there is no off mode). The
-`ELECTRIC_CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
+`CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
 versus which fall through to the routing/fallback tiers. The `electric-conformance` line is
 Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
 package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
@@ -241,7 +241,7 @@ canvas update, screenshot.
   transient (`ds::is_unavailable`) with backoff, bounded by a budget and the shutdown token; retire
   only on a definite refusal, a `head` that confirms the stream is gone, or an exhausted budget.
 - **A transaction is one unit of visibility even when it is several appends** (ADR-0003). A commit
-  larger than `ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES` reaches the change log as several appends, and
+  larger than `CIRCUITS_CHANGES_APPEND_BYTES` reaches the change log as several appends, and
   durable-streams exposes each atomically — so splitting a read page into transactions by
   `(txid, lsn)` alone would flush a fraction of a commit to the shape streams. The rule on the wire is
   the **transaction-end marker**: `headers.last = true` on the LAST envelope of every transaction, and
@@ -266,7 +266,7 @@ canvas update, screenshot.
   the position alone is not a restart point.
 - **The INGESTOR's memory is bounded, and transaction size never invalidates anything** (ADR-0003).
   Its per-transaction buffer holds `Envelope` structs (nothing is serialized on the way in) and spills
-  to a temp file past `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` (`txn_buffer.rs`), so its peak is that cap
+  to a temp file past `CIRCUITS_TXN_MEMORY_BYTES` (`txn_buffer.rs`), so its peak is that cap
   plus one chunk. That bound is the ingestor's alone — the sequencer's read page, held run and
   `txn_pending` are bounded by a transaction's size. There is no "transaction too large" branch: no
   shape is retired, nothing is purged, nothing is refused for being big. If you add work between
@@ -274,7 +274,7 @@ canvas update, screenshot.
 - **Schema drift, `TRUNCATE` and a replica-identity regression retire that table's dependents**
   (ADR 0005; `engine/drift.rs`). The compiled schema carries a fingerprint (`attnum`-ordered
   `(name, type oid, typmod)` + `relreplident`); a pgoutput `Relation` that disagrees with it, a
-  `TRUNCATE`, or the `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` reconciler retires every shape on the
+  `TRUNCATE`, or the `CIRCUITS_SCHEMA_RECONCILE_SECS` reconciler retires every shape on the
   table and every subquery shape referencing it. Drift also re-introspects and swaps the schema in
   all holders (TRUNCATE does not — nothing changed); the ingestor awaits the handling inline, so
   post-DDL DML decodes against the new schema. A create that overlapped a retirement is refused by
@@ -291,7 +291,7 @@ canvas update, screenshot.
   belongs to, and the slot is verified against it before **every** connection — boot and each ingestor
   reconnect. Slot gone, `wal_status = 'lost'`, foreign output plugin, or a different cluster
   `system_identifier` = **epoch break**: the gap cannot be filled, so either every shape is retired
-  and a new epoch bound (`ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=true`, the default), or the engine
+  and a new epoch bound (`CIRCUITS_RESET_ON_SLOT_LOSS=true`, the default), or the engine
   fails closed with a named reason until `POST /epoch/reset` (`=false`). A slot held by another
   walsender is NOT a break (wait for it) and a changed timeline is recorded, not acted on. Never
   recreate the slot silently: a fresh slot at the WAL head with shapes still being served is the
@@ -314,7 +314,7 @@ canvas update, screenshot.
   to **exactly** the next segment (the writer is the only thing that walks to the first open one). A
   rotated-out segment is deleted only once the **durable** checkpoint (the last `Offset` that reached
   the catalog, not the in-memory position) is past it and no shape pins it — a dormant shape pinning
-  past `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` is evicted first, a reactivating one is never evicted
+  past `CIRCUITS_CHANGES_RETAIN_SECS` is evicted first, a reactivating one is never evicted
   mid-replay, and the plan is recomputed after the evictions so a skipped one cannot license a
   delete. The current segment is never deleted, and a boot whose restored position names a missing
   segment refuses to start.
@@ -336,7 +336,7 @@ canvas update, screenshot.
   `Created` and the `Joined` of a NEW claim (`send_durable`, awaited before the HTTP answer, no
   timeout — a create while storage is down waits rather than handing back a shape a restart would
   forget), and the `Left`/`Dropped` of a native `DELETE`, whose success response has to mean the
-  release or the purge survives a restart even under `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0`, where no
+  release or the purge survives a restart even under `CIRCUITS_SHAPE_IDLE_SECS=0`, where no
   lease will ever repair it. A retry of an idempotent removal finds its mutation already applied,
   enqueues nothing and waits on the same barrier (`CatalogWriter::wait_durable`) rather than
   answering from memory. **Queued-never-dropped = everything the engine does to itself**: a lease
@@ -402,7 +402,7 @@ canvas update, screenshot.
   lapses, after it is released and across a restart, with nothing remembered to make that true. (A
   caller that names a `~` id of its own only makes its own claim the expendable one.) And because
   native reads go straight to durable-streams where the engine cannot see them, the renewal IS the
-  liveness signal: a claim not renewed within `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS` is released by the
+  liveness signal: a claim not renewed within `CIRCUITS_SHAPE_IDLE_SECS` is released by the
   retention sweeper exactly as an explicit delete would release it (`Left { lapsed: true }`), and
   the shape then follows the ordinary lifecycle. If you add a create path, thread the subscription
   through it; if you add a release path, name the claim. A provisional claim taken before an await
@@ -417,7 +417,7 @@ canvas update, screenshot.
   pre-ADR-0006 formats — greenfield, no compat.
 - **A backfill is never materialised.** Every Postgres backfill streams off a `query_raw` cursor and
   is consumed **chunk by chunk** (`pg::BackfillReader`, bounded by
-  `ELECTRIC_CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide
+  `CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide
   the table. A plain shape appends each chunk to its still-pending stream; an aggregate folds each
   chunk into an `AggSeed` (via the same `fold_agg_row` the live path uses) and drops the rows. The
   ONLY legitimate `BackfillReader::collect` callers are the ones whose *result* is an in-memory set
@@ -500,7 +500,7 @@ canvas update, screenshot.
 - **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`); data does not persist. **Kill
   stale demos before restarting** — a leftover `tsx start.ts`/`caddy` keeps the ports and serves
   stale code, which reads as a mysterious schema mismatch. `scripts/linearlite.sh stop`, or
-  `pkill -f electric-circuits-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
+  `pkill -f circuits-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
   scope kills by port (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks
   the ephemeral Postgres.
 - **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also

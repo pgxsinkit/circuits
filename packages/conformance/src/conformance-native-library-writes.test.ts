@@ -2,9 +2,9 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createCore, type ElectricCore, type ShapeHandle } from '@electric-circuits/api'
-import { DurableStreamTestServer } from '@electric-circuits/ds-rust'
-import type { Schema } from '@electric-circuits/protocol'
+import { createCore, type ElectricCore, type ShapeHandle } from '@circuits/api'
+import { DurableStreamTestServer } from '@circuits/ds-rust'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { foldStream, waitFor } from './engine-native.js'
@@ -26,15 +26,15 @@ async function spawnLibraryEngine(
   extraEnv: Record<string, string> = {},
 ): Promise<{ url: string; proc: ChildProcess }> {
   buildEngine()
-  const proc = spawn(join(root, 'target/debug/electric-circuits-engine'), [], {
+  const proc = spawn(join(root, 'target/debug/circuits-engine'), [], {
     env: {
       ...process.env,
       DATABASE_URL: '',
-      ELECTRIC_CIRCUITS_PG_URL: '',
-      ELECTRIC_CIRCUITS_DS_URL: dsUrl,
-      ELECTRIC_CIRCUITS_BIND: '127.0.0.1:0',
-      ELECTRIC_CIRCUITS_TRACE: '0',
-      ELECTRIC_CIRCUITS_LOG: 'warn',
+      CIRCUITS_PG_URL: '',
+      CIRCUITS_DS_URL: dsUrl,
+      CIRCUITS_BIND: '127.0.0.1:0',
+      CIRCUITS_TRACE: '0',
+      CIRCUITS_LOG: 'warn',
       ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -105,9 +105,9 @@ describe('native library-mode writes', () => {
     ds = new DurableStreamTestServer({ port: 0 })
     const dsUrl = await ds.start()
     const started = await spawnLibraryEngine(dsUrl, {
-      ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
-      ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '60',
-      ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
+      CIRCUITS_SHAPE_IDLE_SECS: '1',
+      CIRCUITS_SHAPE_DORMANT_TTL_SECS: '60',
+      CIRCUITS_RETENTION_SWEEP_SECS: '1',
     })
     engine = started.proc
     core = createCore({ dsUrl, engineUrl: started.url })

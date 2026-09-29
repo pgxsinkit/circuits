@@ -175,7 +175,7 @@ spike measured the actual cost and refuted that premise:
   a small file (`RoaringBitmap::serialize_into` per feed).
 
 So the feed set does **not** move to disk. It stays a host-side bitmap, and the spill machinery
-(`ELECTRIC_CIRCUITS_SUBQ_STORAGE_*`) now covers only the **contributor** relation still in the
+(`CIRCUITS_SUBQ_STORAGE_*`) now covers only the **contributor** relation still in the
 circuit — kept because a high-selectivity inner query could grow it, with the default a
 candidate to flip off (a separate, gated follow-up; see the spike §4c). Checkpoint/restore of
 the feed bitmaps and the contributor relation (a tracked follow-up) is now

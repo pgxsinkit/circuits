@@ -21,7 +21,7 @@
 
 import { createServer, request } from 'node:http'
 
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, sleep, waitFor } from './engine-native.js'
@@ -191,7 +191,7 @@ describe('a change the sequencer cannot process (ADR-0010)', () => {
     h = await bootHarness(schema, {
       // The reconciler parked at an hour: the drift must go through the ingest path (the `Relation`
       // message), which is the case where the sequencer can be behind it.
-      engineEnv: { ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS: '3600' },
+      engineEnv: { CIRCUITS_SCHEMA_RECONCILE_SECS: '3600' },
       wrapEngineDs: async (upstreamUrl) => {
         proxy = await startChangeReadProxy(upstreamUrl)
         return proxy

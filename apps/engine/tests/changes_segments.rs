@@ -18,11 +18,11 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::changelog::{
+use circuits_engine::changelog::{
     ChangeLogConfig, ChangeLogWriter, ChangesState, LogPosition, SegmentPin, next_segment_for_reader,
     plan_segment_deletion, resolve_current, rotation_envelope, segment_path, should_rotate,
 };
-use electric_circuits_engine::ds::DsClient;
+use circuits_engine::ds::DsClient;
 
 /// A durable-streams stub whose only interesting state is which streams exist and which are closed.
 #[derive(Clone, Default)]

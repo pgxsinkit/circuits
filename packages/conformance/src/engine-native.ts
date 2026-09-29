@@ -1,10 +1,10 @@
 // Helpers for driving the engine through its NATIVE surface only — `POST /shapes`, SQL against the
-// system of record, and raw durable-streams reads. No Electric adapter, no `@electric-circuits/client`,
+// system of record, and raw durable-streams reads. No Electric adapter, no `@circuits/client`,
 // no `headers.lsn`: this is the path a consumer that dedups on ds offsets and aligns on
 // `GET /replication/lsn` actually exercises.
 
 import pgpkg from 'pg'
-import type { Row, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Row, StreamEnvelope } from '@circuits/protocol'
 
 import type { Harness } from './harness.js'
 

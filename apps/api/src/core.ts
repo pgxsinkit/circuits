@@ -1,4 +1,4 @@
-// electric-circuits "core": the logic behind the tRPC procedures. Writes append State-Protocol
+// Circuits "core": the logic behind the tRPC procedures. Writes append State-Protocol
 // envelopes directly to the current segment of the durable-streams change log (decoupled from the
 // engine, which tails it). Schema definition and shape lifecycle are forwarded to the Rust engine.
 
@@ -13,7 +13,7 @@ import {
   type SubsetResult,
   toTableEnvelope,
   type Value,
-} from '@electric-circuits/protocol'
+} from '@circuits/protocol'
 
 export interface WriteInput {
   table: string
@@ -28,7 +28,7 @@ export interface ShapeHandle {
   table: string
   streamPath: string
   streamUrl: string
-  /** The subscription the create was recorded under (ADR-0008). See `@electric-circuits/protocol`. */
+  /** The subscription the create was recorded under (ADR-0008). See `@circuits/protocol`. */
   subscription?: string
   /** Seconds a subscription may go unrenewed before the engine releases it (`0` = never). */
   leaseSeconds?: number
@@ -62,7 +62,7 @@ export interface ElectricCore {
    * feed's deltas, re-checking view membership — so paging never becomes server-side range state.
    */
   createSubsetFeed(def: Pick<SubsetDef, 'table' | 'where' | 'columns'>, subscription?: string): Promise<ShapeHandle>
-  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — an electric-circuits
+  /** Register a scalar **aggregation** (COUNT/SUM/AVG/MIN/MAX) over a filter — a Circuits
    * extension (not in the Electric protocol). Streams a single value maintained incrementally. */
   createAggregate(def: AggregateDef, subscription?: string): Promise<ShapeHandle>
 }

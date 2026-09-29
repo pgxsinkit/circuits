@@ -1,4 +1,4 @@
-# Pinned to match the sibling Rust service, pgxsinkit/electric-circuits, so both
+# Pinned to match the sibling Rust service, pgxsinkit/circuits, so both
 # build on one toolchain in dev, CI, and the image builds.
 #
 # NOTE: this is NOT the same constraint circuits has. Circuits pins 1.96.0 because

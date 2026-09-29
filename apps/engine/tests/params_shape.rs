@@ -7,10 +7,10 @@ use axum::Router;
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::http::router;
-use electric_circuits_engine::schema::Schema;
+use circuits_engine::ds::DsClient;
+use circuits_engine::engine::Engine;
+use circuits_engine::http::router;
+use circuits_engine::schema::Schema;
 use tower::ServiceExt;
 
 /// Minimal fake ds: writes succeed; reads are empty + up-to-date (so the snapshot's materialize

@@ -1,5 +1,5 @@
 {
-  "name": "@electric-circuits/oracle",
+  "name": "@circuits/oracle",
   "description": "Reference implementation of shape semantics that the conformance suite compares the real system against.",
   "version": "0.0.0",
   "private": true,
@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-circuits/protocol": "workspace:*",
+    "@circuits/protocol": "workspace:*",
     "@electric-sql/pglite": "^0.5.3",
     "pg": "^8.13.1"
   },

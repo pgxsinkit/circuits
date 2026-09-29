@@ -1,4 +1,4 @@
-// Characterization of the Durable Streams operations Electric Circuits actually uses.  This is
+// Characterization of the Durable Streams operations Circuits actually uses.  This is
 // deliberately a real-process lane: the wrapper resolves the same pinned durable-streams Rust
 // binary used by the conformance harness and gives every test a fresh data directory and port.
 //
@@ -17,7 +17,7 @@ function stream(base: string, path: string, params?: Record<string, string>): st
   return url.toString()
 }
 
-describe('pgxsinkit durable-streams provider contract used by Electric Circuits', () => {
+describe('pgxsinkit durable-streams provider contract used by Circuits', () => {
   let server: DurableStreamTestServer
   let base: string
 

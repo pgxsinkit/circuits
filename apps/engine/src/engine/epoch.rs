@@ -28,7 +28,7 @@
 //!
 //! ## The two policies
 //!
-//! `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS` (default `true`) picks between them:
+//! `CIRCUITS_RESET_ON_SLOT_LOSS` (default `true`) picks between them:
 //!
 //! - **auto-reset** (Electric parity, the default): [`Engine::reset_epoch`] retires every shape —
 //!   active and dormant alike, each stream closed then deleted (ADR-0007) with a `Dropped` record —
@@ -48,11 +48,11 @@ use super::*;
 use crate::pg::SlotObservation;
 use crate::replication::Refused;
 
-/// `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS`, default `true`. Anything that spells "off" selects the
+/// `CIRCUITS_RESET_ON_SLOT_LOSS`, default `true`. Anything that spells "off" selects the
 /// refuse policy; everything else (including a value nobody meant) keeps the safe-by-default
 /// self-healing behaviour.
 fn auto_reset_from_env() -> bool {
-    match std::env::var("ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS") {
+    match std::env::var("CIRCUITS_RESET_ON_SLOT_LOSS") {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
         Err(_) => true,
     }
@@ -158,7 +158,7 @@ impl std::fmt::Display for EpochBreakReason {
 }
 
 /// The engine is refusing every shape read and create because its epoch broke and the policy is
-/// `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`.
+/// `CIRCUITS_RESET_ON_SLOT_LOSS=false`.
 ///
 /// A typed error for the same reason [`Degraded`] is one: the HTTP layer maps it to 503 by downcast,
 /// never by matching message text. It is deliberately **not** `Degraded` — that latch means "lost
@@ -268,7 +268,7 @@ pub(crate) struct EpochState {
     resetting: std::sync::atomic::AtomicBool,
     /// Cuts the ingestor's reconnect backoff short when the epoch is rebound.
     wake: tokio::sync::Notify,
-    /// `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS`, read once at construction.
+    /// `CIRCUITS_RESET_ON_SLOT_LOSS`, read once at construction.
     auto_reset: bool,
 }
 
@@ -391,7 +391,7 @@ impl Engine {
     /// refusal on every reconnect attempt, so nothing is silent.
     pub(crate) fn log_refuse_policy(&self, reason: EpochBreakReason) {
         tracing::error!(
-            "ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false: ingest is stopped and every shape route \
+            "CIRCUITS_RESET_ON_SLOT_LOSS=false: ingest is stopped and every shape route \
              answers 503 (reason '{reason}'). POST /epoch/reset to retire every shape, bind a new \
              epoch and resume."
         );
@@ -781,7 +781,7 @@ mod tests {
         SlotBinding {
             system_identifier: "7300000000000000001".to_string(),
             timeline_id: 1,
-            slot: "electric_circuits".to_string(),
+            slot: "circuits".to_string(),
             bound_at: "2026-08-21T10:00:00.000Z".to_string(),
         }
     }

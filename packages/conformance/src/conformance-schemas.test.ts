@@ -7,7 +7,7 @@
 // Everything here is driven through the NATIVE surface (`POST /shapes` + raw durable-streams reads)
 // plus the compat `GET /v1/shape`, because those are the two boundaries a table name crosses.
 
-import type { Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'
 import { applyOp, bootHarness, drainEngine, type Harness } from './harness.js'
@@ -71,7 +71,7 @@ describe('conformance: two schemas, one table name', () => {
 
   // Boot sanity: both relations really exist in their own schemas (the oracle's createPgTables had
   // to CREATE SCHEMA for the non-public one) and both were introspected by the engine.
-  it('introspects both schemas from ELECTRIC_CIRCUITS_PG_TABLES', async () => {
+  it('introspects both schemas from CIRCUITS_PG_TABLES', async () => {
     const rows = await pgQuery(
       h,
       `select table_schema from information_schema.tables

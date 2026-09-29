@@ -31,7 +31,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Rust engine tests
-        run: cargo test -p electric-circuits-engine
+        run: cargo test -p circuits-engine
 
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4

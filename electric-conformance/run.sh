@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run ElectricSQL's own conformance tests against electric-circuits's /v1/shape adapter.
+# Run ElectricSQL's own conformance tests against circuits's /v1/shape adapter.
 #
 # The test files in this directory are Elixir tests that execute INSIDE an ElectricSQL checkout
 # (they use Electric's official Electric.Client, OracleHarness/ShapeChecker, and generators).
@@ -20,7 +20,7 @@
 # the launcher boots its own ephemeral Postgres.
 #
 # Note: copying overwrites `test/integration/subquery_*_test.exs` in the Electric checkout with
-# the electric-circuits variants (same test bodies, swapped setup) — use a throwaway clone if you
+# the circuits variants (same test bodies, swapped setup) — use a throwaway clone if you
 # don't want the checkout modified.
 set -euo pipefail
 
@@ -33,7 +33,7 @@ suite="${1:-all}"
 # rooted in this repo on exit.
 cleanup() {
   pkill -f "$repo/.*electric-adapter.ts" 2>/dev/null || true
-  pkill -f "$repo/target/release/electric-circuits-engine" 2>/dev/null || true
+  pkill -f "$repo/target/release/circuits-engine" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -47,7 +47,7 @@ fi
 sync="$ELECTRIC_DIR/packages/sync-service"
 
 echo "==> building the release engine"
-(cd "$repo" && cargo build --release -p electric-circuits-engine)
+(cd "$repo" && cargo build --release -p circuits-engine)
 
 echo "==> copying test files into $sync"
 cp "$here/electric_circuits_oracle_test.exs" \
@@ -57,7 +57,7 @@ cp "$here/electric_circuits_oracle_test.exs" \
    "$sync/test/integration/"
 cp "$here/el_ivm_setup.ex" "$sync/test/support/"
 
-export ELECTRIC_CIRCUITS_DIR="$repo"
+export CIRCUITS_DIR="$repo"
 cd "$sync"
 [ -d deps ] || (echo "==> mix deps.get" && mix deps.get)
 

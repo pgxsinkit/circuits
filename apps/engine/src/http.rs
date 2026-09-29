@@ -16,7 +16,7 @@ pub fn router(engine: Engine) -> Router {
     router_with_introspection(engine, true)
 }
 
-/// `introspection = false` (`ELECTRIC_CIRCUITS_TRACE=0`) leaves the visualizer/introspection surface
+/// `introspection = false` (`CIRCUITS_TRACE=0`) leaves the visualizer/introspection surface
 /// unregistered — `/trace` (SSE), `/graph`(`/node`), `/state`(`/node`) all 404. With no route there
 /// can be no `/trace` subscriber, so the per-envelope trace instrumentation stays on its
 /// zero-subscriber fast path (one atomic load). The surface is unauthenticated when enabled.
@@ -46,7 +46,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/table/{table}/rows", post(insert_table_row).delete(delete_table_rows))
         .route("/subqueries", get(subquery_stats))
         .route("/replication/lsn", get(replication_lsn))
-        // Operator recovery from a broken epoch under ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false
+        // Operator recovery from a broken epoch under CIRCUITS_RESET_ON_SLOT_LOSS=false
         // (ADR-0004): retire every shape, bind a new epoch, resume ingest.
         .route("/epoch/reset", post(epoch_reset))
         .route("/metrics", get(get_metrics))
@@ -262,7 +262,7 @@ struct ShapeResp {
     #[serde(skip_serializing_if = "Option::is_none")]
     subscription: Option<String>,
     /// How long a subscription may go unrenewed before the engine releases it
-    /// (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse, because dormancy is off).
+    /// (`CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse, because dormancy is off).
     /// The renewal cadence is the server's to set, so clients read it from here rather than guess.
     #[serde(skip_serializing_if = "Option::is_none")]
     lease_seconds: Option<u64>,
@@ -353,7 +353,7 @@ struct AggregateReq {
     subscription: Option<String>,
 }
 
-/// Create a scalar aggregation shape (electric-circuits extension; not in the Electric protocol).
+/// Create a scalar aggregation shape (Circuits extension; not in the Electric protocol).
 async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
@@ -570,7 +570,7 @@ struct ReleaseShapeQuery {
 ///
 /// Both forms are **durable before they are acknowledged** (ADR-0008): this answers only once the
 /// `Left`/`Dropped` is in the restart contract, because a `200` here is a promise that the release or
-/// the purge survives a restart — and `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS=0` is a supported setting in
+/// the purge survives a restart — and `CIRCUITS_SHAPE_IDLE_SECS=0` is a supported setting in
 /// which no lease will ever repair a record that went missing. So it blocks for as long as storage is
 /// down; a client timeout means "no answer", never "not done", and retrying is safe (a repeat finds
 /// the mutation applied and waits on the same barrier). Cancelling the request cancels nothing: the
@@ -779,7 +779,7 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
     }))
 }
 
-/// `POST /epoch/reset` — the operator's half of `ELECTRIC_CIRCUITS_RESET_ON_SLOT_LOSS=false`:
+/// `POST /epoch/reset` — the operator's half of `CIRCUITS_RESET_ON_SLOT_LOSS=false`:
 /// retire every shape, bind a new epoch on a fresh slot, and let ingest resume.
 ///
 /// Refused with 409 unless the epoch is actually broken. It is a destructive operation (every shape

@@ -1,16 +1,16 @@
-# @electric-circuits/client
+# @circuits/client
 
-The browser/Node client for the extended electric-circuits API: a typed tRPC client over
-[`@electric-circuits/api`](../../apps/api/README.md) plus `@durable-streams/state` for materializing
+The browser/Node client for the extended Circuits API: a typed tRPC client over
+[`@circuits/api`](../../apps/api/README.md) plus `@durable-streams/state` for materializing
 shape streams into live TanStack DB collections. (ElectricSQL clients don't use this package —
 they sync straight from the engine's `/v1/shape`.)
 
 ```ts
-import { createClient } from '@electric-circuits/client'
+import { createClient } from '@circuits/client'
 
 const client = createClient({
   apiUrl,            // the tRPC API server
-  schema,            // Schema from @electric-circuits/protocol
+  schema,            // Schema from @circuits/protocol
   dsBaseUrl,         // optional: durable-streams base override (e.g. '/ds' behind a dev proxy)
   liveMode,          // true (SSE, default) | 'sse' | 'long-poll'
 })
@@ -135,7 +135,7 @@ the claim under that name and returns it on the handle together with `leaseSecon
   reference on a shared shape.) `client.close()` tears down everything still open.
 - **The subscription is a lease, so the client renews it.** Native reads go straight to
   durable-streams, where the engine cannot see them, so an un-renewed claim is released after
-  `leaseSeconds` (the engine's `ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`) and the shape follows its
+  `leaseSeconds` (the engine's `CIRCUITS_SHAPE_IDLE_SECS`) and the shape follows its
   retention lifecycle. Each open materialization renews on a third of that window automatically; a
   caller whose timers do not run (a suspended tab, a test that controls time) can say it explicitly
   with `shape.renew()` / `subset.renew()` / `aggregate.renew()` — the same create with the same id,

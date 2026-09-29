@@ -1,7 +1,7 @@
 // PostgreSQL's supported scalar domain must survive the native query path without JSON precision
 // loss. The published client is the external consumer here; no engine internals are involved.
 
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { pgQuery } from './engine-native.js'

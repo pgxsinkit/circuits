@@ -1,4 +1,4 @@
-// Cross-language contract for electric-circuits.
+// Cross-language contract for Circuits.
 //
 // These JSON shapes are the single source of truth shared by the TS API/oracle/client
 // and the Rust dbsp engine (which mirrors them with serde). Keep them minimal and stable.
@@ -157,7 +157,7 @@ export interface ShapeHandle {
   subscription?: string
   /**
    * How long the subscription may go unrenewed before the engine releases it, in seconds
-   * (`ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse). The renewal cadence is the
+   * (`CIRCUITS_SHAPE_IDLE_SECS`; `0` = leases never lapse). The renewal cadence is the
    * server's to set — read it from here rather than assuming one.
    */
   leaseSeconds?: number
@@ -206,7 +206,7 @@ export interface SubsetResult {
   lsn: string
 }
 
-/** Scalar aggregation functions (an electric-circuits extension — not part of the Electric protocol). */
+/** Scalar aggregation functions (a Circuits extension — not part of the Electric protocol). */
 export type AggFn = 'count' | 'sum' | 'avg' | 'min' | 'max'
 
 /** A scalar aggregation over a filtered set, maintained incrementally by the engine and streamed as a

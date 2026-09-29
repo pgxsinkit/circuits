@@ -2,7 +2,7 @@
 // loaded page boundary by the published client. Those two comparisons must agree for every text
 // value or an unloaded row can enter (or a loaded row can leave) the window spuriously.
 
-import type { Row, Schema } from '@electric-circuits/protocol'
+import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { pgQuery, waitFor } from './engine-native.js'

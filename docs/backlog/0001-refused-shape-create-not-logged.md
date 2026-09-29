@@ -16,7 +16,7 @@ surface.
 - The caller (pgxsinkit's control plane) maps every engine error to a `503 sync engine unavailable`
   for its own client and, today, drops the body too (pgxsinkit backlog 0018). So at INFO the engine
   says nothing while it refuses the same shape once a second.
-- Seen on the emergent dev cluster, 2026-09-11: the engine's `ELECTRIC_CIRCUITS_PG_TABLES` had
+- Seen on the emergent dev cluster, 2026-09-11: the engine's `CIRCUITS_PG_TABLES` had
   drifted from the client registry; `public.competency_association` was untracked, so every
   `POST /shapes` for the shape on it was refused for over an hour. The engine's log for that hour
   held only the periodic `WARNING: there is no transaction in progress` lines from the metrics poll

@@ -101,7 +101,7 @@ impl crate::heap_size::HeapSize for Envelope {
 
 /// What one envelope costs to hold in memory: its inline representation plus the heap it owns.
 ///
-/// This is the quantity `ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES` is measured in (ADR-0003), so the knob
+/// This is the quantity `CIRCUITS_TXN_MEMORY_BYTES` is measured in (ADR-0003), so the knob
 /// counts what is actually held rather than what the same data would serialize to. It is a lower
 /// bound in the same sense as every other [`crate::heap_size::HeapSize`] estimate (allocator
 /// overhead and `serde_json::Map` bucket overhead are not modelled).
@@ -218,7 +218,7 @@ pub fn is_inconsistent(e: &anyhow::Error) -> bool {
 /// normal case in a compose/Kubernetes start, so it must back off rather than exit `EX_CONFIG`.
 /// Deliberately narrow — it forgives the TRANSPORT and nothing else:
 ///
-/// * `reqwest::Error::is_builder` (an unusable `ELECTRIC_CIRCUITS_DS_URL`) is **not** forgiven: no
+/// * `reqwest::Error::is_builder` (an unusable `CIRCUITS_DS_URL`) is **not** forgiven: no
 ///   amount of waiting reshapes a URL;
 /// * `is_decode` (a body that is not what it claims) is **not** forgiven — that is a malformed
 ///   catalog, which is fatal by design;

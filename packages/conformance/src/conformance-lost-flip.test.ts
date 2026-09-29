@@ -12,7 +12,7 @@
 // connection reset, a failover, or a statement timeout looks like from the engine's side.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 import { createShape, lockTable, lockWaiters, pgQuery, streamKeys, waitFor } from './engine-native.js'

@@ -3,8 +3,8 @@
 // specific mutation, drain, and assert the client materialization equals the pg oracle (and check the
 // specific row entered/left). Convergence is the contract — not Electric's exact control-message stream.
 
-import type { ShapeMaterialization } from '@electric-circuits/client'
-import type { Predicate, Schema, ShapeDef } from '@electric-circuits/protocol'
+import type { ShapeMaterialization } from '@circuits/client'
+import type { Predicate, Schema, ShapeDef } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { formatCompare } from './compare.js'
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from './harness.js'

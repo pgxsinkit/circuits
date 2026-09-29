@@ -17,7 +17,7 @@
 //      mode, and nothing about transaction size retired the shape.
 
 import pgpkg from 'pg'
-import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Row, Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 
@@ -38,8 +38,8 @@ const ROWS = 4000
  * 16 KiB append budget is a few dozen — so `ROWS` rows in one transaction spill and chunk hard.
  */
 const knobs = {
-  ELECTRIC_CIRCUITS_TXN_MEMORY_BYTES: '4096',
-  ELECTRIC_CIRCUITS_CHANGES_APPEND_BYTES: '16384',
+  CIRCUITS_TXN_MEMORY_BYTES: '4096',
+  CIRCUITS_CHANGES_APPEND_BYTES: '16384',
 }
 
 let h: Harness

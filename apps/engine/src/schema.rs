@@ -1,4 +1,4 @@
-//! Schema types (deserialized from the control-plane JSON, mirroring `@electric-circuits/protocol`)
+//! Schema types (deserialized from the control-plane JSON, mirroring `@circuits/protocol`)
 //! and their compiled, positional runtime form, plus the **schema fingerprint** the engine compares
 //! against what Postgres now reports for a table (ADR-0005).
 

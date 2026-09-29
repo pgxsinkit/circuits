@@ -6,9 +6,9 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use electric_circuits_engine::ds::DsClient;
-use electric_circuits_engine::engine::Engine;
-use electric_circuits_engine::http::router;
+use circuits_engine::ds::DsClient;
+use circuits_engine::engine::Engine;
+use circuits_engine::http::router;
 use tower::ServiceExt; // for `oneshot`
 
 fn library_engine() -> Engine {
@@ -183,12 +183,12 @@ async fn delete_table_rows_rejects_unknown_table() {
 
 const INTROSPECTION_ROUTES: &[&str] = &["/trace", "/graph", "/graph/node", "/state", "/state/node"];
 
-/// `ELECTRIC_CIRCUITS_TRACE=0` (introspection off) removes the visualizer/introspection surface entirely
+/// `CIRCUITS_TRACE=0` (introspection off) removes the visualizer/introspection surface entirely
 /// — the routes are never registered, so `/trace` can never gain a subscriber and the hot path
 /// keeps its zero-subscriber fast path. Everything else keeps serving.
 #[tokio::test]
 async fn introspection_disabled_unregisters_viz_routes() {
-    use electric_circuits_engine::http::router_with_introspection;
+    use circuits_engine::http::router_with_introspection;
     for route in INTROSPECTION_ROUTES {
         let res = router_with_introspection(library_engine(), false)
             .oneshot(Request::builder().uri(*route).body(Body::empty()).unwrap())

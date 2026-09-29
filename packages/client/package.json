@@ -1,6 +1,6 @@
 {
-  "name": "@electric-circuits/client",
-  "description": "Browser/Node client for the extended electric-circuits API: a typed tRPC client adding subset queries and live aggregations on top of the Electric client.",
+  "name": "@circuits/client",
+  "description": "Browser/Node client for the extended circuits API: a typed tRPC client adding subset queries and live aggregations on top of the Electric client.",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -11,8 +11,8 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@electric-circuits/protocol": "workspace:*",
-    "@electric-circuits/api": "workspace:*",
+    "@circuits/protocol": "workspace:*",
+    "@circuits/api": "workspace:*",
     "@trpc/client": "^11.18.0",
     "@durable-streams/client": "0.2.6",
     "@durable-streams/state": "^0.3.1",

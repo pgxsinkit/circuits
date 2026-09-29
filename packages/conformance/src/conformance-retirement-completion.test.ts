@@ -10,7 +10,7 @@
 
 import { createServer, request } from 'node:http'
 
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'

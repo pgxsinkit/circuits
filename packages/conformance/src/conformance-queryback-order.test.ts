@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { Schema } from '@electric-circuits/protocol'
+import type { Schema } from '@circuits/protocol'
 
 import { bootHarness, drainEngine, type Harness } from './harness.js'
 import { createShape, foldStream, pgQuery, waitFor } from './engine-native.js'

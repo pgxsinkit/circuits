@@ -271,7 +271,7 @@ pub fn init_otel() -> SdkMeterProvider {
     let _ = PROM_REGISTRY.set(registry);
 
     let provider = SdkMeterProvider::builder().with_reader(exporter).build();
-    let meter = provider.meter("electric_circuits_engine");
+    let meter = provider.meter("circuits_engine");
 
     // One observable gauge per metric; each callback reads the lock-free published snapshot.
     macro_rules! gauge {
@@ -435,7 +435,7 @@ pub fn init_otel() -> SdkMeterProvider {
     engine_gauge!("engine_replication_slot_active", "1 while a walsender holds the slot", replication_slot_active, "");
 
     // Touch a KeyValue so the import is used even if labels are added later.
-    let _ = KeyValue::new("service.name", "electric-circuits-engine");
+    let _ = KeyValue::new("service.name", "circuits-engine");
     provider
 }
 

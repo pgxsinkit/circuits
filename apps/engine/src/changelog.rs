@@ -176,9 +176,9 @@ pub fn offset_bytes(offset: &str) -> Option<u64> {
 ///
 /// | Env var | Default | Meaning |
 /// |---|---|---|
-/// | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Rotate once the current segment reaches this size. `0` disables the size criterion. |
-/// | `ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Rotate once the current segment is this old. `0` disables the age criterion. |
-/// | `ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted (and the segment deleted). `0` disables evict-before-delete — a dormant shape then pins its segment forever. |
+/// | `CIRCUITS_CHANGES_SEGMENT_BYTES` | `1073741824` (1 GiB) | Rotate once the current segment reaches this size. `0` disables the size criterion. |
+/// | `CIRCUITS_CHANGES_SEGMENT_SECS` | `86400` (1 day) | Rotate once the current segment is this old. `0` disables the age criterion. |
+/// | `CIRCUITS_CHANGES_RETAIN_SECS` | `604800` (7 days) | How long a rotated-out segment may stay pinned by a dormant shape before that shape is evicted (and the segment deleted). `0` disables evict-before-delete — a dormant shape then pins its segment forever. |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChangeLogConfig {
     pub segment_bytes: u64,
@@ -204,12 +204,12 @@ impl ChangeLogConfig {
     pub fn from_env() -> Self {
         let d = ChangeLogConfig::default();
         ChangeLogConfig {
-            segment_bytes: env_u64("ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES", d.segment_bytes),
+            segment_bytes: env_u64("CIRCUITS_CHANGES_SEGMENT_BYTES", d.segment_bytes),
             segment_age: Duration::from_secs(env_u64(
-                "ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS",
+                "CIRCUITS_CHANGES_SEGMENT_SECS",
                 d.segment_age.as_secs(),
             )),
-            retain: Duration::from_secs(env_u64("ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS", d.retain.as_secs())),
+            retain: Duration::from_secs(env_u64("CIRCUITS_CHANGES_RETAIN_SECS", d.retain.as_secs())),
         }
     }
 }

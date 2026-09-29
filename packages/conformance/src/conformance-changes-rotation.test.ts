@@ -16,7 +16,7 @@
 // 7 day retain window — see `apps/engine/README.md`).
 
 import pgpkg from 'pg'
-import type { Row, Schema, StreamEnvelope } from '@electric-circuits/protocol'
+import type { Row, Schema, StreamEnvelope } from '@circuits/protocol'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { bootHarness, drainEngine, engineChangesOffset, engineChangesSegment, type Harness } from './harness.js'
 
@@ -29,13 +29,13 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 /** Second-scale segmentation + retention, so a test can watch a week of production behaviour. */
 const knobs = {
   // Age-only rotation: a test cannot write a gigabyte, and every write here is a commit boundary.
-  ELECTRIC_CIRCUITS_CHANGES_SEGMENT_BYTES: '0',
-  ELECTRIC_CIRCUITS_CHANGES_SEGMENT_SECS: '2',
-  ELECTRIC_CIRCUITS_CHANGES_RETAIN_SECS: '4',
-  ELECTRIC_CIRCUITS_RETENTION_SWEEP_SECS: '1',
-  ELECTRIC_CIRCUITS_SHAPE_IDLE_SECS: '1',
+  CIRCUITS_CHANGES_SEGMENT_BYTES: '0',
+  CIRCUITS_CHANGES_SEGMENT_SECS: '2',
+  CIRCUITS_CHANGES_RETAIN_SECS: '4',
+  CIRCUITS_RETENTION_SWEEP_SECS: '1',
+  CIRCUITS_SHAPE_IDLE_SECS: '1',
   // The dormancy TTL must not be what evicts in test 3 — the change log's retain window must be.
-  ELECTRIC_CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
+  CIRCUITS_SHAPE_DORMANT_TTL_SECS: '3600',
 }
 
 let h: Harness

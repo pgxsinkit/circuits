@@ -1,6 +1,6 @@
-# Electric Circuits
+# Circuits
 
-**Electric Circuits make your app's queries live.** Write the queries your app already runs — joins,
+**Circuits make your app's queries live.** Write the queries your app already runs — joins,
 aggregates, subqueries — and every result becomes a live primitive your code programs against: bind
 it to a component, sync it into a local collection, feed it to an agent. No fetch, poll, refetch,
 invalidate.
@@ -12,7 +12,7 @@ a copy of your data. A new user, a new parameter, a whole new query is data flow
 dataflow that's already there.
 
 The engine speaks the Electric wire protocol (`GET /v1/shape`, works with the unmodified ElectricSQL
-client) plus an extended API (`@electric-circuits/client`) that adds subset queries and live
+client) plus an extended API (`@circuits/client`) that adds subset queries and live
 aggregations.
 
 ## What is a live query?
@@ -37,7 +37,7 @@ queries** instead, so live-query maintenance never involves range state. Full se
 
 ## Under the hood: DBSP
 
-Electric Circuits is built on [DBSP](https://docs.rs/dbsp), Feldera's theory and Rust library of
+Circuits is built on [DBSP](https://docs.rs/dbsp), Feldera's theory and Rust library of
 incremental computation: data is **Z-sets** (rows with signed weights), change is a **delta**
 (insert `+1`, delete `−1`, update both), and queries are operator pipelines where each operator
 consumes a delta and emits the delta of its output. Keeping a result up to date never re-runs the
@@ -97,7 +97,7 @@ model: [docs/ivm-engine-internals.md](docs/ivm-engine-internals.md).
                       DURABLE STREAMS   shape/<id>         (one feed per DISTINCT live query)
                          │  read / long-poll
                          ▼
-                      CLIENTS   Electric client (/v1/shape)  or  @electric-circuits/client
+                      CLIENTS   Electric client (/v1/shape)  or  @circuits/client
 ```
 
 Postgres owns durability and transactions; [durable streams](https://durablestreams.com) is the log
@@ -110,7 +110,7 @@ metadata and the shared inner sets. Full design:
 - **The Electric protocol** — `GET /v1/shape`, compatible with the ElectricSQL TS client and
   validated against Electric's own oracle/property/integration tests
   ([`electric-conformance/`](electric-conformance/README.md)).
-- **The extended API** (`@electric-circuits/client`) — live queries plus **subset queries**
+- **The extended API** (`@circuits/client`) — live queries plus **subset queries**
   (ordered pages + a shared live tail; infinite scroll) and **aggregations** (live
   COUNT/SUM/AVG/MIN/MAX with SQL NULL semantics).
 
@@ -144,13 +144,13 @@ walkthrough), `pnpm demo:web` (minimal end-to-end app).
 pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see docker/README.md
 ```
 
-Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@electric-circuits/client` at
+Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@circuits/client` at
 `http://localhost:8790`.
 
 ### Using the extended client
 
 ```ts
-import { createClient } from '@electric-circuits/client'
+import { createClient } from '@circuits/client'
 const client = createClient({ apiUrl, schema })
 
 // a live query (materialized TanStack DB collection)

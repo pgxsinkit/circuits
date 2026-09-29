@@ -27,7 +27,7 @@
 //!
 //! ## Restarting is replay-safe
 //!
-//! A table with a counts pipeline (`ELECTRIC_CIRCUITS_DBSP_COUNTS`) has no runtime rebuild:
+//! A table with a counts pipeline (`CIRCUITS_DBSP_COUNTS`) has no runtime rebuild:
 //! `Arrangements::start` builds the circuit ONCE at boot and seeds it from a group-aggregated
 //! snapshot. Rather than keep serving counts computed over a schema — or a row set — that no longer
 //! exists, the process **exits** after the retirements and catalog events have landed.
@@ -78,9 +78,9 @@ const IDENTITY_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(2);
 const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS`, default 60; `0` disables the reconciler.
+/// `CIRCUITS_SCHEMA_RECONCILE_SECS`, default 60; `0` disables the reconciler.
 fn reconcile_interval() -> std::time::Duration {
-    let secs = std::env::var("ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS")
+    let secs = std::env::var("CIRCUITS_SCHEMA_RECONCILE_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(60);
@@ -586,14 +586,14 @@ impl Engine {
     /// shape created afterwards would run against the stale schema. Each tick fingerprints every
     /// tracked table in one query and feeds any mismatch to the same drift handler.
     ///
-    /// Postgres mode only, and only while `ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS` is non-zero.
+    /// Postgres mode only, and only while `CIRCUITS_SCHEMA_RECONCILE_SECS` is non-zero.
     /// (Unresolved tables are retried by their own task regardless — see [`Self::unresolved`].)
     pub(crate) fn ensure_schema_reconciler(&self) {
         let Some(url) = self.pg_url.clone() else { return };
         let interval = reconcile_interval();
         if interval.is_zero() {
             tracing::warn!(
-                "schema reconciler disabled (ELECTRIC_CIRCUITS_SCHEMA_RECONCILE_SECS=0): DDL that no \
+                "schema reconciler disabled (CIRCUITS_SCHEMA_RECONCILE_SECS=0): DDL that no \
                  write follows, and ANY primary-key change (the replication stream cannot describe a \
                  primary key), will go unnoticed until the engine restarts"
             );
