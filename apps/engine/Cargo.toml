@@ -15,22 +15,24 @@ path = "src/main.rs"
 
 [dependencies]
 # Query engine, reintroduced as the storage-backed table-state layer (src/arrangements.rs):
-# one shared circuit whose arrangements spill to disk when tables grow. Version reqs kept at
-# minor-level so cargo unifies our direct deps with dbsp's own tree (so the rkyv/size-of/
-# feldera-macros derive macros match dbsp's expected rkyv 0.7).
-dbsp = "0.318"
-# default-features=false avoids rkyv's default `size_32`, which is mutually exclusive with
-# the `size_64` that dbsp selects (cargo unions features across dependents).
-rkyv = { version = "0.7", default-features = false, features = ["std", "size_64", "validation"] }
+# one shared circuit whose arrangements spill to disk when tables grow. The crates below it are
+# coupled to it: cargo has to unify them with dbsp's own tree, so that the rkyv/size-of/
+# feldera-macros derive macros and the trait impls our cell types use are the ones dbsp expects.
+dbsp = "0.357.0"
+# rkyv 0.7, not 0.8 (latest): dbsp archives with rkyv 0.7, and its `ArchivedDBData` bounds are on
+# 0.7's traits. default-features=false avoids rkyv's default `size_32`, which is mutually exclusive
+# with the `size_64` that dbsp selects (cargo unions features across dependents).
+rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_64", "validation"] }
 # dbsp uses Feldera's fork of size-of. The `SizeOf` derive emits hardcoded `size_of::` paths,
 # so the crate must be in scope under the name `size_of` (dbsp renames it the same way).
-# `ordered-float` feature pulls the SizeOf impl for OrderedFloat (used by our Float cell).
-size_of = { package = "feldera-size-of", version = "0.1.7", features = ["ordered-float"] }
-feldera-macros = "0.318"
+size_of = { package = "feldera-size-of", version = "0.1.7" }
+feldera-macros = "0.357.0"
 # `OrderedFloat` gives `Value::Float` the `Eq`/`Ord`/`Hash` a bare f64 lacks (map keys:
-# aggregate multisets, routing indexes). Pinned to 3.x to match feldera-size-of's SizeOf
-# impl; rkyv_64 matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
-ordered-float = { version = "3", features = ["rkyv_64", "rkyv_ck"] }
+# aggregate multisets, routing indexes). 4.x, not 5.x (latest), because it has to be the
+# ordered-float dbsp depends on: dbsp implements `OrdRepr` (the archived-vs-unarchived ordering
+# every `DBData` type needs since dbsp 0.357) for that crate's `OrderedFloat` only. rkyv_64
+# matches rkyv's size_64; rkyv_ck adds the validation/CheckBytes impl.
+ordered-float = { version = "4.6.0", features = ["rkyv_64", "rkyv_ck"] }
 anyhow = "1"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
@@ -59,8 +61,9 @@ libc = "0.2.186"
 # Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): `FeedSet` holds each shape's feed
 # membership as a `HashMap<feed_id, RoaringBitmap>` keyed by `u32` pk-id — the delete gate is a
 # synchronous `remove()`-returns-`true` check, no longer an in-circuit relation. Already in the
-# tree transitively (dbsp -> roaring 0.11.3). See docs/notes/2026-07-16-feed-set-representation-spike.md.
-roaring = "0.11"
+# tree transitively (dbsp -> roaring). See docs/notes/2026-07-16-feed-set-representation-spike.md.
+# 0.11.4, not 0.11.5 (latest): dbsp 0.357 requires exactly `=0.11.4`, and a graph holds one 0.11.x.
+roaring = "0.11.4"
 
 [dev-dependencies]
 # Drive the axum router in-process (Service::oneshot) for the HTTP endpoint tests.

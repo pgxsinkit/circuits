@@ -1,6 +1,7 @@
-# `mimalloc-rust-sys` (a transitive dependency via `dbsp`) vendors a mimalloc whose C source
-# uses `ATOMIC_VAR_INIT`, which C23 removed — and gcc >= 15 defaults to gnu23, so its build
-# script fails with "implicit declaration of function 'ATOMIC_VAR_INIT'". Pin build-script C
-# to gnu17 until dbsp moves off `mimalloc-rust`. Applies to `cc`-driven build scripts only.
+# `mimalloc-rust-sys` 1.7.2 (a transitive dependency via `dbsp`, still there in dbsp 0.357) vendors
+# a mimalloc whose C source uses `ATOMIC_VAR_INIT`, which C23 removed — and gcc >= 15 defaults to
+# gnu23, so its build script fails with "implicit declaration of function 'ATOMIC_VAR_INIT'"
+# (re-checked 2026-09-29 with gcc 15.2 and dbsp 0.357). Pin build-script C to gnu17 until dbsp
+# moves off `mimalloc-rust`. Applies to `cc`-driven build scripts only.
 [env]
 CFLAGS = "-std=gnu17"

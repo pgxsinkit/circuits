@@ -40,7 +40,7 @@ use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
 use dbsp::{MapHandle, OutputHandle, Runtime};
 use tokio::sync::{mpsc, oneshot};
 
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
 
@@ -54,7 +54,21 @@ pub type Assert = dbsp::operator::Update<Value, Value>;
 /// the old `Row([Int(id), Text(pk)])` key: 12 inline bytes with NO per-entry heap string (the
 /// string lives once in the dictionary), which is the memory win driving Task 2.1.
 #[derive(
-    Clone, Copy, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Copy,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct PkKey {
@@ -104,7 +118,7 @@ struct SpillConfig {
     ///
     /// dbsp treats a `Some` value as the **grand TOTAL** cache size and uses it verbatim — no
     /// further multiplication by worker count or thread-type (see `RuntimeInner::new` in
-    /// dbsp 0.318: `Some(cache_mib) => cache_mib * 1 MiB`, full stop). The ×nworkers×thread-types
+    /// dbsp 0.357: `Some(cache_mib) => cache_mib * 1 MiB`, full stop). The ×nworkers×thread-types
     /// scaling dbsp describes in its own docs only fires on ITS unset-default (`None` ⇒
     /// `256 MiB × nworkers × ThreadType::LENGTH(=2)`); for our 1-worker circuit that default is
     /// 512 MiB, which is why we always pass an explicit value here (see

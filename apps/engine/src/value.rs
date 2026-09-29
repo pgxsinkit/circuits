@@ -2,13 +2,13 @@
 //! and the weighted-delta pair `Tup2<Row, ZWeight>`.
 //!
 //! `Tup2`/`ZWeight` are dbsp's own (re-exported), and `Value`/`Row` carry the full
-//! `dbsp::DBData` derive stack (rkyv archive + SizeOf + IsNone) so they can be keys and
+//! `dbsp::DBData` derive stack (rkyv archive + SizeOf + IsNone + OrdRepr) so they can be keys and
 //! values in the storage-backed arrangements (`src/arrangements.rs`). The engine's hand
 //! rolled executors keep using them as plain Rust values; only the arrangement layer
 //! exercises the archive impls (batches serialized to layer files).
 
 use anyhow::{Context, Result, bail};
-use feldera_macros::IsNone;
+use feldera_macros::{IsNone, OrdRepr};
 use ordered_float::OrderedFloat;
 use rkyv::{Archive, Deserialize, Serialize};
 use size_of::SizeOf;
@@ -25,7 +25,20 @@ pub use dbsp::utils::Tup2;
 /// A scalar cell value. `Float` wraps `OrderedFloat` because a bare `f64` is not
 /// `Eq`/`Ord`/`Hash` and so could not be a map key (aggregate multisets, routing indexes).
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub enum Value {
@@ -34,7 +47,10 @@ pub enum Value {
     Int(i64),
     Text(String),
     Bool(bool),
-    Float(OrderedFloat<f64>),
+    // `skip`: an f64 owns no heap memory, so there are no children to count. It is how dbsp sizes
+    // its own `F64`, and it is needed because feldera-size-of implements `SizeOf` only for the
+    // ordered-float 3.x `OrderedFloat`, not for the 4.x one dbsp (and so this cell) uses.
+    Float(#[size_of(skip)] OrderedFloat<f64>),
 }
 
 /// Integers a JSON **number** round-trips through IEEE-754 double without loss: `2^53 - 1`. Beyond
@@ -131,7 +147,20 @@ impl Value {
 
 /// A row is a positional vector of cell values; the schema gives names to the positions.
 #[derive(
-    Clone, Default, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, SizeOf, Archive, Serialize, Deserialize, IsNone,
+    Clone,
+    Default,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    SizeOf,
+    Archive,
+    Serialize,
+    Deserialize,
+    IsNone,
+    OrdRepr,
 )]
 #[archive_attr(derive(Ord, Eq, PartialEq, PartialOrd, Hash))]
 pub struct Row(pub Vec<Value>);
