@@ -60,6 +60,9 @@ pub(crate) fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeig
     delta.iter().filter(|t| pred.matches(&t.0)).map(|t| (t.0.clone(), t.1)).collect()
 }
 
+/// One side of [`StandaloneIndex`]'s range conjuncts: column -> bound -> (shape id, strict).
+pub(crate) type BoundIndex = HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>;
+
 /// Index over standalone shapes by a **necessary conjunct** (`(column, op)` — see
 /// [`CompiledPredicate::access_leaf`]): a change row can only match a shape if the shape's
 /// necessary conjunct holds on that row, so per-change candidate lookup replaces the O(K)
@@ -72,9 +75,9 @@ pub(crate) struct StandaloneIndex {
     pub(crate) eq: HashMap<usize, HashMap<Value, Vec<String>>>,
     /// `col >/>= v` conjuncts: column -> bound -> (shape id, strict). A row value `x` satisfies
     /// bounds `< x` (any) and `== x` (non-strict only) — an ordered prefix scan.
-    pub(crate) lower: HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
+    pub(crate) lower: BoundIndex,
     /// `col </<= v` conjuncts, mirrored.
-    pub(crate) upper: HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
+    pub(crate) upper: BoundIndex,
     /// Shapes with no indexable conjunct — always candidates.
     pub(crate) scan: Vec<String>,
     /// Where each shape was placed, for removal.
@@ -137,12 +140,7 @@ impl StandaloneIndex {
         }
     }
 
-    pub(crate) fn remove_bound(
-        m: &mut HashMap<usize, std::collections::BTreeMap<Value, Vec<(String, bool)>>>,
-        col: usize,
-        value: &Value,
-        sid: &str,
-    ) {
+    pub(crate) fn remove_bound(m: &mut BoundIndex, col: usize, value: &Value, sid: &str) {
         if let Some(by_val) = m.get_mut(&col)
             && let Some(sids) = by_val.get_mut(value)
         {

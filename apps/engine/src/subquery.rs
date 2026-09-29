@@ -351,6 +351,11 @@ impl HeapSize for BufferedDelta {
 /// A `TableSchema` lookup shared with the engine's compiled schema.
 pub type SchemaMap = Arc<HashMap<TableRef, TableSchema>>;
 
+/// One node's inner-set index as [`SubqueryRegistry::node_value_index`] returns it: the true
+/// distinct-value count, the node's refcount, up to `cap` `(value, contributor-count)` pairs, and
+/// whether that list was truncated.
+pub type NodeValueIndex = (usize, usize, Vec<(serde_json::Value, usize)>, bool);
+
 /// Cheap, sampler-safe registry cardinalities (see [`SubqueryRegistry::mem_totals`]).
 pub struct MemTotals {
     pub nodes: usize,
@@ -722,11 +727,7 @@ impl SubqueryRegistry {
     /// The live **inner-set index** of one node (the visualizer's "see the index" view): up to `cap`
     /// `(value, contributor-count)` pairs, most-shared first, plus the true distinct count, refcount, and
     /// whether the list was truncated. This is the actual engine-maintained set, not derivable from topology.
-    pub fn node_value_index(
-        &self,
-        sig: &str,
-        cap: usize,
-    ) -> Option<(usize, usize, Vec<(serde_json::Value, usize)>, bool)> {
+    pub fn node_value_index(&self, sig: &str, cap: usize) -> Option<NodeValueIndex> {
         let n = self.nodes.get(sig)?;
         let (distinct, vals) = self.circuit.values_for_node(n.node_id, cap);
         let vals: Vec<(serde_json::Value, usize)> = vals.into_iter().map(|(v, c)| (v.to_json(), c)).collect();

@@ -3,13 +3,14 @@
 
 use super::*;
 
+/// What [`apply_envelope`] makes of one change event: the input Z-set delta, the originating txid
+/// and the commit LSN.
+pub(crate) type EnvelopeDelta = (Vec<Tup2<Row, ZWeight>>, Option<String>, Option<String>);
+
 /// Turn a table change event into the resulting input Z-set delta, plus the originating txid and
 /// commit LSN. The delta is computed entirely from the envelope's `value` (new row) and `old` (prior
 /// row, carried by replication under `REPLICA IDENTITY FULL`) — no in-memory `table_state`.
-pub(crate) fn apply_envelope(
-    ts: &TableSchema,
-    env: &Envelope,
-) -> Result<(Vec<Tup2<Row, ZWeight>>, Option<String>, Option<String>)> {
+pub(crate) fn apply_envelope(ts: &TableSchema, env: &Envelope) -> Result<EnvelopeDelta> {
     let txid = env.headers.txid.clone();
     let lsn = env.headers.lsn.clone();
     let to_row = |v: &serde_json::Value| -> Result<Row> {
