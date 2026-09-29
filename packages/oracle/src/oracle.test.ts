@@ -3,6 +3,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createOracle, type Oracle } from "./index.js";
 
+// The ids are numbers: order them as numbers, not as the strings a bare `sort()` compares.
+const byNumber = (a: unknown, b: unknown): number => Number(a) - Number(b);
+
 const schema: Schema = {
   tables: {
     users: {
@@ -52,7 +55,7 @@ describe("oracle", () => {
     });
 
     const active = await oracle.queryShape({ table: "users", where: { col: "active", op: "eq", value: true } });
-    expect(active.map((r) => r.id).sort()).toEqual([1, 3]);
+    expect(active.map((r) => r.id).sort(byNumber)).toEqual([1, 3]);
     // types round-trip exactly
     expect(active.find((r) => r.id === 1)).toMatchObject({ name: "Alice", age: 30, active: true, score: 9.5 });
   });
@@ -65,7 +68,7 @@ describe("oracle", () => {
       row: { id: 2, name: "Bob", age: 18, active: true, score: 3.2 },
     });
     let active = await oracle.queryShape({ table: "users", where: { col: "active", op: "eq", value: true } });
-    expect(active.map((r) => r.id).sort()).toEqual([1, 2, 3]);
+    expect(active.map((r) => r.id).sort(byNumber)).toEqual([1, 2, 3]);
 
     // Alice becomes inactive -> leaves the shape.
     await oracle.applyChange("users", {
@@ -74,7 +77,7 @@ describe("oracle", () => {
       row: { id: 1, name: "Alice", age: 30, active: false, score: 9.5 },
     });
     active = await oracle.queryShape({ table: "users", where: { col: "active", op: "eq", value: true } });
-    expect(active.map((r) => r.id).sort()).toEqual([2, 3]);
+    expect(active.map((r) => r.id).sort(byNumber)).toEqual([2, 3]);
   });
 
   it("delete removes a row", async () => {
@@ -107,7 +110,7 @@ describe("oracle", () => {
       },
     });
     // age>=20 -> ids 2,3,4,5 ; AND (active(2,4) OR score>4(5)) -> ids 2,4,5
-    expect(rows.map((r) => r.id).sort()).toEqual([2, 4, 5]);
+    expect(rows.map((r) => r.id).sort(byNumber)).toEqual([2, 4, 5]);
   });
 });
 

@@ -45,7 +45,7 @@ describe("native composite primary-key identity", () => {
     const shape = await createShape(h, { table: "items" });
     const rows = await foldStream(shape.streamUrl);
     expect(rows.size, "two distinct PostgreSQL primary keys must emit two native rows").toBe(2);
-    expect([...rows.values()].map((row) => row.payload).sort()).toEqual(["first", "second"]);
+    expect([...rows.values()].map((row) => String(row.payload)).sort()).toEqual(["first", "second"]);
   });
 
   it("includes every composite primary-key column in a projected native shape", async () => {

@@ -2,7 +2,7 @@
 // machinery — enter/leave churn, pk-changing "updates", re-insert of a deleted pk, idempotent and
 // redundant ops, high-churn over a tiny pk space, and multiple shapes across multiple tables.
 
-import type { Schema, ShapeDef } from "@circuits/protocol";
+import type { Row, Schema, ShapeDef } from "@circuits/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { formatCompare } from "./compare.js";
@@ -24,7 +24,7 @@ const usersSchema: Schema = {
   },
 };
 const COLUMNS = ["id", "name", "age", "active", "score"];
-const mk = (id: number, active: boolean, age = 20): import("@circuits/protocol").Row => ({
+const mk = (id: number, active: boolean, age = 20): Row => ({
   id,
   name: "alpha",
   age,

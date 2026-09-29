@@ -289,9 +289,11 @@ describe("window ordering agrees with the engine, not with UTF-16", () => {
     // The reproduction: JavaScript's `<` compares UTF-16 code units, so the emoji's leading
     // surrogate (D83D) sorts before U+E000 — while PostgreSQL, the engine's evaluator and this
     // comparator all put U+1F600 after it.
-    expect("\u{1F600}" < "\uE000").toBe(true);
-    expect(cmpCodePoints("\uE000", "\u{1F600}")).toBeLessThan(0);
-    expect(cmpCodePoints("\u{1F600}", "\uE000")).toBeGreaterThan(0);
+    const emoji = "\u{1F600}";
+    const privateUse = "\uE000";
+    expect(emoji < privateUse).toBe(true);
+    expect(cmpCodePoints(privateUse, emoji)).toBeLessThan(0);
+    expect(cmpCodePoints(emoji, privateUse)).toBeGreaterThan(0);
   });
 
   it("is a total order: equality, prefixes, and the ordinary ASCII case", () => {

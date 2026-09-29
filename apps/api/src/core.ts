@@ -92,7 +92,12 @@ export function createCore(opts: CoreOptions): CircuitsCore {
     return cachedSegment;
   }
 
-  async function engineJson<T>(path: string, init: RequestInit): Promise<T> {
+  // Extra headers are a plain record: they are spread over the JSON content type, and spreading an
+  // array or a Headers object (the rest of HeadersInit) would lose them.
+  async function engineJson<T>(
+    path: string,
+    init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> },
+  ): Promise<T> {
     const res = await doFetch(`${engineUrl}${path}`, {
       ...init,
       headers: { "content-type": "application/json", ...(init.headers ?? {}) },

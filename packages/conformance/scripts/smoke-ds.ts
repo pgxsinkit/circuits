@@ -103,7 +103,7 @@ async function main() {
   console.log("[streamdb live] change events seen =", JSON.stringify(liveSeen));
 
   sub.unsubscribe();
-  await db.close?.();
+  db.close?.();
   await server.stop();
   console.log("[done]");
   process.exit(0);

@@ -4,7 +4,7 @@
 import type { Schema, ShapeDef } from "@circuits/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { compareShapeSets, formatCompare } from "./compare.js";
+import { formatCompare } from "./compare.js";
 import { applyOp, bootHarness, drainEngine, type Harness, waitForConvergence } from "./harness.js";
 import { createSimulator, randomSeed } from "./simulator.js";
 

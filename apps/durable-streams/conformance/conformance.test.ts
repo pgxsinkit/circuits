@@ -65,7 +65,7 @@ beforeAll(async () => {
       ],
       { stdio: [`ignore`, `pipe`, `pipe`] },
     );
-    server.stderr?.on(`data`, (d: Buffer) => process.stderr.write(`[rust] ${d}`));
+    server.stderr?.on(`data`, (d: Buffer) => process.stderr.write(`[rust] ${d.toString()}`));
     server.on(`exit`, (code) => {
       if (code) process.stderr.write(`[rust] server exited with code ${code}\n`);
     });

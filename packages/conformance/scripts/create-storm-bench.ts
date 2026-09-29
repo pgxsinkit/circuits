@@ -1,16 +1,18 @@
-import pgpkg from "pg";
-
 // Micro-bench: 300 concurrent subquery-shape creations straight against the engine HTTP API
 // (no Electric adapter), replicating the fleet benchmark's shape template. Prints latency
 // percentiles + wall time so the serializer can be located.
+
+import type { Schema } from "@circuits/protocol";
+import pgpkg from "pg";
+
 import { bootHarness, drainEngine } from "../src/harness.js";
 
-const schema = {
+const schema: Schema = {
   tables: {
     parent: { columns: { id: { type: "text" }, group_id: { type: "int" }, name: { type: "text" } }, primaryKey: "id" },
     child: { columns: { id: { type: "text" }, parent_id: { type: "text" }, name: { type: "text" } }, primaryKey: "id" },
   },
-} as any;
+};
 
 const GROUPS = Number(process.env.GROUPS ?? 300);
 

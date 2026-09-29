@@ -128,7 +128,7 @@ function zodRowSchema(def: TableDef, cols?: string[]): z.ZodType {
   // When the shape projects a column subset, validate only those columns (+ pk) — the projected rows
   // genuinely omit the rest, so requiring them would reject every row. The pk is always present.
   const names = cols ? Array.from(new Set([def.primaryKey, ...cols])) : Object.keys(def.columns);
-  const shape: Record<string, z.ZodTypeAny> = {};
+  const shape: Record<string, z.ZodType> = {};
   for (const col of names) {
     const c = def.columns[col];
     if (!c) continue;
@@ -276,7 +276,7 @@ export function createClient(opts: {
           const sub = collection.subscribeChanges(listener.cb as never, { includeInitialState: true });
           listener.unsubscribe = () => sub.unsubscribe();
         }
-        await previousDb.close?.();
+        previousDb.close?.();
       };
 
       // Renew for as long as the materialization is open: the engine cannot see reads that go
@@ -305,7 +305,7 @@ export function createClient(opts: {
           // create landing after the release would re-take the claim this close just gave up
           // (see `startLeaseRenewal`). A `renew()` after this is a no-op.
           await lease.stop();
-          await db.close?.();
+          db.close?.();
           // Release OUR subscription: shapes are shared server-side, so every shape() must release
           // exactly the claim it took — by id, which is also what makes the retry inside
           // `deleteShapeWithRetry` safe.

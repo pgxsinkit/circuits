@@ -61,7 +61,8 @@ export interface EngineExit {
  */
 export interface RawEngine {
   proc: ChildProcess;
-  stderr(): string;
+  /** Everything the process has written to stderr so far. A closure, so it can be passed on detached. */
+  stderr: () => string;
   /** The bound base URL, once the process has printed `ENGINE_BINDING` (the port is open). */
   waitForBinding(timeoutMs?: number): Promise<string>;
   /** The bound base URL, once the boot has fully resolved (`ENGINE_LISTENING`). */
