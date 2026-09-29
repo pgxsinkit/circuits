@@ -1,29 +1,31 @@
 # syntax=docker/dockerfile:1
 #
-# Built and published by .github/workflows/docker.yml to
-# ghcr.io/pgxsinkit/durable-streams-rust. The build context is the repo root.
+# The durable-streams log server image, published as ghcr.io/pgxsinkit/circuits/durable-streams
+# by .github/workflows/images.yml: the Rust server in apps/durable-streams (crate
+# `durable-streams`, binary `durable-streams-server`).
 #
-# Upstream this lived in a monorepo, so the COPY paths were prefixed with
-# `packages/durable-streams-rust/` and the context was the monorepo root. This
-# repo IS the package, so the paths are repo-relative.
+# The build context is the repository root:
+#   podman build -f container/Containerfile.durable-streams -t localhost/circuits-durable-streams:dev .
 
 # ---- build stage: compile the release binary (glibc, matches the runtime) ----
-# Pinned to the same rustc as rust-toolchain.toml (and as pgxsinkit/circuits)
-# so the image build cannot drift from what CI and local builds produce. Upstream
-# floated this at `rust:1-bookworm`.
+# Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
+# builds use (and rustup has nothing to download).
 FROM rust:1.96.0-bookworm AS build
-WORKDIR /app
-# Copy only what the build needs (no target/, no npm/).
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-# Default features only (no `tier`/`telemetry`) — minimal image, matching the
-# conformance matrix. To ship S3 tiering, add `--features tier` here AND
-# `ca-certificates` to the runtime stage.
-RUN cargo build --release --locked
+WORKDIR /repo
+# Cargo loads every workspace member's manifest, so both members are copied; only the log server
+# is built.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY apps/engine apps/engine
+COPY apps/durable-streams apps/durable-streams
+# The workspace's `release-durable-streams` profile (LTO, one codegen unit: the settings the log
+# server has always been released with); its output lands in target/release-durable-streams/.
+# Default features only (no `tier`/`telemetry`) — minimal image, matching the conformance matrix.
+# To ship S3 tiering, add `--features tier` here AND `ca-certificates` to the runtime stage.
+RUN cargo build --profile release-durable-streams --locked -p durable-streams
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
 FROM gcr.io/distroless/cc-debian12 AS runtime
-COPY --from=build /app/target/release/durable-streams-server /usr/local/bin/durable-streams-server
+COPY --from=build /repo/target/release-durable-streams/durable-streams-server /usr/local/bin/durable-streams-server
 # Protocol default port (PROTOCOL.md §13.1); override with `--port`.
 EXPOSE 4437
 ENTRYPOINT ["/usr/local/bin/durable-streams-server"]

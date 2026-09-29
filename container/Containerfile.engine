@@ -1,19 +1,25 @@
-# circuits ENGINE image: the Rust binary that tails Postgres logical replication, maintains
-# shapes/subqueries/aggregations, and serves both the control-plane HTTP API and the
-# Electric-compatible `GET /v1/shape` endpoint.
+# The Circuits engine image, published as ghcr.io/pgxsinkit/circuits/engine by
+# .github/workflows/images.yml: the Rust binary (apps/engine) that tails Postgres logical
+# replication, maintains shapes/subqueries/aggregations, and serves both the control-plane HTTP
+# API and the Electric-compatible `GET /v1/shape` endpoint.
 #
-# Build context is the repo root:
-#   podman build -f container/Containerfile.engine -t circuits-engine .
+# The build context is the repository root:
+#   podman build -f container/Containerfile.engine -t localhost/circuits-engine:dev .
 #
 # The engine speaks plain HTTP to the durable-streams server (reqwest is built with no TLS
 # backend), so the runtime image needs no OpenSSL — just certs-free debian slim.
 
-FROM rust:1-bookworm AS build
+# Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
+# builds use (and rustup has nothing to download).
+FROM rust:1.96.0-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
+# Cargo loads every workspace member's manifest, so both members are copied; only the engine is
+# built, with cargo's default release profile.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY apps/engine apps/engine
-RUN cargo build --release -p circuits-engine
+COPY apps/durable-streams apps/durable-streams
+RUN cargo build --release --locked -p circuits-engine
 
 FROM debian:bookworm-slim
 COPY --from=build /repo/target/release/circuits-engine /usr/local/bin/circuits-engine
