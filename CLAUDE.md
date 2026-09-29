@@ -7,25 +7,28 @@ handoff, report changed files, validation run, and suggested next commands.
 
 ## Tools
 
-bun (never npm, pnpm or yarn), podman (never docker), mise for tool versions. Run cargo through
-`mise exec -- cargo …` when the shell has not activated mise: the pinned Rust is in
-`rust-toolchain.toml`, and a newer rustc crashes while compiling dbsp.
+bun (never npm, pnpm or yarn), podman (never docker), mise for tool versions. The pinned Rust is in
+`rust-toolchain.toml`, and a newer rustc crashes while compiling dbsp: the package scripts reach
+cargo through `scripts/with-toolchain.sh` (`mise exec` when mise is on `PATH`), so `bun run …` is
+safe from any shell, but run a bare cargo as `mise exec -- cargo …` when the shell has not
+activated mise.
 
 ## Build & Test
 
+Scripts are check-default: a bare verb never changes a file (`format:write` and `lint:fix` do).
+
 ```bash
-bun run engine:test                        # the engine's Rust tests
-bun run test:durable-streams               # the log server's Rust tests
-bun run typecheck
-bun run test                               # every TypeScript suite, engine conformance included (boots its own Postgres)
-bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server
+bun run validate                           # pre-commit gate (the hook runs it): format, typecheck, lint, test
+bun run validate:full                      # pre-push gate (the hook runs it) and CI: validate + test:integration
+bun run test                               # unit only: both crates' Rust tests + the TypeScript unit project; no Postgres
+bun run test:integration                   # engine conformance harness (boots its own Postgres) + the protocol suite
 ```
 
-The harness needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
-(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
+The integration suites need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
+(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu). `bun install` installs the hooks.
 
-**Finishing a task that touches the engine or the log server requires the suites above green — see
-"Testing checklist before claiming done" in AGENTS.md.**
+**Finishing a task that touches the engine or the log server requires `bun run validate:full` green
+— see "Testing checklist before claiming done" in AGENTS.md, which also lists the focused scripts.**
 
 The invariants and the gotchas are in **AGENTS.md**. Read it before touching the engine.
 

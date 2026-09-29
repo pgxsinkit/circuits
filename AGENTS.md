@@ -82,33 +82,61 @@ The recipe for capturing an app's query set in one circuit:
 ## Build & test
 
 Tools: **bun** (never npm, pnpm or yarn), **podman** (never docker), **mise** for tool versions.
-Rust is pinned in `rust-toolchain.toml`; a newer rustc crashes while compiling dbsp, so in a shell
-that has not activated mise run cargo as `mise exec -- cargo …`. The harness boots its own
-ephemeral Postgres and needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
+Rust is pinned in `rust-toolchain.toml`; a newer rustc crashes while compiling dbsp. Every package
+script that reaches cargo runs it through `scripts/with-toolchain.sh` (`mise exec` when mise is on
+`PATH`, the bare command otherwise, which is what CI does), so `bun run …` gets the pinned
+toolchain from any shell; a bare `cargo …` in a shell that has not activated mise for this
+directory does not, so run it as `mise exec -- cargo …`. The integration suites boot their own
+ephemeral Postgres and need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
 (`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
 
+The scripts are check-default: a bare verb never changes a file.
+
 ```bash
-bun run engine:build                       # cargo build -p circuits-engine
-cargo fmt --check                          # rustfmt.toml at the root (120 cols, Max heuristics); CI enforces it
-bun run engine:test                        # cargo test -p circuits-engine   (fast)
-bun run test:durable-streams               # cargo test -p durable-streams
+bun run validate                           # the pre-commit gate: format + typecheck + lint + test
+bun run validate:full                      # the pre-push gate, and what CI runs: validate + test:integration
+
+bun run format                             # check: oxfmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
+bun run format:write                       # apply both
+bun run lint                               # check: oxlint (type-aware), then clippy on the log server, release profile, -D warnings
+bun run lint:fix                           # oxlint --fix
 bun run typecheck                          # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
-bun run test                               # vitest run — full suite incl. conformance (boots its own PG)
+bun run test                               # unit only: both crates' Rust tests + the vitest `unit` project; no Postgres
+bun run test:integration                   # the vitest `integration` project (boots PG, engine, log server) + the protocol suite
+bun run build                              # cargo build of the engine and the log server
+
+bun run engine:build                       # cargo build -p circuits-engine
+bun run engine:test                        # cargo test -p circuits-engine   (fast)
+bun run durable-streams:build              # cargo build -p durable-streams
+bun run test:durable-streams               # cargo test -p durable-streams
+bun run test:unit:ts                       # just the vitest `unit` project
+bun run test:integration:harness           # just the vitest `integration` project: the engine conformance harness
 bun run test:conformance                   # just the conformance package
-bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server
+bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server's release build
 bun run test:fuzz                          # random-predicate fuzz vs oracle
 bun run loop [N]                           # fuzz until failure; replay with SEED=<n>
 ```
 
+**The gates run themselves.** `bun install` points git at `.githooks/` (the `prepare` script): the
+pre-commit hook runs `bun run validate`, the pre-push hook runs `bun run validate:full`, and CI
+(`.github/workflows/validate.yml`) runs the same scripts split across its jobs. The pre-push hook
+puts `/usr/lib/postgresql/18/bin` on `PATH` itself when it finds no `initdb` there.
+
 **vitest does not typecheck** — it runs through esbuild, which strips types without reading them.
 `bun run typecheck` is the gate (one root `tsconfig.json` over every TS package + the test files; CI
-runs it right after install, before the suite).
+runs it right after install, before the suites).
 
-**The harness runs the log server built here.** `vitest.global-setup.ts` builds the engine and the
-log server once before the workers start, and `packages/ds-rust` spawns that binary. It never
-falls back to a `durable-streams-server` found elsewhere on the machine; `DS_RUST_BIN` overrides
-the path explicitly. `DS_MEMORY=1` removes durability for max-throughput runs
-(`--durability memory`, Linux-only).
+**Every vitest file is in exactly one of two projects** (`vitest.config.ts`). `unit` is an explicit
+list of files that need neither the engine, a log server nor a Postgres server (the oracle's tests
+use in-process PGlite); its setup, `vitest.unit-setup.ts`, only builds the log server, which
+`packages/ds-rust/src/binary.test.ts` resolves but never starts. `integration` is every other file,
+so a new test file lands there unless it is added to the list.
+
+**The harness runs the log server built here.** `vitest.global-setup.ts`, the `integration`
+project's setup, builds the engine and the log server once before the workers start, and
+`packages/ds-rust` spawns that binary. It never falls back to a `durable-streams-server` found
+elsewhere on the machine; `DS_RUST_BIN` overrides the path explicitly. `DS_MEMORY=1` removes
+durability for max-throughput runs (`--durability memory`, Linux-only).
 
 ### Testing checklist before claiming done
 
@@ -117,21 +145,18 @@ log server is not "done" until the suites below have run green, and agents must 
 report exactly which ran and why the rest could not) before closing the task.**
 
 ```bash
-bun run typecheck                          # vitest cannot see type errors
-bun run engine:test                        # the engine's Rust tests
-bun run test:durable-streams               # the log server's Rust tests
-bun run test                               # full vitest suite incl. oracle conformance
-bun run test:durable-streams:conformance   # after any change to the log server
+bun run validate                           # format, typecheck (vitest cannot see type errors), lint, both crates' Rust tests, TS unit tests
+bun run validate:full                      # validate + the engine conformance harness + the protocol suite
 ```
 
-The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
-against the always-on circuit on every run (there is no off mode). The
+The `integration` project includes `packages/conformance` — the engine-vs-oracle harness — and
+runs against the always-on circuit on every run (there is no off mode). The
 `CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
 versus which fall through to the routing/fallback tiers.
 
 A change to the log server can break the engine without breaking the protocol suite: the engine
-depends on behaviour the protocol leaves to the server (read paging, for one). Run `bun run test`
-after every log server change.
+depends on behaviour the protocol leaves to the server (read paging, for one). Run
+`bun run validate:full`, which runs both, after every log server change.
 
 To exercise dormancy and eviction fast, boot with second-scale knobs
 (`CIRCUITS_SHAPE_IDLE_SECS=1 CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see

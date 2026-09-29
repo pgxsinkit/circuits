@@ -67,19 +67,18 @@ with one value: a version (`1.2.3`), or a commit (`sha-0123abc`). Building them 
 
 ## Working on it
 
-The toolchain is pinned: Rust by `rust-toolchain.toml`, bun and node by `mise.toml`. The test
-harness boots its own ephemeral Postgres, so it needs PostgreSQL 18's `initdb` and `pg_ctl` on
-`PATH` (on Debian and Ubuntu they are in `/usr/lib/postgresql/18/bin`).
+The toolchain is pinned: Rust by `rust-toolchain.toml`, bun and node by `mise.toml`. The
+integration suites boot their own ephemeral Postgres, so they need PostgreSQL 18's `initdb` and
+`pg_ctl` on `PATH` (on Debian and Ubuntu they are in `/usr/lib/postgresql/18/bin`).
 
 ```bash
 mise install
-bun install
+bun install                                # also installs the git hooks
 
-bun run engine:test                        # the engine's Rust tests
-bun run test:durable-streams               # the log server's Rust tests
-bun run typecheck
-bun run test                               # every TypeScript suite, engine conformance included
-bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server
+bun run validate                           # before a commit (the pre-commit hook runs it): format, typecheck, lint, unit tests
+bun run validate:full                      # before a push (the pre-push hook and CI run it): validate + the integration suites
+bun run test                               # the unit tests: both crates' Rust tests and the TypeScript tests that boot nothing
+bun run test:integration                   # the engine conformance harness and the Durable Streams protocol suite
 bun run test:fuzz                          # random predicates against the oracle
 ```
 

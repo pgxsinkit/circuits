@@ -10,20 +10,23 @@ vocabulary, and [AGENTS.md](AGENTS.md) for the layout and the invariants the eng
 ## Build and test
 
 The toolchain is pinned: Rust by `rust-toolchain.toml`, bun and node by `mise.toml`. Containers are
-built with podman. The test harness needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`.
+built with podman. The integration suites need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`.
 
 ```bash
 mise install
-bun install
-bun run engine:test                        # the engine's Rust tests
-bun run test:durable-streams               # the log server's Rust tests
-bun run typecheck
-bun run test                               # every TypeScript suite, engine conformance included
-bun run test:durable-streams:conformance   # the protocol suite, against the log server
+bun install                                # also installs the git hooks (.githooks/)
+bun run validate                           # format, typecheck, lint, unit tests (Rust + TypeScript)
+bun run validate:full                      # validate + the engine conformance harness + the protocol suite
 ```
 
-A change to the engine must pass the engine's tests and `bun run test`. A change to the log server
-must pass its tests, its conformance run and `bun run test`, because the engine depends on it.
+The scripts only check; `bun run format:write` and `bun run lint:fix` change files. `bun run test`
+is the unit tests alone and `bun run test:integration` the suites that boot Postgres, the engine and
+the log server. [AGENTS.md](AGENTS.md#build--test) lists the focused scripts.
+
+Every commit must pass `bun run validate`: the pre-commit hook runs it. Every push must pass
+`bun run validate:full`: the pre-push hook runs it, and so does CI. A change to the log server is
+not proven by its own tests and the protocol suite alone, because the engine depends on it:
+`validate:full` runs the engine's conformance harness against the log server built beside it.
 
 ## History
 
