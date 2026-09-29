@@ -55,7 +55,7 @@ impl Hist {
         let sum = self.sum.load(Ordering::Relaxed);
         serde_json::json!({
             "count": count,
-            "mean_us": if count > 0 { sum / count } else { 0 },
+            "mean_us": sum.checked_div(count).unwrap_or(0),
             "p50_us": self.quantile(0.50),
             "p99_us": self.quantile(0.99),
             "p999_us": self.quantile(0.999),
