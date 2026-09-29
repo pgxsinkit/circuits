@@ -1,11 +1,11 @@
 import type { AddressInfo } from 'node:net'
 import { createHTTPServer } from '@trpc/server/adapters/standalone'
-import { createCore, type ElectricCore } from './core.js'
+import { createCore, type CircuitsCore } from './core.js'
 import { appRouter } from './router.js'
 
 export interface ApiServer {
   url: string
-  core: ElectricCore
+  core: CircuitsCore
   close(): Promise<void>
 }
 

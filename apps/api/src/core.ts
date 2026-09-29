@@ -34,7 +34,7 @@ export interface ShapeHandle {
   leaseSeconds?: number
 }
 
-export interface ElectricCore {
+export interface CircuitsCore {
   readonly dsUrl: string
   defineSchema(schema: Schema): Promise<void>
   write(input: WriteInput): Promise<{ txid: string }>
@@ -74,7 +74,7 @@ export interface CoreOptions {
   fetch?: typeof fetch
 }
 
-export function createCore(opts: CoreOptions): ElectricCore {
+export function createCore(opts: CoreOptions): CircuitsCore {
   const dsUrl = opts.dsUrl.replace(/\/$/, '')
   const engineUrl = opts.engineUrl.replace(/\/$/, '')
   const doFetch = opts.fetch ?? fetch

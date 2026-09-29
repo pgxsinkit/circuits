@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { createCore, type ElectricCore, type ShapeHandle } from '@circuits/api'
+import { createCore, type CircuitsCore, type ShapeHandle } from '@circuits/api'
 import { DurableStreamTestServer } from '@circuits/ds-rust'
 import type { Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -67,7 +67,7 @@ async function shapeState(engineUrl: string, id: string): Promise<string | undef
 describe('native library-mode writes', () => {
   let ds: DurableStreamTestServer | undefined
   let engine: ChildProcess | undefined
-  let core: ElectricCore | undefined
+  let core: CircuitsCore | undefined
   let shape: ShapeHandle | undefined
 
   afterEach(async () => {

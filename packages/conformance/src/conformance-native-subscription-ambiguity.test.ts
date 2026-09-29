@@ -4,7 +4,7 @@
 
 import { createServer, request } from 'node:http'
 
-import { createClient, type ElectricIvmClient } from '@circuits/client'
+import { createClient, type CircuitsClient } from '@circuits/client'
 import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -115,7 +115,7 @@ async function startResponseLossProxy(upstreamUrl: string): Promise<ResponseLoss
 }
 
 let h: Harness | undefined
-const clients: ElectricIvmClient[] = []
+const clients: CircuitsClient[] = []
 const proxies: ResponseLossProxy[] = []
 
 afterEach(async () => {
@@ -125,7 +125,7 @@ afterEach(async () => {
   h = undefined
 })
 
-async function bootWithShortRetention(): Promise<{ client: ElectricIvmClient; proxy: ResponseLossProxy }> {
+async function bootWithShortRetention(): Promise<{ client: CircuitsClient; proxy: ResponseLossProxy }> {
   h = await bootHarness(schema, {
     engineEnv: {
       CIRCUITS_SHAPE_IDLE_SECS: '1',

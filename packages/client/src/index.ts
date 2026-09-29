@@ -99,7 +99,7 @@ export interface AggregateSubscription {
   close(): Promise<void>
 }
 
-export interface ElectricIvmClient {
+export interface CircuitsClient {
   defineSchema(schema: Schema): Promise<unknown>
   write(input: { table: string; op: Op; pk: Value; row?: Row; txid?: string }): Promise<{ txid: string }>
   /** Schema-derived typed ingestion API, one entry per table. */
@@ -158,7 +158,7 @@ export function createClient(opts: {
   dsBaseUrl?: string
   /** Live mode passed to stream-db. 'long-poll' is the most proxy-friendly. Default true (SSE). */
   liveMode?: boolean | 'sse' | 'long-poll'
-}): ElectricIvmClient {
+}): CircuitsClient {
   const trpc = createTRPCClient<AppRouter>({ links: [httpBatchLink({ url: opts.apiUrl })] })
   // Everything the client opens (shape materializations, subset subscriptions AND aggregate
   // subscriptions) so `close()` can tear them all down — otherwise a live stream leaks and blocks

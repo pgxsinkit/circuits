@@ -2,10 +2,10 @@
 
 import { initTRPC, TRPCError } from '@trpc/server'
 import { z } from 'zod'
-import type { ElectricCore } from './core.js'
+import type { CircuitsCore } from './core.js'
 
 export interface Context {
-  core: ElectricCore
+  core: CircuitsCore
 }
 
 const t = initTRPC.context<Context>().create()
@@ -46,7 +46,7 @@ export const appRouter = t.router({
     define: t.procedure
       .input(z.object({ schema: schemaSchema }))
       .mutation(async ({ input, ctx }) => {
-        await ctx.core.defineSchema(input.schema as Parameters<ElectricCore['defineSchema']>[0])
+        await ctx.core.defineSchema(input.schema as Parameters<CircuitsCore['defineSchema']>[0])
         return { ok: true as const }
       }),
   }),

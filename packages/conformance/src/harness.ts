@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 
 import { DurableStreamTestServer, type TestServerOptions } from '@circuits/ds-rust'
 import { type ApiServer, createApiServer } from '@circuits/api'
-import { createClient, type ElectricIvmClient, type ShapeMaterialization } from '@circuits/client'
+import { createClient, type CircuitsClient, type ShapeMaterialization } from '@circuits/client'
 import { createPgOracle, createPgTables, type Oracle } from '@circuits/oracle'
 import type { ChangeEvent, Row, Schema, ShapeDef } from '@circuits/protocol'
 import pgpkg from 'pg'
@@ -158,7 +158,7 @@ export interface Harness {
   engineUrl: string
   apiUrl: string
   api: ApiServer
-  client: ElectricIvmClient
+  client: CircuitsClient
   oracle: Oracle
   schema: Schema
   /** Postgres connection string for this harness's database (the system of record). */
@@ -281,7 +281,7 @@ export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promi
   let proc: ChildProcess | undefined
   let api: ApiServer | undefined
   let oracle: Oracle | undefined
-  let client: ElectricIvmClient | undefined
+  let client: CircuitsClient | undefined
   let engineDs: { url: string; close(): Promise<void> } | undefined
   const teardown = async () => {
     await client?.close().catch(() => {})
