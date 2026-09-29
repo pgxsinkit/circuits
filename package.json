@@ -20,6 +20,7 @@
     "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings",
     "lint:fix": "oxlint --fix -c .oxlintrc.jsonc .",
     "loop": "bash scripts/with-toolchain.sh bash scripts/conformance-loop.sh",
+    "prepare": "git config core.hooksPath .githooks || true",
     "test": "bun run engine:test && bun run test:durable-streams && bun run test:unit:ts",
     "test:conformance": "bash scripts/with-toolchain.sh vitest run packages/conformance",
     "test:durable-streams": "bash scripts/with-toolchain.sh cargo test -p durable-streams",

@@ -1,6 +1,12 @@
 # Everything that has to pass before a change is accepted or an image is published. Called by
 # ci.yml (pull requests) and by images.yml (pushes to develop, and release tags).
 #
+# The jobs run the package scripts, so CI and a local `bun run validate:full` are the same commands,
+# split across three jobs: `rust` is `format`, `lint` and the Rust half of `test`; `harness` is
+# `typecheck`, the TypeScript half of `test` and the engine conformance harness; the matrix is the
+# Durable Streams protocol suite, once per run configuration. CI has no mise, so
+# scripts/with-toolchain.sh runs cargo as it is and rustup takes the version from rust-toolchain.toml.
+#
 # The engine and the log server are tested from the one workspace at the one commit, so the engine's
 # conformance suite always runs against the log server built beside it.
 name: validate
@@ -13,7 +19,7 @@ permissions:
 
 jobs:
   rust:
-    name: cargo fmt + test + clippy
+    name: format + lint + Rust tests
     runs-on: ubuntu-26.04
     timeout-minutes: 60
     steps:
@@ -27,21 +33,34 @@ jobs:
           components: rustfmt, clippy
           rustflags: ""
 
-      - name: Formatting (rustfmt.toml at the root)
-        run: cargo fmt --check
+      # oxfmt and oxlint are dev dependencies. No `bun-version`: setup-bun reads package.json's
+      # `packageManager`, which mise.toml matches.
+      - uses: oven-sh/setup-bun@v2
+
+      # oxfmt and oxlint start under node; the version is mise.toml's.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+
+      - run: bun install --frozen-lockfile
+
+      # oxfmt over everything it formats, then `cargo fmt --check` (rustfmt.toml at the root).
+      - name: Formatting
+        run: bun run format
 
       - name: Engine tests
-        run: cargo test -p circuits-engine --locked
+        run: bun run engine:test --locked
 
       # The log server is tested as it ships: its release profile, link-time optimisation included.
       - name: Log server build
-        run: cargo build -p durable-streams --profile release-durable-streams --locked
+        run: bun run durable-streams:build --profile release-durable-streams --locked
 
       - name: Log server tests
-        run: cargo test -p durable-streams --profile release-durable-streams --locked
+        run: bun run test:durable-streams --profile release-durable-streams --locked
 
-      - name: Log server clippy
-        run: cargo clippy -p durable-streams --profile release-durable-streams --locked --all-targets -- -D warnings
+      # oxlint over the TypeScript, then clippy on the log server in its release profile.
+      - name: Lint
+        run: bun run lint
 
       - name: Upload the log server binary
         uses: actions/upload-artifact@v7
@@ -51,7 +70,7 @@ jobs:
           retention-days: 1
 
   harness:
-    name: typecheck + engine conformance
+    name: typecheck + TypeScript unit tests + engine conformance
     runs-on: ubuntu-26.04
     timeout-minutes: 45
     steps:
@@ -81,9 +100,13 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      # Builds the engine and the log server once, then runs every suite, conformance included.
-      - name: Test
-        run: bun run test
+      # The TypeScript half of `bun run test`: no Postgres, no engine, no log server running.
+      - name: TypeScript unit tests
+        run: bun run test:unit:ts
+
+      # Builds the engine and the log server once, then runs every suite that boots the stack.
+      - name: Engine conformance
+        run: bun run test:integration:harness
 
   durable-streams-conformance:
     name: log server conformance (${{ matrix.config.name }})
@@ -120,8 +143,10 @@ jobs:
       - name: Make the binary executable
         run: chmod +x "$RUNNER_TEMP/durable-streams/durable-streams-server"
 
+      # The suite half of `bun run test:durable-streams:conformance`: the build half is the `rust`
+      # job's, whose binary RUST_SERVER_BIN names.
       - name: Run conformance (${{ matrix.config.name }})
         env:
           RUST_SERVER_BIN: ${{ runner.temp }}/durable-streams/durable-streams-server
           RUST_SERVER_ARGS: ${{ matrix.config.args }}
-        run: bun run test:durable-streams:conformance
+        run: bun run --cwd apps/durable-streams test:conformance

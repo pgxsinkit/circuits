@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The pre-commit gate: `bun run validate` (format, typecheck, lint, and the unit tests: both crates'
+# Rust tests and the TypeScript unit project). `bun install` installs the hooks through the
+# `prepare` script. bun runs through scripts/with-toolchain.sh, so a git client that never
+# activated mise still gets the pinned bun, node and Rust.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+mapfile -d '' staged_files < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if ((${#staged_files[@]} == 0)); then
+  echo "No staged files to check."
+  exit 0
+fi
+
+echo "→ Delegating staged commit checks to bun run validate"
+bash scripts/with-toolchain.sh bun run validate
