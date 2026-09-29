@@ -13,17 +13,17 @@
     "@circuits/ds-rust": "workspace:*",
     "@circuits/oracle": "workspace:*",
     "@circuits/protocol": "workspace:*",
-    "@durable-streams/client": "0.2.6",
-    "@durable-streams/state": "0.3.1",
-    "@faker-js/faker": "10.5.0",
+    "@durable-streams/client": "0.2.7",
+    "@durable-streams/state": "0.3.2",
+    "@faker-js/faker": "10.6.0",
     "@pgxsinkit/pgwasm": "0.5.2",
     "@pgxsinkit/pgwasm-c": "0.5.2",
-    "@tanstack/db": "0.6.12",
-    "@trpc/client": "11.18.0",
-    "pg": "8.22.0",
-    "zod": "4.4.3"
+    "@tanstack/db": "0.9.2",
+    "@trpc/client": "11.19.0",
+    "pg": "8.23.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
-    "@types/pg": "8.20.0"
+    "@types/pg": "8.23.1"
   }
 }

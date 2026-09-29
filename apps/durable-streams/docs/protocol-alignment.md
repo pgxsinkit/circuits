@@ -4,10 +4,14 @@ Audited against:
 
 - Protocol: [DRAFT Durable Streams Protocol 1.0](https://github.com/pgxsinkit/durable-streams/blob/a172acc389351cb3db6deb5cd60e3dec11e7ff39/PROTOCOL.md)
 - Upstream repository commit: `a172acc389351cb3db6deb5cd60e3dec11e7ff39`
-- Published conformance suite: `@durable-streams/server-conformance-tests@0.3.6`
+- Published conformance suite: `@durable-streams/server-conformance-tests@0.3.7`
 
 The published package and upstream `main` contain the same conformance source at
 that commit. There is no newer unpublished suite in the upstream repository.
+`0.3.7` carries the same tests as `0.3.6`; it moved only its own dependency on
+`@durable-streams/client` (0.2.6 to 0.2.7). Upstream `main`
+(`461b40267aabd644558f9b19dbb9507dd5f691cf`, checked 2026-09-29) has the same
+suite source and the same `PROTOCOL.md`.
 
 This file records the places where the protocol leaves a decision to the server
 and this implementation had to make one. It is not a coverage report — the

@@ -20,7 +20,7 @@ const unitFiles = [
 
 // Sibling agent worktrees live under .claude/worktrees and carry their own copies of the test files
 // (without node_modules) — never collect them from this checkout. The log server's protocol
-// conformance suite is its own package with its own vitest (4.x) and config, run by
+// conformance suite is its own package with its own config, run by
 // `bun run test:durable-streams:conformance` against a release build — not by this run.
 const exclude = ["**/node_modules/**", "**/.claude/worktrees/**", "apps/durable-streams/**"];
 
@@ -32,8 +32,10 @@ const common = {
 
 export default defineConfig({
   test: {
-    // Conformance tests each boot an engine subprocess and a log server; keep memory bounded.
-    poolOptions: { forks: { maxForks: 4 } },
+    // Conformance tests each boot an engine subprocess and a log server; keep memory bounded. Set for
+    // the whole run, not per project: projects that run together must agree on it (vitest refuses two
+    // `maxWorkers` in one sequence group), and `vitest run packages/conformance` runs files of both.
+    maxWorkers: 4,
     projects: [
       {
         test: {

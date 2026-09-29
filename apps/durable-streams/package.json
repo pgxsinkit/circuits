@@ -14,7 +14,7 @@
     "test:conformance": "vitest run --config conformance/vitest.config.ts"
   },
   "devDependencies": {
-    "@durable-streams/server-conformance-tests": "0.3.6",
+    "@durable-streams/server-conformance-tests": "0.3.7",
     "vitest": "4.1.11"
   }
 }
