@@ -1537,9 +1537,9 @@ impl SubqueryRegistry {
         rows: &[Row],
         gate: &crate::pg::SnapshotGate,
     ) -> Option<Vec<(String, Option<Value>)>> {
-        let (pred, proj, recent) = match self.nodes.get(sig) {
-            Some(n) => (n.pred.clone(), n.proj_col, &n.recent),
-            None => return None,
+        let (pred, proj, recent) = {
+            let n = self.nodes.get(sig)?;
+            (n.pred.clone(), n.proj_col, &n.recent)
         };
         Some(
             rows.iter()
