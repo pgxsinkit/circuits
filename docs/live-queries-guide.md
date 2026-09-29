@@ -44,8 +44,7 @@ by text in the **client-side live query** — no re-sync when you type in a sear
 
 Postgres is the system of record; the engine observes it via logical replication and backfills
 via snapshot reads. (The engine can also run without Postgres — writes go through the tRPC
-`ingest.write` API — which is how the headless `pnpm demo` runs. The live-query/subquery model is
-identical either way.)
+`ingest.write` API. The live-query/subquery model is identical either way.)
 
 ### Postgres prerequisites
 
@@ -178,7 +177,7 @@ filter into the inner `where`, or handle it as a client-side live query over a b
 
 ## 5. Practical examples
 
-### Active high-priority todos (`pnpm demo`)
+### Active high-priority todos
 
 ```ts
 const liveQuery = await client.shape({
@@ -194,7 +193,7 @@ Rows enter and leave live as todos are completed, re-prioritised, and deleted. T
 **standalone** live query (it has a range leaf), so the engine keeps no state for it — it filters
 the change stream directly.
 
-### Per-user visibility (`pnpm demo:linearlite`)
+### Per-user visibility
 
 The visibility subquery from §4 makes each user see only issues in their projects. It is a
 **subquery** live query: a tiny shared node holds the user's membership rows; when membership
@@ -283,9 +282,6 @@ nobody renews is released after `CIRCUITS_SHAPE_IDLE_SECS` (see
 
 ## 8. See also
 
-- `docs/getting-started.md` — from-zero setup against a new database, with bare-HTTP examples
-  for every request in this guide (live queries, subqueries, aggregations).
 - `docs/ivm-engine-internals.md` — engine internals + full analytical cost model.
 - `docs/deployment-postgres.md` — running with Postgres as system of record.
 - `docs/ARCHITECTURE.md` §6 — the subquery node/edge/flip model and its correctness argument.
-- `examples/linearlite/README.md` — the end-to-end visibility example.

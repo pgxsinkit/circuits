@@ -1,6 +1,6 @@
 {
   "name": "circuits",
-  "description": "Monorepo for Circuits — live queries for Postgres: a Rust engine ingests logical replication and keeps every query result (joins, aggregates, subqueries) in sync, speaking the Electric protocol plus an extended API.",
+  "description": "The server side of pgxsinkit's read path: the Circuits engine, which keeps shapes in sync from Postgres logical replication, and the durable-streams log server that stores and serves them.",
   "version": "0.0.0",
   "private": true,
   "type": "module",

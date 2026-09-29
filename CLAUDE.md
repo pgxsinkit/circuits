@@ -1,33 +1,35 @@
 # Project Instructions for AI Agents
 
-This file provides instructions and context for AI coding agents working on this project.
-
 ## Git Policy
 
-Do not commit or push unless explicitly asked. At handoff, report changed files, validation run,
-and suggested next commands.
+Do not commit or push unless explicitly asked. History is one line: rebase, never merge. At
+handoff, report changed files, validation run, and suggested next commands.
+
+## Tools
+
+bun (never npm, pnpm or yarn), podman (never docker), mise for tool versions. Run cargo through
+`mise exec -- cargo …` when the shell has not activated mise: the pinned Rust is in
+`rust-toolchain.toml`, and a newer rustc crashes while compiling dbsp.
 
 ## Build & Test
 
 ```bash
-pnpm engine:test                          # Rust unit + integration (fast)
-CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (boots its own Postgres)
-ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
-  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
-pnpm demo:linearlite                      # demo stack: PG + engine + LinearLite + pipeline visualizer
+bun run engine:test                        # the engine's Rust tests
+bun run test:durable-streams               # the log server's Rust tests
+bun run typecheck
+bun run test                               # every TypeScript suite, engine conformance included (boots its own Postgres)
+bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server
 ```
 
-**Finishing an engine-touching task requires all three suites green, plus driving the demo
-(browser e2e) for live-path/visualizer changes — see "Testing checklist before claiming done"
-in AGENTS.md.**
+The harness needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
+(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
 
-Full commands, the demo/visualizer runbook (incl. driving the visualizer with the Playwright MCP),
-invariants, and gotchas live in **AGENTS.md** — read it before touching the engine or the apps.
+**Finishing a task that touches the engine or the log server requires the suites above green — see
+"Testing checklist before claiming done" in AGENTS.md.**
+
+The invariants and the gotchas are in **AGENTS.md**. Read it before touching the engine.
 
 ## Architecture Overview
 
-See AGENTS.md (layout + docs index) and `docs/ARCHITECTURE.md`.
-
-## Conventions & Patterns
-
-See the Invariants and Gotchas sections of AGENTS.md.
+See AGENTS.md (layout and docs index), `docs/ARCHITECTURE.md` and
+`apps/durable-streams/ARCHITECTURE.md`. The glossary is `CONTEXT.md`; decisions are in `docs/adr/`.

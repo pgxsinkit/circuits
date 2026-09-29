@@ -1,5 +1,9 @@
 # Electric protocol conformance
 
+> **This suite cannot be run from this repository.** It started the stack through a launcher in
+> `packages/bench`, which was not brought over. It is removed together with the compatibility
+> adapter it tests (ADR-0011).
+
 Runs ElectricSQL's **own** oracle harness (`Support.OracleHarness` / `ShapeChecker` — its
 comparison-against-Postgres logic) against Circuits' `GET /v1/shape` adapter, driven by Electric's
 official Elixir `Electric.Client`. This proves Circuits speaks Electric's wire protocol.

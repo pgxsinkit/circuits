@@ -1,10 +1,21 @@
-# Circuits (fork)
+# Circuits
 
-A reactive sync engine: application writes go to Postgres, the engine turns logical-replication
-changes into live, incrementally maintained shapes, and durable streams are the log between them. This
-glossary fixes the terms the fork relies on; the architecture itself is in `docs/ARCHITECTURE.md`.
+The server side of a reactive sync path, in two programs. Application writes go to Postgres; the
+**engine** turns logical-replication changes into live, incrementally maintained shapes; the **log
+server** holds the durable streams those shapes are written to and clients read from. This glossary
+fixes the terms the repository relies on; the architecture itself is in `docs/ARCHITECTURE.md`.
 
 ## Language
+
+**Engine**:
+The program that ingests Postgres logical replication and maintains shapes. It holds no copy of any
+table, and it can be restarted without clients losing what they have already read.
+_Avoid_: Electric Circuits, the sync service
+
+**Log server**:
+The program that stores durable streams and serves them over the Durable Streams protocol. The
+engine appends to it and reads its own change log back from it; clients read shape streams from it.
+_Avoid_: ds (in prose), the Node test server
 
 **Table**:
 A Postgres relation identified by its schema and name together. Canonical spelling is `schema.name`;
@@ -13,10 +24,11 @@ _Avoid_: bare table name, relation OID
 
 **Native path**:
 The engine's own control plane (`POST /shapes`, the predicate AST) plus reads straight from durable
-streams — the surface the fork develops. Upstream's docs call it the extended API.
+streams — the only surface this repository develops.
 
 **Compat adapter**:
-The Electric-protocol `GET /v1/shape` surface, maintained for upstream parity only.
+The Electric-protocol `GET /v1/shape` surface. Nothing of ours calls it, and it is being removed
+(ADR-0011).
 _Avoid_: Electric path, legacy API
 
 **Shape**:

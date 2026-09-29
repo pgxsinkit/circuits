@@ -30,6 +30,8 @@ COPY --from=build /repo/target/release-durable-streams/durable-streams-server /u
 EXPOSE 4437
 ENTRYPOINT ["/usr/local/bin/durable-streams-server"]
 # Bind all interfaces by default (the binary defaults to 127.0.0.1, unreachable
-# from outside the container). Override by passing your own args. For persistence,
-# mount a volume and add `--data-dir /your/path` (default is an ephemeral tmp dir).
+# from outside the container). These default arguments are not enough to start: in its default
+# durability (`wal`) the server refuses to run without an explicit `--data-dir`, so every
+# deployment passes its own arguments, with a mounted volume and `--data-dir /your/path`, or
+# `--durability memory` for a store that is not meant to survive (docs/backlog/0003).
 CMD ["--host", "0.0.0.0"]

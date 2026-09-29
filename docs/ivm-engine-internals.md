@@ -39,7 +39,8 @@ reasoning about cost. State that scales with row count lives in Postgres, full s
 engine keeps only per-shape metadata, the counts pipelines' (group → count) relations, and,
 for subqueries, a shared set of *inner-query result values*.
 Baseline engine RSS is flat with database size, whether the database has 1,000 or 100,000 rows
-(measured by the shape-memory matrix benchmark in `packages/bench`; fresh benchmarks pending).
+(measured by the shape-memory matrix benchmark, which was not brought into this repository;
+fresh benchmarks pending).
 
 ### What dbsp is here
 
@@ -361,7 +362,7 @@ The question this section answers: **as you add shapes, users, and rows, where d
 state accumulate, what is shared vs per-shape vs per-user, and how does that show up in memory
 and disk?**
 
-The headline, measured (shape-memory matrix benchmark, `packages/bench`): a steady fleet of *many* shapes
+The headline, measured (shape-memory matrix benchmark, not brought into this repository): a steady fleet of *many* shapes
 over a *large* table is cheap; the only deployment-size-sensitive cost is the **transient
 backfill working set** of a *materialized* shape. (fresh benchmarks pending)
 
@@ -477,10 +478,11 @@ scales with table size; everything row-scale lives in Postgres.
 
 ---
 
-## 5. Worked example: LinearLite per-user visibility
+## 5. Worked example: per-user visibility in an issue tracker
 
-The flagship example (`examples/linearlite`, verified in-browser at 100k issues) makes a user
-see only issues in projects they're a member of. With the demo's default circuit config this
+The example (an issue tracker, verified in-browser at 100k issues before the move into this
+repository) makes a user see only issues in projects they're a member of. With the full circuit
+configuration this
 shape is circuit-served (see "Serving tiers: compiled, routed, fallback" above); the walkthrough
 below traces the registry path — what the same shape costs with the circuit off. It is a
 subquery shape:
@@ -600,8 +602,6 @@ executors via a trait so presentation cannot drift from execution.
 
 - `docs/ARCHITECTURE.md` — the system-level architecture (consistency fences, reliability,
   adapters) and the speedup backlog.
-- `packages/bench/README.md` — the benchmark runners, including the shape-memory matrix that
-  produced the memory-vs-shapes data used above.
 - `docs/live-queries-guide.md` — the user-facing companion to this document.
 
 ## Serving tiers: compiled, routed, fallback

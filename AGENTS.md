@@ -1,39 +1,46 @@
 # AGENTS.md
 
-Guidance for AI agents working in **Circuits** — an Electric-style reactive sync engine. App
-writes go to **Postgres**; a Rust engine turns logical-replication changes into **live shapes**
-(incrementally maintained, fully de-duplicated); **durable streams** is the log between them. Two
-client surfaces: the Electric-compatible `GET /v1/shape` (works with the ElectricSQL TS client) and
-the extended `@circuits/client` API (shapes + subset queries + live aggregations — the surface
-the project is growing toward).
+Guidance for AI agents working in **Circuits**: the server side of pgxsinkit's read path. App
+writes go to **Postgres**; the **engine** (Rust) turns logical-replication changes into **live
+shapes** (incrementally maintained, fully de-duplicated); the **log server** (Rust) holds the
+durable streams between them and serves those streams to clients. The two are one Cargo workspace,
+tested and released together, and run as separate processes. `CONTEXT.md` is the glossary; use its
+words.
+
+The surface this repository develops is the **native path**: the engine's control plane
+(`POST /shapes`, the predicate AST) plus reads straight from the log server. The Electric
+compatibility adapter (`GET /v1/shape`) is still in the engine and is being removed (ADR-0011): do
+not extend it, and do not justify anything by compatibility with Electric.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
-| `apps/api` | tRPC API (`router.ts`) over the engine + durable-streams (`core.ts`). |
+| `apps/durable-streams` | The log server (crate `durable-streams`, binary `durable-streams-server`): `store.rs` the stream store, `wal/` the group-commit write-ahead log, `handlers.rs` the protocol, `http1.rs` + `engine_raw.rs` + `sse_reactor.rs` its own HTTP serving. `conformance/` runs the Durable Streams protocol suite against it. |
+| `apps/api` | tRPC API (`router.ts`) over the engine + the log server (`core.ts`). The test harness drives the engine through it. |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
-| `packages/client` | Browser client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
+| `packages/client` | The harness client: `shape()`, `subset()` (see `subset.ts` — LSN watermarks + tombstones), `aggregate()`. All lifecycles tracked; `close()` is one-shot and deletes server-side with retry. |
 | `packages/conformance` | The real test suite — engine vs oracle, incl. live replication, fuzz, NULLs, concurrency, shape sharing. |
 | `packages/oracle` | Reference implementation shapes are checked against. |
-| `packages/bench` | Benchmarks incl. the **benchmarking-fleet runner** (`electric-bench-runner.ts`, `pnpm bench:fleet` — auto-clones electric-sql/benchmarking-fleet). |
-| `packages/loadgen` | Headless load generator (state-machine users; memory/CPU/disk sampling; Docker-scalable clients). |
-| `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
-| `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Containerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
-| `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
-| `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
+| `packages/ds-rust` | Starts the log server built in this workspace for a test (one process, fresh data directory and port per test). |
+| `container/` | The two image builds: `Containerfile.engine`, `Containerfile.durable-streams`. |
+| `electric-conformance/` | Electric's own oracle/property/integration tests pointed at the compatibility adapter. Removed with it. |
 
 ## Docs (read these before designing)
 
-- `README.md` — the system in one page + the consistency model summary.
-- `docs/ARCHITECTURE.md` — the as-built architecture: ingest, `SnapshotGate` fencing, sharing,
-  subquery registry, reliability model, Electric adapter, client layer.
+- `README.md` — the system in one page.
+- `CONTEXT.md` — the glossary. `docs/adr/` — the decisions; ADR-0011 is why this repository exists.
+- `docs/ARCHITECTURE.md` — the engine's as-built architecture: ingest, `SnapshotGate` fencing, sharing,
+  subquery registry, reliability model, client layer.
 - `docs/ivm-engine-internals.md` — engine execution strategies + the analytical cost model,
   including the three-tier serving model (circuit/routing/fallback): see
   [`docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback`](docs/ivm-engine-internals.md#serving-tiers-compiled-routed-fallback).
 - `docs/live-queries-guide.md` — user/integrator guide.
 - `docs/deployment-postgres.md` — Postgres-as-source-of-record setup.
+- `apps/durable-streams/ARCHITECTURE.md` — the log server's design; its `WAL_TUNING.md`,
+  `CRASH_SIM_FINDINGS.md` and the other notes beside it record what was measured and why.
+- `docs/backlog/` — known defects and debts, one file each.
 - Each package has its own `README.md` (surface, commands, env knobs).
 
 ## Designing dbsp circuits: pipelines vs shapes
@@ -53,7 +60,7 @@ The recipe for capturing an app's query set in one circuit:
 
 1. **Enumerate call sites → collapse to templates.** Parameters become *data* (keys in the
    output index, rows in an input relation) — never circuit structure.
-2. **Find the access cohort** (LinearLite: the project) and key every pipeline output by it,
+2. **Find the access cohort** (in an issue tracker: the project) and key every pipeline output by it,
    never by user or shape. Per-shape work happens only at the fan-out edge: a shape = the set
    of cohort groups its parameters select, unioned by delivery. The union is correct only when
    the cohort key **partitions** the table (a row lives in exactly one group) — overlapping
@@ -74,141 +81,62 @@ The recipe for capturing an app's query set in one circuit:
 
 ## Build & test
 
-```bash
-pnpm engine:build          # cargo build -p circuits-engine
-cargo fmt --check          # rustfmt.toml at the root (120 cols, Max heuristics); CI enforces it
-pnpm engine:test           # cargo test  -p circuits-engine   (fast)
-pnpm typecheck             # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
-pnpm test                  # vitest run — full suite incl. conformance (~60s; boots its own PG)
-pnpm test:conformance      # just the conformance package
-pnpm test:fuzz             # random-predicate fuzz vs oracle
-pnpm loop [N]              # fuzz until failure; replay with SEED=<n>
-pnpm demo:linearlite       # LinearLite demo (ephemeral PG + engine + ds + api + vite + caddy)
-pnpm bench:fleet           # ElectricSQL benchmarking-fleet vs our /v1/shape (auto-clones)
-pnpm docker:up             # containerized stack
-```
-
-**Benchmarking against other Electric versions.** The fleet runner also drives any
-Electric-compatible server instead of our stack — use this to baseline stock Electric releases
-against the same workloads:
+Tools: **bun** (never npm, pnpm or yarn), **podman** (never docker), **mise** for tool versions.
+Rust is pinned in `rust-toolchain.toml`; a newer rustc crashes while compiling dbsp, so in a shell
+that has not activated mise run cargo as `mise exec -- cargo …`. The harness boots its own
+ephemeral Postgres and needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
+(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
 
 ```bash
-# 1. Boot the target, e.g. stock Electric:
-podman run -d --name electric-baseline -p 3000:3000 \
-  -e DATABASE_URL=postgresql://postgres:password@host.docker.internal:54321/electric \
-  -e ELECTRIC_INSECURE=true electricsql/electric:latest
-
-# 2. Point the fleet at it (both vars required together; tables are dropped/recreated in that DB):
-EXTERNAL_ELECTRIC_URL=http://localhost:3000 \
-EXTERNAL_DATABASE_URL=postgresql://postgres:password@localhost:54321/electric \
-BENCH_OUT=docs/bench/electric-fleet-results-baseline.md pnpm bench:fleet
+bun run engine:build                       # cargo build -p circuits-engine
+cargo fmt --check                          # rustfmt.toml at the root (120 cols, Max heuristics); CI enforces it
+bun run engine:test                        # cargo test -p circuits-engine   (fast)
+bun run test:durable-streams               # cargo test -p durable-streams
+bun run typecheck                          # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
+bun run test                               # vitest run — full suite incl. conformance (boots its own PG)
+bun run test:conformance                   # just the conformance package
+bun run test:durable-streams:conformance   # the Durable Streams protocol suite, against the log server
+bun run test:fuzz                          # random-predicate fuzz vs oracle
+bun run loop [N]                           # fuzz until failure; replay with SEED=<n>
 ```
-
-Use a distinct `BENCH_OUT` per target and diff the reports; `BENCH_ONLY`/`BENCH_SCALE` apply the
-same way. (Our own image can also be the target — `pnpm docker:up`, then point at port 7010.)
 
 **vitest does not typecheck** — it runs through esbuild, which strips types without reading them.
-`pnpm typecheck` is the gate (one root `tsconfig.json` over every server/node TS package + the test
-files; CI runs it right after install, before the suite). The browser/Vite apps — `apps/pipeline-viz`
-and `examples/**` — are excluded: they are React 18 / TS 5 trees with their own configs. Always run
-`pnpm typecheck` + `pnpm engine:test` + `pnpm test` before claiming done.
+`bun run typecheck` is the gate (one root `tsconfig.json` over every TS package + the test files; CI
+runs it right after install, before the suite).
 
-## Running the stack (sizes, explorer, load testing)
-
-`scripts/linearlite.sh start <size>` — size = `small|medium|large|xlarge|<issue count>`; users and
-projects scale with it (users ~√issues). Boots PG + ds + engine + API + web UI + the pipeline
-explorer; `stop` tears down cleanly; `status` reports. One instance at a time (teardown is
-pattern-based). Ports: `DEMO_HTTPS_PORT` (8443), `DEMO_VIZ_PORT` (5180), `DEMO_VIZ=0` to skip.
-
-`packages/loadgen` — `USERS=100 SEED_ISSUES=20000 DURATION_S=90 pnpm --filter @circuits/loadgen
-loadgen`; `SWEEP_USERS=…` for comparison tables; Docker client scaling in `packages/loadgen/docker/`.
-The streams layer is the Rust durable-streams server (group-commit WAL — appends batch under
-concurrency); `DS_MEMORY=1` still removes durability entirely for max-throughput runs
+**The harness runs the log server built here.** `vitest.global-setup.ts` builds the engine and the
+log server once before the workers start, and `packages/ds-rust` spawns that binary. It never
+falls back to a `durable-streams-server` found elsewhere on the machine; `DS_RUST_BIN` overrides
+the path explicitly. `DS_MEMORY=1` removes durability for max-throughput runs
 (`--durability memory`, Linux-only).
-
-## Demo + visualizer: start, drive, verify (agent runbook)
-
-**Start everything with one command** (rebuilds the engine, boots an ephemeral throwaway Postgres
-with `wal_level=logical`, durable-streams, the API, LinearLite, and the pipeline visualizer wired
-to the engine):
-
-```bash
-pnpm demo:linearlite > /tmp/demo.log 2>&1 &     # agents: run in background, tail the log
-# ready when the log prints "👉 Open a URL above"
-```
-
-Fixed URLs: LinearLite `http://localhost:5174` (HTTPS/HTTP-2 `https://localhost:8443`), visualizer
-`http://localhost:5180` (`https://localhost:5443`). Ephemeral ports for the rest — grep the log:
-`postgres →`, `engine →`, `api →`. `DEMO_SEED_COUNT=<n>` scales the faker seed (default 512 issues).
-Data resets every run. **Restarting:** kill the previous run first or Vite silently binds 5175 —
-`pkill -f circuits-engine; pkill -f caddy; pkill -f linearlite/start.ts`, then relaunch (if a
-port lingers: `lsof -ti :5174 -ti :5180 | xargs kill`).
-
-The **visualizer** can also attach to any running engine on its own:
-`CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @circuits/pipeline-viz dev`.
-Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
-etc. work from the page — the backbone of the verification workflow below. A third way is the
-containerized visualizer (`docker/Dockerfile.viz`): `podman build -f docker/Dockerfile.viz -t
-circuits-viz . && podman run -p 5180:5180 -p 5443:5443 circuits-viz` serves
-`http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
-point it at another engine.
-
-### Typical verification workflow (Playwright MCP)
-
-Use the Playwright MCP browser to drive both apps; keep LinearLite and the visualizer in two tabs
-(`browser_tabs` to create/select, `browser_navigate` to each URL).
-
-1. **Make the pipeline do something.** Drive LinearLite: switch the "Viewing as" user
-   (`browser_select_option` on the sidebar `<select>`) to create/join that user's shapes; open the
-   Board view or an issue detail for more; drag cards / edit issues for live writes. For surgical
-   writes, `psql` straight at the demo Postgres (URL from the log) — replication picks it up.
-2. **Verify engine state from the viz page** with `browser_evaluate` — no CORS friction thanks to
-   the proxy: `await (await fetch('/engine/graph')).json()` (shapes/nodes/edges),
-   `/engine/shapes/{id}` (incl. retention `state`), `/engine/metrics`, `/engine/state`.
-3. **Verify the canvas against the engine.** Count DOM vs graph:
-   `document.querySelectorAll('.react-flow__node').length` / `'.react-flow__edge'` vs
-   `graph.shapes` — nodes render immediately, edges must too (regression test: clear shapes via the
-   trash button, switch user, edges must appear without a reload).
-4. **Verify animations deterministically** via the sidebar **Activity** log (last 50 replicated
-   changes): click an entry with `browser_evaluate` and sample in the same script — dot positions
-   over time (`.react-flow__edge g circle` → `getBoundingClientRect()`), staged flash delays
-   (`.flash` → `--flash-delay`), pulse stagger. Replay beats racing a live write's timing.
-5. **Eyeball it.** `browser_take_screenshot` after driving — a blank or stale frame is a failure
-   even when the DOM probes pass. Check the browser console output for React/engine errors.
-
-Retention interplay while testing: an open LinearLite tab holds subscriptions (refcount ≥ 1), which
-blocks dormancy for its shapes; `GET /shapes/{id}` is deliberately NOT a retention touch, so
-polling it never keeps a shape alive. To exercise dormancy/eviction fast, boot with second-scale
-knobs (`CIRCUITS_SHAPE_IDLE_SECS=1 CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
-`packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
 
 ### Testing checklist before claiming done
 
-**This is a task-completion requirement, not a suggestion: an engine-touching task is not
-"done" until all three suites below have run green, and agents must run them (or report exactly
-which ran and why the rest could not) before closing the task.**
+**This is a task-completion requirement, not a suggestion: a task that touches the engine or the
+log server is not "done" until the suites below have run green, and agents must run them (or
+report exactly which ran and why the rest could not) before closing the task.**
 
 ```bash
-pnpm typecheck                            # tsc --noEmit over the TS workspace (vitest cannot see type errors)
-pnpm engine:test                          # Rust unit + integration (fast)
-CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance (set the var iff you already built)
-ASDF_ELIXIR_VERSION=1.18.4-otp-28 ASDF_ERLANG_VERSION=28.1 \
-  ./electric-conformance/run.sh oracle    # Electric's own oracle vs /v1/shape (needs elixir + ../electric)
+bun run typecheck                          # vitest cannot see type errors
+bun run engine:test                        # the engine's Rust tests
+bun run test:durable-streams               # the log server's Rust tests
+bun run test                               # full vitest suite incl. oracle conformance
+bun run test:durable-streams:conformance   # after any change to the log server
 ```
 
 The vitest suite includes `packages/conformance` — the engine-vs-oracle harness — and runs
 against the always-on circuit on every run (there is no off mode). The
 `CIRCUITS_DBSP_INDEXES`/`_COUNTS` tunables decide which shapes the circuit actually serves
-versus which fall through to the routing/fallback tiers. The `electric-conformance` line is
-Electric's *own* oracle suite pointed at our `/v1/shape` — a separate tier from our conformance
-package; run both. (The ASDF pins matter: `../electric` asks for an Elixir that may not be
-installed locally.)
+versus which fall through to the routing/fallback tiers.
 
-**E2E (browser) tier:** for anything touching the engine's live path, shapes, or the visualizer,
-finish by **driving the demo as above** (Playwright MCP runbook, §"Demo + visualizer") — the
-suites don't render a canvas or exercise the browser, so a green run does not prove the live
-UI path. A quick pass = boot `pnpm demo:linearlite`, drive a write, verify the shape stream and
-canvas update, screenshot.
+A change to the log server can break the engine without breaking the protocol suite: the engine
+depends on behaviour the protocol leaves to the server (read paging, for one). Run `bun run test`
+after every log server change.
+
+To exercise dormancy and eviction fast, boot with second-scale knobs
+(`CIRCUITS_SHAPE_IDLE_SECS=1 CIRCUITS_RETENTION_SWEEP_SECS=1 …`) — see
+`packages/conformance/src/conformance-retention.test.ts` for the canonical sequence.
+`GET /shapes/{id}` is deliberately NOT a retention touch, so polling it never keeps a shape alive.
 
 ## Invariants (violate these and conformance will catch you — eventually)
 
@@ -496,30 +424,16 @@ canvas update, screenshot.
   an ordered subset over a large table wants an expression index `((col COLLATE "C"))`.
 - **A subset whose predicate folds in live UI filters re-creates the engine feed on every click.**
   Prefer per-facet feeds reused across filter changes + a client merge (identical predicates across
-  users ⇒ shared engine families). LinearLite's browse list does this.
-- **The demo boots an _ephemeral_ Postgres each run** (`mkdtemp`); data does not persist. **Kill
-  stale demos before restarting** — a leftover `tsx start.ts`/`caddy` keeps the ports and serves
-  stale code, which reads as a mysterious schema mismatch. `scripts/linearlite.sh stop`, or
-  `pkill -f circuits-engine`, `pkill -f "tsx start.ts"`, `pkill -f caddy`. If two demos run,
-  scope kills by port (`ps -o ppid= -p $(lsof -ti :<httpsPort>)`) — a SIGKILL mid-shutdown leaks
-  the ephemeral Postgres.
-- **Vite binds IPv6 `[::1]` only** — prefer the `https://localhost:8443` Caddy proxy (HTTP/2 also
-  dodges the browser's ~6-connection HTTP/1.1 cap that freezes multi-stream apps). **The pipeline
-  visualizer needs its Caddy front too** (`https://localhost:5443`, auto-started by the demo): its
-  `/trace` SSE + engine polling compete for the same connection budget, so open it over HTTPS in a
-  browser — plain `http://localhost:5180` is for `curl` only. See `.claude/skills/run-linearlite`.
-- **The durable-streams server is the Rust binary** (crates.io `durable-streams`, spawned by the
-  drop-in wrapper `packages/ds-rust`; self-provisions via `cargo install`, override with
-  `DS_RUST_BIN`). Appends are group-commit WAL `fdatasync` — no per-append fsync ceiling like the
-  old Node test server. `DS_MEMORY=1` still works (ephemeral data dir; `--durability memory` is
-  Linux-only, macOS falls back to `wal`).
-- **Docker + pnpm:** scripts that import workspace deps must live in a workspace package
-  (`docker/package.json`) — running `tsx docker/x.ts` from the repo root can't resolve them.
-- **Verify against the live stack, not just types.** `pnpm typecheck` proves the types line up; a
-  headless `tsx` script driving the real client against a running demo catches what it can't.
+  users ⇒ shared engine families).
+- **The log server is `apps/durable-streams`, built in this workspace** and spawned for tests by
+  `packages/ds-rust` (override the binary with `DS_RUST_BIN`). Appends are group-commit WAL
+  `fdatasync`. `DS_MEMORY=1` gives an ephemeral data dir (`--durability memory` is Linux-only,
+  macOS falls back to `wal`).
+- **Verify against the live stack, not just types.** `bun run typecheck` proves the types line up;
+  the conformance suite driving the real client against a running engine catches what it can't.
   **Changing code means realigning docs in the same pass.**
 
 ## Git Policy
 
-Do not commit or push unless explicitly asked. At handoff, report changed files, validation run,
-and suggested next commands.
+Do not commit or push unless explicitly asked. History is one line: rebase, never merge. At
+handoff, report changed files, validation run, and suggested next commands.

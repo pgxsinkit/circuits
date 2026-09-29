@@ -1,6 +1,6 @@
 # Fork scope: the native path is the product surface; the Electric adapter is kept for upstream only
 
-Status: accepted (2026-08-21)
+Status: superseded by [ADR-0011](0011-one-repository-no-longer-a-fork.md) (2026-09-29). Accepted 2026-08-21.
 
 This repository is the `pgxsinkit/electric-circuits` fork of `electric-sql/electric-circuits`. Our
 consumer reaches the engine only through the native control plane (`POST /shapes` with the predicate

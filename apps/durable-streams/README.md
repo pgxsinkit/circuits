@@ -1,26 +1,21 @@
 # Durable Streams server (Rust)
 
-[Durable Streams](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md) is an open protocol for persistent, resumable event streams over plain HTTP — the data primitive for the agent loop.
+[Durable Streams](https://github.com/pgxsinkit/durable-streams/blob/a172acc389351cb3db6deb5cd60e3dec11e7ff39/PROTOCOL.md) is an open protocol for persistent, resumable event streams over plain HTTP — the data primitive for the agent loop.
 
 This is a Rust implementation of that protocol. It's a single self-contained binary with no database, broker, or other moving parts — just a process and a data directory. It stores each stream as the literal bytes it puts on the wire, so reads are byte ranges of a file.
 
-## Install
+## Build
 
-Three ways to get the server (Linux/macOS, x64/arm64):
+The log server is a member of this repository's Cargo workspace. From the repository root:
 
 ```bash
-# 1. cargo (builds the binary `durable-streams-server`)
-cargo install durable-streams
-
-# 2. npm (downloads a prebuilt binary for your platform)
-npm install -g @electric-ax/durable-streams-server-rust
-
-# 3. Docker (multi-arch image)
-podman run -p 4437:4437 electricax/durable-streams-server-rust
+cargo build -p durable-streams                                      # target/debug/durable-streams-server
+cargo build -p durable-streams --profile release-durable-streams    # as it ships: LTO, one codegen unit
+podman build -f container/Containerfile.durable-streams -t localhost/circuits-durable-streams:dev .
 ```
 
-cargo and npm both install the `durable-streams-server` command; the Docker image
-runs it directly.
+The published image is `ghcr.io/pgxsinkit/circuits/durable-streams`. It is not published to
+crates.io, npm or Docker Hub: the packages there under this name are upstream's.
 
 ## Quickstart
 
@@ -151,7 +146,7 @@ runs the full conformance suite once per configuration (the `conformance` matrix
 
 Core protocol: create / append / read (catch-up, long-poll, SSE), HEAD, DELETE, JSON mode, idempotent producers (`Producer-Id` / `Producer-Epoch` / `Stream-Seq`), close, TTL / expiry, cursors, ETags / 304, security headers, and stream forks.
 
-Durable: in `wal` mode (the default), an append returns only after its record is durable in the sharded write-ahead log (WAL). The WAL acks on a group-commit `fdatasync` and recovers cleanly on restart: every WAL record carries both a header CRC32C (torn-header detector — a partially-written header fails immediately) and a payload CRC32C verified on recovery, so no torn or zeroed record is ever replayed. State survives restarts — on boot the store rebuilds every stream from its data file plus a `.meta` sidecar, re-links fork chains, and replays the WAL to reconcile any un-checkpointed tail. (Crash window per [PROTOCOL.md](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md): producer dedup state may lag the data file, so producers should bump their epoch on restart.)
+Durable: in `wal` mode (the default), an append returns only after its record is durable in the sharded write-ahead log (WAL). The WAL acks on a group-commit `fdatasync` and recovers cleanly on restart: every WAL record carries both a header CRC32C (torn-header detector — a partially-written header fails immediately) and a payload CRC32C verified on recovery, so no torn or zeroed record is ever replayed. State survives restarts — on boot the store rebuilds every stream from its data file plus a `.meta` sidecar, re-links fork chains, and replays the WAL to reconcile any un-checkpointed tail. (Crash window per [PROTOCOL.md](https://github.com/pgxsinkit/durable-streams/blob/a172acc389351cb3db6deb5cd60e3dec11e7ff39/PROTOCOL.md): producer dedup state may lag the data file, so producers should bump their epoch on restart.)
 
 In `memory` mode there is no WAL and no WAL replay. Recovery is a sidecar pass: each stream is rebuilt from its per-stream data file and `.meta` sidecar; durability is delegated to (future) replication.
 
@@ -193,9 +188,7 @@ preflight advertising nothing — are fixed; see PROVENANCE.md.
 
 ## Releasing
 
-Released via Changesets to three channels — crates.io (`durable-streams`), npm
-(`@electric-ax/durable-streams-server-rust`, currently gated off), and Docker Hub
-(`electricax/durable-streams-server-rust`). See [RELEASING.md](RELEASING.md).
+Released with the repository, as a container image. See [RELEASING.md](RELEASING.md).
 
 ---
 

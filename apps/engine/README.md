@@ -15,8 +15,8 @@ Design and execution model: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md) a
 ## Build & run
 
 ```bash
-cargo build -p circuits-engine          # or: pnpm engine:build (repo root)
-cargo test  -p circuits-engine          # or: pnpm engine:test
+cargo build -p circuits-engine          # or: bun run engine:build (repo root)
+cargo test  -p circuits-engine          # or: bun run engine:test
 
 CIRCUITS_DS_URL=http://127.0.0.1:8791 \
 CIRCUITS_PG_URL=postgres://postgres@127.0.0.1:5432/postgres \

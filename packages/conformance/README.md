@@ -41,12 +41,12 @@ Requires PostgreSQL 16 binaries on `PATH` (`initdb`/`pg_ctl`) — the suite boot
 From the repo root:
 
 ```bash
-pnpm test:conformance     # the whole suite
-pnpm test:fuzz            # the random-predicate fuzz test
-pnpm loop [N]             # run the fuzz test repeatedly until failure (default 50 iterations)
+bun run test:conformance     # the whole suite
+bun run test:fuzz            # the random-predicate fuzz test
+bun run loop [N]             # run the fuzz test repeatedly until failure (default 50 iterations)
 
 # a fuzz failure prints `FAILED seed=<n>`; replay it exactly:
-SEED=<n> pnpm exec vitest run packages/conformance/src/conformance-fuzz.test.ts
+SEED=<n> bun run test:fuzz
 ```
 
 Fuzz tunables: `FUZZ_SEEDS` (scenarios per run, default 5), `FUZZ_SHAPES`, `FUZZ_OPS`, `SEED`

@@ -1,37 +1,38 @@
 # Contributing
 
-Thanks for your interest in Circuits. Issues and pull requests are welcome.
+## Before changing anything
 
-## Getting started
-
-Read the [README](README.md) for what the project is, and [AGENTS.md](AGENTS.md) for the
-repository layout, the docs index, and the invariants the engine must hold. The docs it points
-to (`docs/ARCHITECTURE.md`, `docs/ivm-engine-internals.md`) explain the design; read them
-before changing the engine.
+Read the [README](README.md) for what the repository is, [CONTEXT.md](CONTEXT.md) for its
+vocabulary, and [AGENTS.md](AGENTS.md) for the layout and the invariants the engine must hold.
+`docs/ARCHITECTURE.md` and `docs/ivm-engine-internals.md` explain the engine's design, and
+`apps/durable-streams/ARCHITECTURE.md` the log server's. Read them before changing either.
 
 ## Build and test
 
-You need Node 20+, pnpm, Rust (pinned by `rust-toolchain.toml`), and Docker (for Postgres).
+The toolchain is pinned: Rust by `rust-toolchain.toml`, bun and node by `mise.toml`. Containers are
+built with podman. The test harness needs PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`.
 
 ```bash
-pnpm install
-pnpm engine:test                               # Rust unit + integration (fast)
-CIRCUITS_ENGINE_PREBUILT=1 pnpm test  # full vitest suite incl. oracle conformance
+mise install
+bun install
+bun run engine:test                        # the engine's Rust tests
+bun run test:durable-streams               # the log server's Rust tests
+bun run typecheck
+bun run test                               # every TypeScript suite, engine conformance included
+bun run test:durable-streams:conformance   # the protocol suite, against the log server
 ```
 
-A change that touches the engine must pass both suites. The full runbook — conformance against
-Electric's own oracle, the demo stack, the visualizer — is in the "Build & test" and "Testing
-checklist" sections of AGENTS.md.
+A change to the engine must pass the engine's tests and `bun run test`. A change to the log server
+must pass its tests, its conformance run and `bun run test`, because the engine depends on it.
 
-## Pull requests
+## History
 
-- Keep each PR to one change; small PRs merge faster.
-- Say what the change does and why; link the issue if one exists.
-- Add or extend tests for behavior you change — the conformance suite is the safety net, but
-  regressions should be caught closer to the code.
+History is one line. Rebase onto the branch you are changing; never merge into it. Keep each commit
+to one change, say what it does and why, and add or extend a test for behaviour you change.
 
-## License
+## Licence
 
-This project is dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE).
-Unless you state otherwise, any contribution you submit is licensed under the same terms,
-with no additional conditions.
+The engine and the test harness are dual-licensed under [MIT](LICENSE-MIT) or
+[Apache 2.0](LICENSE-APACHE); the log server is licensed under
+[Apache 2.0](apps/durable-streams/LICENSE). Unless you state otherwise, a contribution is licensed
+under the terms of the part it changes, with no additional conditions.

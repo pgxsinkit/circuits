@@ -7,7 +7,8 @@
   "private": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pgxsinkit/durable-streams-rust.git"
+    "url": "git+https://github.com/pgxsinkit/circuits.git",
+    "directory": "apps/durable-streams"
   },
   "scripts": {
     "test:conformance": "vitest run --config conformance/vitest.config.ts"

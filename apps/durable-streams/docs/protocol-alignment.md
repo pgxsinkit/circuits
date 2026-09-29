@@ -2,7 +2,7 @@
 
 Audited against:
 
-- Protocol: [DRAFT Durable Streams Protocol 1.0](https://github.com/durable-streams/durable-streams/blob/main/PROTOCOL.md)
+- Protocol: [DRAFT Durable Streams Protocol 1.0](https://github.com/pgxsinkit/durable-streams/blob/a172acc389351cb3db6deb5cd60e3dec11e7ff39/PROTOCOL.md)
 - Upstream repository commit: `a172acc389351cb3db6deb5cd60e3dec11e7ff39`
 - Published conformance suite: `@durable-streams/server-conformance-tests@0.3.6`
 

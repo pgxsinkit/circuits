@@ -850,7 +850,7 @@ than the mechanism.
   `shutting_down`); `GET /v1/health` is unchanged Electric-fleet parity. The HTTP surface comes up
   before Postgres so readiness is answerable while the boot is still retrying.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
-  indexes + shape contents, consumed by the **pipeline explorer** (`apps/pipeline-viz`).
+  indexes + shape contents, for inspecting a running engine.
 - `GET /state`, `GET /state/node?id=…` — per-node live state: summaries for every pipeline node
   (offsets, emit counters, routing-index/inner-set cardinalities, fold values) and on-demand deep
   dumps (a family's routing index contents, an aggregate's fold internals incl. the MIN/MAX
@@ -928,9 +928,9 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/config.rs` | boot config: `CIRCUITS_*` env + Electric fleet-surface mapping |
 | `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
 | `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
-| `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
+| `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE) |
 | `apps/api/src/core.ts` | extended API core (writes, shape/subset/aggregate forwarding) |
 | `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |
 | `packages/client/src/subset.ts` | subset queries: page merge, LSN watermarks, tombstones, feed lifecycle |
-| `docker/` | containerized stack (engine, durable-streams, API, Postgres) |
-| `apps/pipeline-viz` | live pipeline explorer over `GET /graph` + `/state` + `/trace` |
+| `apps/durable-streams` | the log server (its own design is in `apps/durable-streams/ARCHITECTURE.md`) |
+| `container/` | the two image builds |
