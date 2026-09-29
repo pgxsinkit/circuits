@@ -623,6 +623,10 @@ pub async fn append_commit_chunked(
 }
 
 /// What one decoded DML message amounts to for the ingestor.
+// `Env` is the common case — one per replicated row change — and the value is only ever returned
+// by `on_change` and matched at once, never stored, so the unused bytes of the small variants cost
+// nothing. Boxing the envelope would add an allocation per change on the ingest path instead.
+#[allow(clippy::large_enum_variant)]
 enum Decoded {
     Env(Envelope),
     Sync(i64),
