@@ -37,7 +37,7 @@ pub struct Config {
     pub pg_url: Option<String>,
     /// Durable-streams base URL (`CIRCUITS_DS_URL`; required for a real run, set by the entrypoint).
     pub ds_url: Option<String>,
-    /// HTTP bind address for the control plane + `/v1/shape` + `/v1/health`.
+    /// HTTP bind address for the control plane + `/v1/health`.
     pub bind: String,
     /// `tracing` EnvFilter string.
     pub log_filter: String,
@@ -59,8 +59,6 @@ pub struct Config {
     pub statsd: Option<StatsdTarget>,
     /// Period for the periodic system-metrics sampler.
     pub metrics_period: Duration,
-    /// If set, `/v1/shape` requires a matching `secret`/`api_secret` query param.
-    pub secret: Option<String>,
     /// Root dir of durable-streams file storage, for `electric.storage.used.bytes` (`du`).
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
@@ -126,13 +124,9 @@ const HANDLED: &[&str] = &[
     "ELECTRIC_INSTANCE_ID",
     "ELECTRIC_STATSD_HOST",
     "ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL",
-    "ELECTRIC_INSECURE",
-    "ELECTRIC_SECRET",
     "ELECTRIC_STORAGE_DIR",
     "ELECTRIC_LOG_LEVEL",
     "ELECTRIC_REPLICATION_STREAM_ID",
-    "ELECTRIC_LIVE_TIMEOUT_MS",
-    "ELECTRIC_HANDLE_TTL",
     "ELECTRIC_PROMETHEUS_PORT",
     "ELECTRIC_DB_POOL_SIZE",
 ];
@@ -268,10 +262,6 @@ impl Config {
             .or_else(|| g("TELEMETRY_POLLER_PERIOD").and_then(|s| parse_human_duration(&s)))
             .unwrap_or_else(|| Duration::from_secs(5));
 
-        // ELECTRIC_INSECURE is accepted; it is a no-op unless a secret is also set (then it does not
-        // override the secret — an explicit secret always takes effect).
-        let secret = g("ELECTRIC_SECRET");
-
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
         // `CIRCUITS_PG_POOL_SIZE` wins; `ELECTRIC_DB_POOL_SIZE` is the fleet's spelling of it.
@@ -392,7 +382,6 @@ impl Config {
             stack_id,
             statsd,
             metrics_period,
-            secret,
             storage_dir,
             prometheus_port,
             db_pool_size,
@@ -414,11 +403,11 @@ impl Config {
         Ok(cfg)
     }
 
-    /// The bind host:port with the `DATABASE_URL`/`ELECTRIC_SECRET` credentials redacted — safe to log.
+    /// The resolved configuration with the Postgres URL's credentials redacted — safe to log.
     pub fn redacted(&self) -> String {
         format!(
             "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             secret={} storage_dir={} prometheus_port={:?} trace={} log={} \
+             storage_dir={} prometheus_port={:?} trace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
@@ -429,7 +418,6 @@ impl Config {
             self.stack_id,
             self.statsd.as_ref().map(|s| s.addr()).unwrap_or_else(|| "<off>".into()),
             self.metrics_period,
-            if self.secret.is_some() { "<redacted>" } else { "<none>" },
             self.storage_dir.as_deref().unwrap_or("<none>"),
             self.prometheus_port,
             self.trace,
@@ -474,13 +462,11 @@ use std::sync::OnceLock;
 
 static INSTANCE_ID: OnceLock<String> = OnceLock::new();
 static STACK_ID: OnceLock<String> = OnceLock::new();
-static SECRET: OnceLock<Option<String>> = OnceLock::new();
 
-/// Publish the request-path globals (instance id, stack id, `/v1/shape` secret) once at boot.
-pub fn set_globals(instance_id: &str, stack_id: &str, secret: Option<&str>) {
+/// Publish the metric-tag globals (instance id, stack id) once at boot.
+pub fn set_globals(instance_id: &str, stack_id: &str) {
     let _ = INSTANCE_ID.set(instance_id.to_string());
     let _ = STACK_ID.set(stack_id.to_string());
-    let _ = SECRET.set(secret.map(str::to_string));
 }
 
 pub fn instance_id() -> &'static str {
@@ -489,20 +475,6 @@ pub fn instance_id() -> &'static str {
 
 pub fn stack_id() -> &'static str {
     STACK_ID.get().map(String::as_str).unwrap_or("single_stack")
-}
-
-pub fn secret() -> Option<&'static str> {
-    SECRET.get().and_then(|s| s.as_deref())
-}
-
-/// Does the configured secret authorize a request carrying these `secret`/`api_secret` params?
-/// `None` configured → always authorized (no auth). A constant-time-ish compare is unnecessary here
-/// (the secret is a deployment-wide token, not a per-user password), but we still require an exact match.
-pub fn secret_ok(configured: Option<&str>, secret_param: Option<&str>, api_secret_param: Option<&str>) -> bool {
-    match configured {
-        None => true,
-        Some(want) => secret_param == Some(want) || api_secret_param == Some(want),
-    }
 }
 
 #[cfg(test)]
@@ -639,16 +611,6 @@ mod tests {
         assert_eq!(parse_human_duration("1m"), Some(Duration::from_secs(60)));
         assert_eq!(parse_human_duration("500"), Some(Duration::from_millis(500)));
         assert_eq!(parse_human_duration("garbage"), None);
-    }
-
-    #[test]
-    fn secret_and_noop() {
-        assert_eq!(cfg(&[("ELECTRIC_SECRET", "sekret")]).secret.as_deref(), Some("sekret"));
-        assert!(secret_ok(None, None, None));
-        assert!(secret_ok(Some("s"), Some("s"), None));
-        assert!(secret_ok(Some("s"), None, Some("s")));
-        assert!(!secret_ok(Some("s"), Some("nope"), None));
-        assert!(!secret_ok(Some("s"), None, None));
     }
 
     #[test]

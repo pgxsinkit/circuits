@@ -1457,10 +1457,6 @@ async fn sampler_cardinalities_never_populates_bytes_fields() {
     assert_eq!(card.bytes_circuit_snapshots, 0, "sampler path must not measure the circuit snapshot bytes");
     assert_eq!(card.bytes_feed_sets, 0, "sampler path must not measure the host-side feed-set bytes");
     assert_eq!(card.bytes_pk_dict, 0, "sampler path must not measure the pk dictionary bytes");
-    assert_eq!(
-        card.bytes_electric_adapter, 0,
-        "sampler path must not walk the electric adapter TTL registry heap bytes"
-    );
 
     // `Engine::mem_bytes` — the on-demand-only counterpart — does populate them (proves the split
     // isn't just "the fields are dead code"; the walk still exists and works, just gated off the

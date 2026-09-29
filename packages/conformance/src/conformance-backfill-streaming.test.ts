@@ -11,14 +11,13 @@
 //      chunking is invisible in the result. (The durable-streams offset is `{seq}_{byte}` over
 //      MESSAGES, not over appends, so the append boundaries are not recoverable from the offsets
 //      afterwards; the counter is the direct evidence and this is what it says.)
-//   2. a `/v1/shape` snapshot over the same table returns every row;
-//   3. `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS=1` fails THAT create with a clear error and
+//   2. `CIRCUITS_BACKFILL_STATEMENT_TIMEOUT_MS=1` fails THAT create with a clear error and
 //      leaves the ENGINE healthy — proved against the engine, not against Postgres: `/ready` is
 //      still 200, the ingestor and sequencer still carry a write end to end (`drainEngine`), and a
 //      shape created AFTER the failure still receives changes. (The guard is process-wide, so the
 //      shape used for that has to be one that takes no backfill — a `changesOnly` feed — or it
 //      would trip the same 1 ms timeout and prove nothing.);
-//   4. unset (the default), the same create works.
+//   3. unset (the default), the same create works.
 
 import type { Row, Schema } from '@circuits/protocol'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -131,18 +130,6 @@ describe('streamed backfills', () => {
     expect(prom).toMatch(/^engine_replication_slot_retained_wal_bytes\{/m)
     expect(prom).toMatch(/^engine_replication_confirmed_flush_lag_bytes\{/m)
     expect(prom).toMatch(/^engine_replication_slot_active\{/m)
-  })
-
-  it('serves every row through the /v1/shape snapshot over the same table', async () => {
-    await boot({ engineEnv: { CIRCUITS_BACKFILL_APPEND_BYTES: '65536' } })
-    await seedRows()
-
-    const res = await fetch(`${h!.engineUrl}/v1/shape?table=items&offset=-1`)
-    expect(res.status).toBe(200)
-    const messages = (await res.json()) as Array<{ key?: string; headers: { operation?: string; control?: string } }>
-    const inserts = messages.filter((m) => m.headers.operation === 'insert')
-    expect(inserts.length).toBe(ROWS)
-    expect(new Set(inserts.map((m) => m.key)).size).toBe(ROWS)
   })
 
   it('a 1ms statement timeout fails that create with a clear error and leaves the engine healthy', async () => {

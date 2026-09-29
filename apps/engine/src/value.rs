@@ -65,11 +65,11 @@ impl Value {
         })
     }
 
-    /// Type a **where-clause literal** (not a data cell) against a column type, leniently: a string
+    /// Type a **predicate literal** (not a data cell) against a column type, leniently: a string
     /// literal is coerced into the target type (`'5'` → int 5, `'t'` → bool true, …), matching
-    /// Postgres/Electric unknown-literal coercion. This is what lets a substituted `$N` param value
-    /// (always delivered as a string) compare against a non-text column. Typed JSON (number/bool)
-    /// stays strict — same as [`from_json`], so a bare `5` against a text column still errors.
+    /// Postgres unknown-literal coercion, so a string literal can compare against a non-text column.
+    /// Typed JSON (number/bool) stays strict — same as [`from_json`], so a bare `5` against a text
+    /// column still errors.
     pub fn literal_from_json(j: &serde_json::Value, ty: ColumnType) -> Result<Value> {
         if let serde_json::Value::String(s) = j {
             return Ok(match ty {

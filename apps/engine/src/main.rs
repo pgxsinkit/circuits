@@ -58,8 +58,8 @@ async fn main() -> Result<()> {
     }
     tracing::info!("resolved config: {}", config.redacted());
 
-    // Publish request-path globals (instance id, stack id, /v1/shape secret) and wire up StatsD.
-    config::set_globals(&config.instance_id, &config.stack_id, config.secret.as_deref());
+    // Publish the metric-tag globals (instance id, stack id) and wire up StatsD.
+    config::set_globals(&config.instance_id, &config.stack_id);
     if let Some(target) = &config.statsd {
         statsd::init(target, &config.instance_id);
     }
@@ -181,8 +181,7 @@ async fn main() -> Result<()> {
 
     serve.await.context("http server task")??;
 
-    // The accept loop is closed and every in-flight request has finished (the `/v1/shape` live poll
-    // joined the token, so that took milliseconds, not its 20 s window). Now let the engine's own
+    // The accept loop is closed and every in-flight request has finished. Now let the engine's own
     // tasks reach their safe points.
     let outcome = finish_shutdown(&engine_at_exit, &shutdown, config.shutdown_grace).await;
     if outcome != shutdown::ShutdownOutcome::Complete {

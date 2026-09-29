@@ -120,7 +120,7 @@ async fn instrumentation_emits_expected_metric_families() {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let addr = sock.local_addr().unwrap();
     let id = "global-instance-03";
-    config::set_globals(id, "bench-stream", None);
+    config::set_globals(id, "bench-stream");
     statsd::init(&StatsdTarget { host: "127.0.0.1".into(), port: addr.port() }, id);
     assert!(statsd::enabled(), "global StatsD should be active after init");
 

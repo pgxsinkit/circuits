@@ -252,37 +252,6 @@ describe('shape retention lifecycle (active / dormant / evicted)', () => {
     await waitFor(async () => (await fetch(a.streamUrl)).status === 404, 'stream deletion')
   })
 
-  // The `/v1/shape` adapter must turn a retired stream into the answer an evicted handle already
-  // gets (`409 must-refetch`) — not a 500 once the delete lands, and not a full live-timeout wait
-  // (`ELECTRIC_LIVE_TIMEOUT_MS`, 20 s by default).
-  it('a live /v1/shape poll is released with 409 must-refetch when the underlying shape is purged', async () => {
-    await pg('INSERT INTO items (id, n) VALUES (1, 10)')
-    await drainEngine(h)
-
-    const where = 'n >= 10'
-    const snap = await fetch(`${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset: '-1', where })}`)
-    expect(snap.status).toBe(200)
-    const handle = snap.headers.get('electric-handle') as string
-    const offset = snap.headers.get('electric-offset') as string
-    await snap.text() // drain
-
-    const started = Date.now()
-    const live = fetch(
-      `${h.engineUrl}/v1/shape?${new URLSearchParams({ table: 'items', offset, handle, live: 'true', where })}`,
-    )
-    await sleep(250) // let the long-poll park on the durable-streams server
-
-    // A handle is `<shapeId>h<seq>` over a shared engine shape; purge the shape underneath it.
-    await fetch(`${h.engineUrl}/shapes/${handle.replace(/h\d+$/, '')}?purge=true`, { method: 'DELETE' })
-
-    const res = await live
-    const elapsed = Date.now() - started
-    const msgs = (await res.json()) as Array<{ headers: { control?: string } }>
-    expect(res.status).toBe(409)
-    expect(msgs[0]?.headers.control).toBe('must-refetch')
-    expect(elapsed).toBeLessThan(5000)
-  })
-
   it('the dormancy TTL evicts: record 404s, stream is deleted, rejoin creates a fresh shape', async () => {
     await pg('INSERT INTO items (id, n) VALUES (1, 10)')
     await drainEngine(h)

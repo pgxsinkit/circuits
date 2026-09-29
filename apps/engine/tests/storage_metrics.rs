@@ -86,7 +86,7 @@ async fn live_append_emits_storage_txn_metrics() {
     let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
     let port = sock.local_addr().unwrap().port();
     let id = "storage-metrics-test";
-    config::set_globals(id, "single_stack", None);
+    config::set_globals(id, "single_stack");
     statsd::init(&StatsdTarget { host: "127.0.0.1".into(), port }, id);
     assert!(statsd::enabled());
 

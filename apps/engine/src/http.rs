@@ -22,7 +22,7 @@ pub fn router(engine: Engine) -> Router {
 /// zero-subscriber fast path (one atomic load). The surface is unauthenticated when enabled.
 pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router {
     let mut r = Router::new()
-        // Fleet surface: root probe + health state machine (CORS preflight is on the /v1/shape route).
+        // Fleet surface: root probe + health state machine.
         .route("/", get(|| async { StatusCode::OK }))
         .route("/v1/health", get(health_v1))
         // Kubernetes-shaped probes, deliberately split (see `ready` / the liveness note below).
@@ -52,10 +52,7 @@ pub fn router_with_introspection(engine: Engine, introspection: bool) -> Router 
         .route("/metrics", get(get_metrics))
         .route("/metrics/reset", post(reset_metrics))
         .route("/memory", get(get_memory))
-        .route("/metrics/prometheus", get(get_prometheus))
-        // Electric-protocol adapter: lets Electric's official client + oracle harness read our shapes.
-        // OPTIONS is the CORS preflight the fleet's browser-style clients send.
-        .route("/v1/shape", get(crate::electric::shape).options(shape_options));
+        .route("/metrics/prometheus", get(get_prometheus));
     if introspection {
         r = r
             .route("/graph", get(get_graph))
@@ -124,13 +121,6 @@ async fn ready(State(engine): State<Engine>) -> Response {
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache, no-store, must-revalidate"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
     (code, headers, health_json(status)).into_response()
-}
-
-/// `OPTIONS /v1/shape` — CORS preflight: 204 advertising the methods the adapter serves.
-async fn shape_options() -> Response {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, HEAD, DELETE, OPTIONS"));
-    (StatusCode::NO_CONTENT, headers).into_response()
 }
 
 #[derive(Deserialize)]
@@ -353,7 +343,7 @@ struct AggregateReq {
     subscription: Option<String>,
 }
 
-/// Create a scalar aggregation shape (Circuits extension; not in the Electric protocol).
+/// Create a scalar aggregation shape.
 async fn create_aggregate(
     State(engine): State<Engine>,
     Json(req): Json<AggregateReq>,
@@ -452,7 +442,7 @@ async fn get_shape_log(
     let mut live: std::collections::HashMap<String, Option<serde_json::Value>> = std::collections::HashMap::new();
     let mut offset = "-1".to_string();
     loop {
-        let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
+        let r = engine.read_shape_stream(&rec.stream_path, &offset).await?;
         let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             total += 1;
@@ -490,7 +480,7 @@ async fn get_shape_log(
 }
 
 /// The current contents of an **existing** shape, materialized by folding its stream — creates no new
-/// shape (unlike `/v1/shape`). Drives the visualizer's live "contents" preview, which polls this.
+/// shape. Drives the visualizer's live "contents" preview, which polls this.
 async fn get_shape_rows(
     State(engine): State<Engine>,
     Path(id): Path<String>,
@@ -507,7 +497,7 @@ async fn get_shape_rows(
     let mut rows: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
     let mut offset = "-1".to_string();
     loop {
-        let r = engine.read_shape_stream(&rec.stream_path, &offset, false).await?;
+        let r = engine.read_shape_stream(&rec.stream_path, &offset).await?;
         let empty = r.envelopes.is_empty();
         for env in r.envelopes {
             if env.headers.operation == "delete" {
@@ -566,7 +556,7 @@ struct ReleaseShapeQuery {
 /// `subscription` it is the legacy anonymous decrement.
 ///
 /// With `?purge=true` it instead force-drops the shape immediately (subscribed clients recreate via
-/// the normal 404 / must-refetch path).
+/// the normal 404 path).
 ///
 /// Both forms are **durable before they are acknowledged** (ADR-0008): this answers only once the
 /// `Left`/`Dropped` is in the restart contract, because a `200` here is a promise that the release or

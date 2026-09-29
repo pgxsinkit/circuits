@@ -1484,7 +1484,7 @@ mod tests {
     /// one over-budget row on its own), no row is dropped, and snapshot order is preserved across
     /// the chunk boundaries. Those are the three properties a streamed backfill's correctness rests
     /// on — a body over the budget is an append durable-streams can refuse, a dropped row is a
-    /// missing row in the shape, and a reordered one breaks the adapter's deterministic snapshot.
+    /// missing row in the shape, and a reordered one breaks the snapshot's deterministic order.
     #[test]
     fn packing_a_run_of_rows_respects_the_budget_and_preserves_order() {
         const BUDGET: u64 = 100;

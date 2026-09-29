@@ -52,16 +52,14 @@ fn retry_create(
 impl Engine {
     /// `share`: when true, an identical existing shape (same table, canonical predicate, and columns) is
     /// joined by ref-count instead of creating a second stream — so N app clients subscribing to the same
-    /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. Both
-    /// public surfaces pass `true` — the `/v1/shape` adapter included, which keys its per-request live
-    /// state by the SHARED shape id (`electric.rs`), so identical Electric definitions collapse onto one
-    /// maintained stream like any other. `false` exists for callers that genuinely need their own
-    /// handle; nothing in the tree currently does.
+    /// reference shape (e.g. `project_members WHERE user_id = me`) share one maintained output. The
+    /// public surface (`POST /shapes`) passes `true`. `false` exists for callers that genuinely need
+    /// their own handle; nothing in the tree currently does.
     ///
     /// A shared create therefore always pays the join path's stream-liveness `HEAD`
-    /// ([`Self::retire_join_target_if_stream_lost`]), `/v1/shape` requests included. That is the
-    /// intended trade: one storage round trip per join is cheaper than handing an Electric client a
-    /// handle whose stream storage has already lost, which it cannot detect except as an empty sync.
+    /// ([`Self::retire_join_target_if_stream_lost`]). That is the intended trade: one storage round
+    /// trip per join is cheaper than handing a client a handle whose stream storage has already lost,
+    /// which it cannot detect except as an empty sync.
     ///
     /// An attempt that lost a race during its catalog durability wait ([`CreateRaced`], see
     /// [`Self::recheck_after_durability`]) is **redone**, up to [`CREATE_RACE_ATTEMPTS`] times: the
@@ -467,7 +465,7 @@ impl Engine {
             st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
         }
         // Release the engine-state lock, then run the two-phase backfill+activate so the shape's
-        // snapshot is readable when we return (the Electric adapter folds the stream immediately).
+        // snapshot is readable when we return (a client may read the stream immediately).
         // The sequencer keeps processing all tables meanwhile, buffering this shape's deltas.
         drop(st);
         let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
@@ -542,8 +540,8 @@ impl Engine {
     }
 
     /// Create a scalar **aggregation** shape (COUNT/SUM/AVG/MIN/MAX over `where`), maintained
-    /// incrementally. A Circuits extension — not part of the Electric-compatible API. Rejects
-    /// subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a column.
+    /// incrementally. Rejects subquery predicates (use a plain filter); SUM/AVG/MIN/MAX require a
+    /// column.
     pub async fn create_aggregate(
         &self,
         table: &TableRef,
@@ -882,7 +880,7 @@ impl Engine {
     }
 
     /// The **legacy anonymous** release: drop one subscription without being told which
-    /// (`DELETE /shapes/{id}` with no `subscription`, the `/v1/shape` adapter's handle eviction).
+    /// (`DELETE /shapes/{id}` with no `subscription`).
     ///
     /// Kept for callers that never learned their subscription id, and NOT retry-safe: nothing
     /// identifies the claim the caller meant, so a repeat drops a second one. Engine-minted claims
@@ -948,7 +946,7 @@ impl Engine {
     /// entries, lifecycle entry, sequencer routing, subquery-registry entry, durable stream)
     /// regardless of refcount or lifecycle state. An admin/debug operation (`DELETE
     /// /shapes/{id}?purge=true`, the visualizer's trash button) — subscribed clients see their
-    /// stream vanish and recreate via the normal 404 / must-refetch path. The sequencer command
+    /// stream vanish and recreate via the normal 404 path. The sequencer command
     /// queue is FIFO, so a purge ordered after an in-flight resume removes whatever the resume
     /// registered.
     ///
@@ -1101,24 +1099,6 @@ impl Engine {
             trace_lifecycle(&self.trace_tx, crate::trace::GraphLifecycle::ShapeDropped { shape: id.to_string() });
             tracing::info!("purged shape {id} (forced)");
         }
-    }
-
-    /// Renew a subscription's lease **in memory only** — no catalog event (ADR-0008).
-    ///
-    /// For a subscriber the engine can actually SEE: the `/v1/shape` adapter, whose every poll goes
-    /// through the engine, unlike a native subscriber reading durable-streams directly. Its handle
-    /// is the liveness signal, so the poll renews the claim the handle holds and
-    /// `subscriptions_live` keeps describing reality rather than decaying to zero under a client
-    /// that is plainly still there.
-    ///
-    /// Nothing is recorded because there is nothing a restart could use it for: an Electric handle
-    /// does not survive one (the registry is in-memory, and a returning client gets `must-refetch`
-    /// and re-snapshots, which takes a fresh claim). A claim that lapsed before this call is
-    /// re-taken here for the same reason — the handle is demonstrably live — and if the shape is
-    /// gone entirely this is a no-op, which is exactly the `must-refetch` path.
-    pub(crate) async fn renew_subscription_local(&self, id: &str, sub: &str) {
-        let mut st = self.state.lock().await;
-        st.subscribe(id, sub.to_string(), crate::changelog::now_secs());
     }
 
     /// Record an engine-visible read of a shape (drives the retention idle timer + LRU order).
@@ -1443,8 +1423,7 @@ impl Engine {
     }
 
     /// Evict a shape: delete its record, share entries, lifecycle entry, and durable stream. A
-    /// returning `/v1/shape` client gets `409 must-refetch`; an extended-API client gets `404` and
-    /// recreates. Normally only **dormant** shapes are evicted; the exception is non-parkable
+    /// returning client gets `404` and recreates. Normally only **dormant** shapes are evicted; the exception is non-parkable
     /// shapes (subquery / aggregate — see [`crate::retention`]), which the TTL layer evicts
     /// straight from active with a full teardown. Rechecks eligibility under the locks — a
     /// reactivation or rejoin racing the sweep wins.

@@ -1,9 +1,8 @@
 //! Shape retention: the three-tier lifecycle (active / dormant / evicted) and its layered,
 //! dormant-only eviction policy.
 //!
-//! Replaces delete-on-refcount-0 (extended API) and the "handle TTL drops the shape" behavior of
-//! the `/v1/shape` adapter as the primary lifecycle (a deliberate divergence from upstream
-//! Electric, which keeps every retained shape actively maintained):
+//! Replaces delete-on-refcount-0 as the primary lifecycle (a retained shape is not kept actively
+//! maintained for ever):
 //!
 //! - **Active** — maintained live by a tailer. Refcount-0 / client disconnect does NOT deactivate;
 //!   brief reconnects stay warm and rejoin the same stream.
@@ -15,8 +14,7 @@
 //!   backfill (see `Engine::ensure_active`). While dormant a shape PINS its resume segment against
 //!   deletion; one that would pin it past `CIRCUITS_CHANGES_RETAIN_SECS` is evicted
 //!   ([`EvictReason::ChangeLogRetention`]) so the segment can go.
-//! - **Evicted** — stream and record deleted; a returning `/v1/shape` client gets `409
-//!   must-refetch` and re-snapshots, an extended-API client gets `404` and recreates.
+//! - **Evicted** — stream and record deleted; a returning client gets `404` and recreates.
 //!
 //! Eviction is **layered** and applies to dormant shapes only (active shapes are never evicted),
 //! least-recently-read first:
@@ -141,8 +139,7 @@ impl HeapSize for LifeState {
 
 /// Per-shape lifecycle record.
 pub struct ShapeLife {
-    /// Last engine-visible read/touch (shape create/join, `/v1/shape` request, stream read,
-    /// rows/log fold). Drives both the idle timer and the LRU eviction order. Direct
+    /// Last engine-visible read/touch (shape create/join, stream read, rows/log fold). Drives both the idle timer and the LRU eviction order. Direct
     /// durable-streams reads bypass the engine and are NOT observed — but such readers hold a
     /// subscription (refcount ≥ 1), which also blocks dormancy.
     pub last_read: Instant,
@@ -262,7 +259,7 @@ pub fn plan_sweep(cfg: &RetentionConfig, shapes: &[SweepShape]) -> SweepPlan {
         // Shapes that cannot park (subquery / aggregate — their state is not rebuildable from a
         // bounded replay) would otherwise be immortal once unsubscribed: evict them straight from
         // active after the same total grace an eligible shape gets (idle timeout + dormancy TTL).
-        // They are recreatable — a returning client gets 404 / must-refetch and recreates.
+        // They are recreatable — a returning client gets 404 and recreates.
         if !cfg.idle_timeout.is_zero() {
             for s in shapes {
                 if !s.dormancy_eligible

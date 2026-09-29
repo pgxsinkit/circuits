@@ -20,14 +20,12 @@ pub mod arrangements;
 pub mod changelog;
 pub mod config;
 pub mod ds;
-pub mod electric;
 pub mod engine;
 pub mod fault;
 pub mod heap_size;
 pub mod http;
 pub mod mem;
 pub mod metrics;
-pub mod params;
 pub mod pg;
 pub mod pgoutput;
 pub mod pk_dict;
@@ -49,7 +47,6 @@ pub mod table_ref;
 pub mod trace;
 pub mod txn_buffer;
 pub mod value;
-pub mod where_sql;
 
 pub use value::{Row, Value};
 

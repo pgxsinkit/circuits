@@ -301,8 +301,8 @@ pub struct Engine {
     /// operator which envelope to look at, and nothing else in the process knows.
     change_log_failure: Arc<std::sync::Mutex<Option<ChangeLogFailure>>>,
     /// The process's graceful-shutdown state (see [`crate::shutdown`]). Held here — not in a global
-    /// — because every part that must join it (the sequencer's select, the ingestor, the `/v1/shape`
-    /// live poll, `GET /ready`) already has an `Engine`.
+    /// — because every part that must join it (the sequencer's select, the ingestor, `GET /ready`)
+    /// already has an `Engine`.
     shutdown: crate::shutdown::ShutdownToken,
     /// Per-process nonce for the subscription ids the engine mints for creates that named none
     /// (ADR-0008). The counter alone would not do: the catalog outlives the process, so a restart
@@ -1824,20 +1824,14 @@ impl Engine {
         self.subqueries.lock().await.stats()
     }
 
-    /// The schema for `table`, if known (used by the Electric-protocol adapter for the schema header and
-    /// value encoding).
-    pub async fn table_schema(&self, table: &TableRef) -> Option<TableSchema> {
-        self.state.lock().await.tables.get(table).cloned()
-    }
-
-    /// Read a shape's durable stream (catch-up or long-poll live) — used by the Electric adapter to turn
-    /// the engine's shape output into Electric `/v1/shape` change messages.
-    pub async fn read_shape_stream(&self, path: &str, offset: &str, live: bool) -> Result<crate::ds::ReadResult> {
+    /// Read one page of a shape's durable stream from `offset` (catch-up, never a long-poll) — the
+    /// fold behind `GET /shapes/{id}/rows` and `GET /shapes/{id}/log`.
+    pub async fn read_shape_stream(&self, path: &str, offset: &str) -> Result<crate::ds::ReadResult> {
         // A data read is a full retention touch: reactivate a dormant shape before reading (so a
         // parked stream is never served stale) and refresh `last_read`. `ensure_active` is a cheap
         // lifecycle-map check when the shape is active (the common case).
         self.ensure_active(sid_of_path(path)).await?;
-        self.ds.read(path, offset, live).await
+        self.ds.read(path, offset, false).await
     }
 
     /// Engine-internal cardinalities for the memory probe — the structures whose growth drives RSS:
@@ -1969,7 +1963,6 @@ impl Engine {
             (reg.circuit_bytes(), reg.feed_sets_bytes(), reg.heap_bytes(), reg.pk_dict_bytes())
         };
         let bytes_retention = self.lives.lock().unwrap().heap_bytes();
-        let bytes_electric_adapter = crate::electric::ttl_registry_heap_bytes().await;
         crate::mem::HeapBytes {
             bytes_shape_records,
             bytes_executors,
@@ -1980,7 +1973,6 @@ impl Engine {
             bytes_circuit_snapshots: circuit_bytes.snapshot_bytes(),
             bytes_feed_sets,
             bytes_pk_dict,
-            bytes_electric_adapter,
         }
     }
 

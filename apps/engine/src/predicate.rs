@@ -18,8 +18,8 @@ pub enum LeafOp {
     Lte,
     Gt,
     Gte,
-    /// SQL `LIKE` (case-sensitive; `%` = any sequence, `_` = any single char). `NOT LIKE` is modeled as
-    /// `Not(Like)` by the where-clause parser. Added for Electric-protocol conformance.
+    /// SQL `LIKE` (case-sensitive; `%` = any sequence, `_` = any single char). `NOT LIKE` is
+    /// `Not(Like)`.
     Like,
 }
 
@@ -281,8 +281,8 @@ impl CompiledPredicate {
         Ok(match p {
             PredicateJson::Leaf { col, op, value } => {
                 let idx = ts.column_index(col)?;
-                // Leaf literals (incl. substituted `$N` param values, always strings) coerce to the
-                // column type — Postgres/Electric unknown-literal semantics.
+                // A string leaf literal coerces to the column type — Postgres unknown-literal
+                // semantics.
                 let v = Value::literal_from_json(value, ts.column_type(idx))?;
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
             }
@@ -645,9 +645,8 @@ mod tests {
         assert_eq!(CompiledPredicate::MatchAll.access_leaf(), None);
     }
 
-    // Substituted `$N` param values arrive as quoted string literals; a leaf literal coerces to the
-    // column type (Postgres/Electric unknown-literal semantics), so `'18'` works against an int column
-    // and `'true'` against a bool column — this is what makes params work for non-text columns.
+    // A string leaf literal coerces to the column type (Postgres unknown-literal semantics), so
+    // `'18'` works against an int column and `'true'` against a bool column.
     #[test]
     fn string_literal_coerces_to_column_type() {
         let ts = users();
@@ -1024,5 +1023,15 @@ mod tests {
         );
         assert!(or.matches(&null_age_active));
         assert!(!or.matches(&null_age_inactive));
+    }
+
+    #[test]
+    fn like_match_basics() {
+        assert!(like_match("abc", "a%"));
+        assert!(like_match("abc", "_bc"));
+        assert!(!like_match("abc", "a_d"));
+        assert!(like_match("abc", "%"));
+        assert!(like_match("abc", "abc"));
+        assert!(!like_match("abcd", "abc"));
     }
 }

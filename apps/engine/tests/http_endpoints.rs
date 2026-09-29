@@ -1,6 +1,6 @@
 //! Integration tests for the fleet HTTP surface added to the engine router: `/v1/health` (state
-//! machine + exact body + status codes + cache headers), `GET /` (200 empty), the
-//! `OPTIONS /v1/shape` CORS preflight, and the liveness/readiness split (`/health` vs `/ready`).
+//! machine + exact body + status codes + cache headers), `GET /` (200 empty), and the
+//! liveness/readiness split (`/health` vs `/ready`).
 //! The router is driven in-process via `Service::oneshot`; no Postgres or durable-streams server is
 //! needed (the health phase is set at Engine construction).
 
@@ -47,16 +47,6 @@ async fn root_returns_200_empty() {
     let res = router(library_engine()).oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     assert!(body_string(res).await.is_empty());
-}
-
-#[tokio::test]
-async fn options_shape_is_cors_preflight() {
-    let res = router(library_engine())
-        .oneshot(Request::builder().method("OPTIONS").uri("/v1/shape").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::NO_CONTENT);
-    assert_eq!(res.headers().get("access-control-allow-methods").unwrap(), "GET, POST, HEAD, DELETE, OPTIONS");
 }
 
 /// `GET /ready` is the probe a load balancer gates on: 200 only when the engine is actually able
@@ -121,37 +111,6 @@ async fn shutdown_makes_ready_503_before_anything_else_changes() {
     let res = router(engine).oneshot(Request::builder().uri("/v1/health").body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "the fleet healthcheck is unchanged by shutdown");
     assert_eq!(body_string(res).await, r#"{"status":"active"}"#);
-}
-
-/// A NEW `live=true` request during the drain is answered `503` + `Retry-After: 1`, not an empty
-/// 204. Electric's client re-polls a 204 immediately, so 204 would turn the drain window into a
-/// tight poll loop for every live subscriber; a 5xx is what it backs off on.
-#[tokio::test]
-async fn a_new_live_poll_during_the_drain_is_told_to_come_back() {
-    let engine = library_engine();
-    engine.shutdown_token().begin();
-    let res = router(engine)
-        .oneshot(
-            Request::builder().uri("/v1/shape?table=items&handle=h1&offset=0_0&live=true").body(Body::empty()).unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(res.headers().get("retry-after").unwrap(), "1");
-    assert!(body_string(res).await.contains("shutting down"));
-}
-
-/// ...and a NON-live request is not: the drain window exists precisely so requests the engine has
-/// already accepted still get served.
-#[tokio::test]
-async fn a_non_live_request_during_the_drain_is_served_normally() {
-    let engine = library_engine();
-    engine.shutdown_token().begin();
-    let res = router(engine)
-        .oneshot(Request::builder().uri("/v1/shape?table=items&offset=-1").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_ne!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "only live polls are turned away");
 }
 
 #[tokio::test]
@@ -242,7 +201,6 @@ async fn degraded_refuses_the_membership_routes_and_keeps_observability_up() {
         ("GET", "/shapes/s1", ""),
         ("GET", "/shapes/s1/rows", ""),
         ("GET", "/shapes/s1/log", ""),
-        ("GET", "/v1/shape?table=t&offset=-1", ""),
     ] {
         let res = call(method, uri, body).await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} {uri} must refuse");
@@ -297,7 +255,6 @@ async fn a_booting_engine_refuses_shape_mutations_with_retry_after() {
         ("GET", "/shapes/s1/log", ""),
         ("DELETE", "/shapes/s1", ""),
         ("DELETE", "/shapes/s1?purge=true", ""),
-        ("GET", "/v1/shape?table=items&offset=-1", ""),
     ] {
         let res = call(&engine, method, uri, body).await;
         assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} {uri} must wait for the boot");

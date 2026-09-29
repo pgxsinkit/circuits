@@ -14,10 +14,9 @@
 //!    also reads as "not ready", but only after the LB has already sent requests into a closing
 //!    socket; answering 503 for one probe interval first is what makes the drain graceful rather
 //!    than merely fast;
-//! 2. the HTTP server stops accepting and lets its in-flight requests finish — the `/v1/shape`
-//!    `live=true` long-poll and the engine's own durable-streams long-polls join this token in their
-//!    selects, so they return in milliseconds instead of pinning the shutdown for their full
-//!    timeout;
+//! 2. the HTTP server stops accepting and lets its in-flight requests finish — the engine's own
+//!    durable-streams long-polls join this token in their selects, so they return in milliseconds
+//!    instead of pinning the shutdown for their full timeout;
 //! 3. each **party** (the replication ingestor, the sequencer) reaches its own safe point and
 //!    finishes: the ingestor completes a commit it is APPENDING, then records its position
 //!    LOCALLY — the wire acknowledgement to Postgres rides the replication client's own status
