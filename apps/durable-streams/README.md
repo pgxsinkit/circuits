@@ -139,7 +139,7 @@ not the server. Options, in order of preference:
 Every run configuration — durability (`wal` vs `memory`), resident tail cache
 on/off, read-offload, response chunk size — is **protocol-equivalent**, and CI
 runs the full conformance suite once per configuration (the `conformance` matrix in
-`.github/workflows/ci.yml`; flags are passed via `RUST_SERVER_ARGS`, e.g.
+`.github/workflows/validate.yml`; flags are passed via `RUST_SERVER_ARGS`, e.g.
 `RUST_SERVER_ARGS="--durability memory" bun run test:conformance`).
 
 ## What it implements
