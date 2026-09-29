@@ -33,7 +33,7 @@ pub(crate) enum CatalogEvent {
     /// second it was taken at — the lease's start, restored by the fold so a restart does not hand
     /// every subscription a fresh window.
     Created {
-        rec: ShapeRecord,
+        rec: Box<ShapeRecord>,
         sig: Option<String>,
         subscription: String,
         at: u64,
@@ -818,7 +818,7 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
-                self.recs.insert(rec.id.clone(), (rec, sig, [(subscription, at)].into_iter().collect(), None));
+                self.recs.insert(rec.id.clone(), (*rec, sig, [(subscription, at)].into_iter().collect(), None));
             }
             // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
             // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
@@ -2642,7 +2642,7 @@ mod tests {
 
         let registered = restoring(Engine::new(DsClient::new(server.url()))).await;
         let CatalogEvent::Created { rec, .. } = shape("s9", "public.users") else { unreachable!() };
-        registered.state.lock().await.shapes.insert(rec.id.clone(), rec);
+        registered.state.lock().await.shapes.insert(rec.id.clone(), *rec);
         let err = registered
             .apply_catalog(catalog(vec![shape("s1", "public.users")]), &users_compiled(), RestoreMode::Resume)
             .await

@@ -315,7 +315,7 @@ impl Engine {
             // Durable BEFORE the create is acknowledged (awaited at the bottom of the success
             // path): a `POST /shapes` that returns 200 promises a shape that survives a restart.
             let created = self.catalog_tx.send_durable(CatalogEvent::Created {
-                rec: rec.clone(),
+                rec: Box::new(rec.clone()),
                 sig: feed_sig.clone(),
                 subscription: sub.to_string(),
                 at: crate::changelog::now_secs(),
@@ -444,7 +444,7 @@ impl Engine {
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see the subquery path above.
         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
-            rec: rec.clone(),
+            rec: Box::new(rec.clone()),
             sig: feed_sig.clone(),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
@@ -696,7 +696,7 @@ impl Engine {
                     .insert(id.clone(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
                 // Durable before the create is acknowledged — see `create_shape`.
                 let created = self.catalog_tx.send_durable(CatalogEvent::Created {
-                    rec: rec.clone(),
+                    rec: Box::new(rec.clone()),
                     sig: Some(agg_sig.clone()),
                     subscription: sub.to_string(),
                     at: crate::changelog::now_secs(),
@@ -795,7 +795,7 @@ impl Engine {
         st.shapes.insert(id.clone(), rec.clone());
         // Durable before the create is acknowledged — see `create_shape`.
         let created = self.catalog_tx.send_durable(CatalogEvent::Created {
-            rec: rec.clone(),
+            rec: Box::new(rec.clone()),
             sig: Some(agg_sig.clone()),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
