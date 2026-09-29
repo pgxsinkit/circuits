@@ -241,17 +241,14 @@ Two caveats worth knowing rather than discovering:
 - **`SIGTERM` drains, it does not kill.** On the signal the engine turns `GET /ready` into
   `503 {"status":"shutting_down"}` and keeps the port open for
   `CIRCUITS_SHUTDOWN_DRAIN_SECS` (2 s) so your load balancer takes the pod out of rotation;
-  then it stops accepting, releases every parked `/v1/shape` long-poll at once (rather than holding
-  the termination grace for their full ~20 s window), lets the ingestor finish the transaction it is
-  *appending*, lets the sequencer finish its batch and write a final checkpoint, drains that
-  checkpoint to durable-streams, and exits `0`. The ingestor's position is recorded **locally**: the
+  then it stops accepting, lets the ingestor finish the transaction it is *appending*, lets the
+  sequencer finish its batch and write a final checkpoint, drains that checkpoint to
+  durable-streams, and exits `0`. The ingestor's position is recorded **locally**: the
   acknowledgement Postgres sees rides the replication client's 1 s status interval and is not forced
   on the way out, so a shutdown never advances the slot and the last second's commits are
-  re-delivered on the next boot and de-duplicated there. New `live=true` requests arriving during
-  the drain are answered `503` + `Retry-After: 1` so clients back off to the successor instead of
-  spinning. Shape streams are **never** closed or deleted on
-  shutdown — the restored shape continues its stream, so a restart costs clients nothing. The whole
-  sequence is bounded by `CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s); a second signal, or the
+  re-delivered on the next boot and de-duplicated there. Shape streams are **never** closed or
+  deleted on shutdown — the restored shape continues its stream, so a restart costs clients nothing.
+  The whole sequence is bounded by `CIRCUITS_SHUTDOWN_GRACE_SECS` (25 s); a second signal, or the
   grace running out, exits `70` immediately (nothing is corrupted: an unacknowledged commit is
   re-delivered and the previous checkpoint stands). Keep `terminationGracePeriodSeconds` above the
   grace.
@@ -259,8 +256,7 @@ Two caveats worth knowing rather than discovering:
   process runs, and it must never be what restarts a pod. `GET /ready` is readiness — 200 only when
   Postgres is connected, the slot is verified, the catalog is restored and the ingestor is running;
   otherwise 503 with the reason word (`waiting`, `starting`, `degraded`, `shutting_down`). Point
-  Kubernetes at those two, not at `/v1/health` (which exists for Electric-fleet parity and answers
-  202 while booting).
+  Kubernetes at those two.
 - **A boot failure is either fatal or retryable, and the engine says which.** Bad credentials, a
   missing privilege, an unknown database, `wal_level` ≠ `logical` (checked explicitly at connect —
   it needs a Postgres *restart* to fix), a `CIRCUITS_PG_URL` the driver cannot parse (caught
@@ -293,8 +289,8 @@ Two caveats worth knowing rather than discovering:
 - **Replication slot lag:** an engine that is stopped for a long time holds its slot, and Postgres
   retains WAL for it. If you decommission an engine, drop its slot:
   `SELECT pg_drop_replication_slot('<slot>');` The engine measures both numbers for you every ~10 s
-  on a pooled connection and publishes them on `GET /metrics` and `GET /metrics/prometheus` (with or
-  without StatsD): `replication_slot_retained_wal_bytes` (`pg_current_wal_lsn() - restart_lsn` — the
+  on a pooled connection and publishes them on `GET /metrics` and `GET /metrics/prometheus`:
+  `replication_slot_retained_wal_bytes` (`pg_current_wal_lsn() - restart_lsn` — the
   WAL the source database is holding on disk for this engine, i.e. what fills its volume) and
   `replication_confirmed_flush_lag_bytes` (`pg_current_wal_lsn() - confirmed_flush_lsn` — ingest
   lag). `replication_slot_active` is `1` while a walsender holds the slot. Alert on the first one
@@ -314,7 +310,7 @@ Two caveats worth knowing rather than discovering:
   for an eviction and re-subscribe), creates a fresh slot under the same name, records the new epoch,
   and resumes. Expect a backfill storm proportional to your live shape count, and note that a table
   with a counts pipeline additionally restarts the process (exit `75`). With
-  `CIRCUITS_RESET_ON_SLOT_LOSS=false` it **refuses**: ingest stops, `/v1/health` reports
+  `CIRCUITS_RESET_ON_SLOT_LOSS=false` it **refuses**: ingest stops, `/ready` reports
   `degraded` (503) and every shape route answers 503, `GET /replication/lsn` names the reason
   (`epoch.state = "broken"`, `epoch.reason` = `slot_lost` | `slot_wal_lost` |
   `system_identifier_mismatch`), and nothing is torn down until you post `/epoch/reset` — which then
@@ -324,7 +320,7 @@ Two caveats worth knowing rather than discovering:
 - **A change the engine cannot process parks it — and only an operator clears that.** If the
   sequencer reaches a change-log envelope it cannot decode under the very schema it was written with
   (an engine bug or corrupt storage; schema drift is recognised and never looks like this — ADR-0010),
-  it stops AT that envelope: `/ready` and `/v1/health` report `degraded`, every shape route answers
+  it stops AT that envelope: `/ready` reports `degraded`, every shape route answers
   503, and `GET /replication/lsn` names it (`epoch.reason = change_log_unprocessable`, plus a
   `changeLogFailure` object with the table, key, txid, lsn, position and error; the same object is on
   `GET /metrics`). This break is **never** reset automatically, whatever

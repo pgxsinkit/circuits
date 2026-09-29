@@ -1,7 +1,6 @@
 # The Circuits engine image, published as ghcr.io/pgxsinkit/circuits/engine by
 # .github/workflows/images.yml: the Rust binary (apps/engine) that tails Postgres logical
-# replication, maintains shapes/subqueries/aggregations, and serves both the control-plane HTTP
-# API and the Electric-compatible `GET /v1/shape` endpoint.
+# replication, maintains shapes/subqueries/aggregations, and serves the control-plane HTTP API.
 #
 # The build context is the repository root:
 #   podman build -f container/Containerfile.engine -t localhost/circuits-engine:dev .

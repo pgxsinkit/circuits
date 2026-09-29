@@ -23,13 +23,9 @@ a bare name is only shorthand for `public.<name>` at the API boundary.
 _Avoid_: bare table name, relation OID
 
 **Native path**:
-The engine's own control plane (`POST /shapes`, the predicate AST) plus reads straight from durable
-streams — the only surface this repository develops.
-
-**Compat adapter**:
-The Electric-protocol `GET /v1/shape` surface. Nothing of ours calls it, and it is being removed
-([ADR-0011](docs/adr/0011-one-repository-no-longer-a-fork.md)).
-_Avoid_: Electric path, legacy API
+The engine's control plane (`POST /shapes` with the predicate AST, `DELETE /shapes/{id}`, the probes
+and the introspection routes) plus reads of shape streams straight from the log server. A client
+creates and renews its shape through the engine and reads its rows from the log server.
 
 **Shape**:
 A live, incrementally maintained selection of a table's rows, materialised as one stream.

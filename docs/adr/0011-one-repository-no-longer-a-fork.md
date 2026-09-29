@@ -6,6 +6,11 @@ Status note (2026-09-29): `electric-conformance/` was removed ahead of the rest 
 not run here: it started the stack through a launcher in the benchmarks package, which was not brought
 over, and it needed Elixir and a checkout of Electric.
 
+Status note (2026-09-29): the compatibility adapter (`GET /v1/shape`), the fleet surface
+(`GET /v1/health`, `GET /`, the `ELECTRIC_*` and `DATABASE_URL` settings) and the StatsD exporter
+were removed in commits 2f30abf, 3267490 and b45a592. The tests that reached engine behaviour through
+the adapter or `/v1/health` were ported to the native path first, in 79101d2.
+
 The Circuits engine and the durable-streams log server were two forks in two repositories, each
 tracking an upstream that has stopped maintaining it. They are now one repository,
 `pgxsinkit/circuits`, maintained here outright. The reasons, and the alternatives that were turned

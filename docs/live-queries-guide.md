@@ -13,8 +13,8 @@ A **live query** is a filtered view of one table:
 > **one table + an optional `WHERE` over that table's own columns + an optional `columns`
 > projection.**
 
-In the API these are created with `client.shape()` and served at `/v1/shape` (the Electric
-protocol name); conceptually we call them **live queries**.
+In the API these are created with `client.shape()` (a **shape** on the engine's control plane);
+conceptually we call them **live queries**.
 
 You create it once; the engine keeps its result set live as Postgres changes, delivering
 incremental `upsert`/`delete` updates to its feed. There are **no general joins** — the one
@@ -51,8 +51,7 @@ via snapshot reads. (The engine can also run without Postgres — writes go thro
 - **PostgreSQL 16** with `wal_level = logical`.
 - Each replicated table needs `REPLICA IDENTITY FULL` so updates/deletes carry the **old** row
   (the engine sets this during setup; see `docs/deployment-postgres.md`).
-- Each replicated table needs a **primary key** (single or composite — composite keys are
-  supported and used by Electric's `*_tags` tables).
+- Each replicated table needs a **primary key** (single or composite).
 
 ### Engine configuration (environment)
 
@@ -113,21 +112,6 @@ const off = liveQuery.subscribe((changes) => { /* insert/update/delete batches *
 
 `client.shape()` creates the live query and returns a **TanStack DB collection** kept live by a
 stream-db reader on its feed; it re-renders on every delta.
-
-### Via the Electric `/v1/shape` HTTP protocol
-
-The engine also speaks Electric's wire protocol (`apps/engine/src/electric.rs`), so existing
-Electric clients/tools work:
-
-- **Snapshot:** `GET /v1/shape?table=todos&where=<SQL WHERE>` (or `offset=-1`) → the current rows
-  as `insert` messages + an `up-to-date` control message. Response carries `electric-handle` and
-  `electric-offset` headers. The `table` param is **resolved**, not stripped: `public.todos` and
-  `reporting.todos` are different tables, and a bare `todos` means `public.todos`.
-- **Live:** `GET /v1/shape?...&handle=<h>&offset=<o>&live=true` long-polls for `insert`/`update`/
-  `delete` from that offset. An unknown handle returns `must-refetch`.
-
-Here the `where` is a **SQL string** (`status = 'active' AND priority > 2`, `BETWEEN`, `IN (…)`,
-`IN (SELECT …)`, `NOT IN`), parsed by the engine's WHERE parser.
 
 ### The `columns` projection
 
@@ -267,9 +251,8 @@ To read retained state directly (independent of allocator noise), scrape the OTe
 | cross-table membership | **subquery** `col IN (SELECT …)` | single column; nestable; auto-shared |
 | exclusion | subquery `negated: true` | SQL `NOT IN` NULL semantics |
 | an ordered page / infinite scroll | **subset query** (`orderBy`+`limit`) | not a live query; no top-N state |
-| a live count / sum / avg / min / max | **aggregation** (`client.aggregate({ table, fn, col?, where })`) | one maintained fold shared by all subscribers; SQL NULL semantics; extended API only |
+| a live count / sum / avg / min / max | **aggregation** (`client.aggregate({ table, fn, col?, where })`) | one maintained fold shared by all subscribers; SQL NULL semantics |
 | ordering / text search of a synced set | **client-side live query** (TanStack DB's `useLiveQuery`) | no re-sync |
-| Electric-compatible HTTP client | `GET /v1/shape` | snapshot + `live=true` long-poll |
 
 Identical live queries are **de-duplicated end to end**: two `shape()`/`subset()`/`aggregate()`
 calls with the same definition (predicate order doesn't matter) share one maintained stream on the

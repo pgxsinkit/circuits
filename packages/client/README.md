@@ -2,8 +2,7 @@
 
 The browser/Node client for the extended Circuits API: a typed tRPC client over
 [`@circuits/api`](../../apps/api/README.md) plus `@durable-streams/state` for materializing
-shape streams into live TanStack DB collections. (ElectricSQL clients don't use this package —
-they sync straight from the engine's `/v1/shape`.)
+shape streams into live TanStack DB collections.
 
 ```ts
 import { createClient } from '@circuits/client'

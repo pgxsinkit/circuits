@@ -263,7 +263,7 @@ subqueries).
    moved and derive nothing. Exhausting the retries loses effects that cannot be re-derived, so
    the engine fails closed — the batch keeps its `pendingFlips` count forever (the barrier now
    means "every computed effect has landed **or** the engine says it is degraded"), `flipFailures`
-   counts it, and the engine degrades: every membership-bearing route answers 503, `/v1/health`
+   counts it, and the engine degrades: every membership-bearing route answers 503, `/ready`
    reports `degraded`, every subquery shape's durable stream is deleted (clients read storage
    directly, past the HTTP surface), and only a restart — which re-seeds every node from Postgres
    — recovers. The restart *drops* every subquery shape (their inner-node state is not persisted,
@@ -336,8 +336,6 @@ key on `(table, predicate, fn, column)` in their own namespace. Consequences:
 - Creation is **atomic**: on any failure the record, share entries, and (for subqueries) every
   node refcount/edge/pending-seed added by the attempt are rolled back
   (`subquery.rs::rollback_create`).
-- The Electric `/v1/shape` adapter passes `share=false` (its protocol needs per-request
-  handles); everything else shares by default.
 
 ### 3.6 Aggregations (extended API)
 
@@ -586,16 +584,14 @@ executors via a trait so presentation cannot drift from execution.
 | `apps/engine/src/replication.rs` | Postgres logical-replication ingestor (streaming pgoutput via the `pgoutput.rs` decoder, buffer per-txn, stamp commit LSN + xid + seq, append, acknowledge) |
 | `apps/engine/src/pg.rs` | connect/introspect, `REPLICA IDENTITY FULL`, slot create, predicate-pushdown backfill + `SnapshotGate`, subset query-back |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued `matches`/`matches_ctx`, `equality_template`, subquery signatures |
-| `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (backfill pushdown); SQL `WHERE` → predicate (Electric path) |
+| `apps/engine/src/sql.rs` | predicate → SQL (backfill pushdown) |
 | `apps/engine/src/schema.rs` | schema, composite PK (`pk_cols`, `\u{1f}` key join), JSON⇄Row |
 | `apps/engine/src/value.rs` | `Value`, `Row` (the dbsp Z-set element) |
 | `apps/engine/src/ds.rs` | durable-streams HTTP client + `Envelope` |
-| `apps/engine/src/electric.rs` / `http.rs` | `/v1/shape` Electric adapter + control-plane HTTP |
+| `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/metrics.rs` / `mem.rs` | counters, latency histograms, OTel memory/cardinality gauges |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `CIRCUITS_*` env + Electric fleet-surface mapping |
-| `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
-| `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
+| `apps/engine/src/config.rs` | boot config: the `CIRCUITS_*` environment |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE, feeds the explorer) |
 
 ## 8. Related documents

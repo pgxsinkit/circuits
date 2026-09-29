@@ -22,7 +22,7 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 - [0005 — The reconciler does not pick up new or re-created tables without a restart](0005-reconciler-does-not-pick-up-new-tables.md) — candidate
 - [0006 — A TRUNCATE replayed after a crash re-retires the table's shapes](0006-truncate-replay-window-re-retires-shapes.md) — candidate
 - [0007 — Three refusal paths have no end-to-end lane](0007-three-refusal-paths-have-no-end-to-end-lane.md) — candidate
-- [0008 — `CIRCUITS_DS_URL` is not validated at resolve, and `ELECTRIC_PROMETHEUS_PORT` is accepted but ignored](0008-ds-url-not-validated-and-prometheus-port-ignored.md) — candidate
+- [0008 — `CIRCUITS_DS_URL` is not validated at resolve](0008-ds-url-not-validated-and-prometheus-port-ignored.md) — candidate
 - [0009 — A Postgres error with no SQLSTATE and no io source retries forever at boot](0009-no-sqlstate-postgres-error-retries-forever.md) — candidate
 - [0010 — The harness client does not re-subscribe when its stream is retired](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) — candidate
 
@@ -31,4 +31,4 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 Four issues of `pgxsinkit/electric-circuits` were open when this repository was made and are not
 items here. #4 (`subset()` with limit 0), #5 (`subset()` and NULL sort keys) and #14 (the walsender
 connect timeout) were already fixed in the code. #18 is a defect of the compatibility adapter, which
-is being removed (ADR-0011).
+has since been removed (ADR-0011).

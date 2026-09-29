@@ -66,9 +66,6 @@ Task 2.2 moved it back to the host as a bitmap — which re-provides the structu
 delete exists iff `remove()` returns true, same lock scope) while being far lighter and needing
 no spill. §3–§4 below.
 
-(The Electric `/v1/shape` adapter additionally keeps a TTL-evicted per-handle key set in
-`electric.rs` for protocol filtering — same order, handle-scoped, dropped on idle.)
-
 ### Across subquery shapes — the outer-shape conjunct index
 
 | structure | cardinality | scales with |

@@ -20,9 +20,8 @@ non-harness consumer of `@circuits/client`'s lease keeper.
   renews a subscription on a shape that is gone, gets refused, and keeps going until the test ends.
 - The body it cannot parse starts `shape crea…` — the text of the engine's `CreateRaced` answer
   (`shape create on 'public.items' lost a race during its catalog durability wait …; retry`). The
-  engine itself answers JSON (`{ "error": … }` on the native routes, `{ "message": … }` on the
-  Electric adapter), so a layer between the engine and the tRPC client re-emits the message as a bare
-  string: `apps/api/src/core.ts:100` wraps the engine body into `Error("engine … -> 503: …")`, and the
+  engine itself answers JSON (`{ "error": … }`), so a layer between the engine and the tRPC client
+  re-emits the message as a bare string: `apps/api/src/core.ts:100` wraps the engine body into `Error("engine … -> 503: …")`, and the
   tRPC transport delivers something the client hands straight to `JSON.parse`. The exact hop was not
   traced; the noise is harness-only (pgxsinkit talks to the engine's native HTTP directly and maps
   every 5xx to its own 503 — this path is the `@circuits/api` tRPC surface).

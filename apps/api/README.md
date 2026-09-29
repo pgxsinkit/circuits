@@ -11,8 +11,7 @@ Rust engine and durable-streams:
 - **reads never pass through this server**: a create returns a `ShapeHandle` (`shapeId`,
   `streamPath`, `streamUrl`) and the client reads the durable stream directly.
 
-The Electric-compatible `GET /v1/shape` endpoint is served by the **engine**, not here. Architecture:
-[docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
+Architecture: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
 
 ## Procedures (`src/router.ts`)
 

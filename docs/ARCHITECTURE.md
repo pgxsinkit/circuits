@@ -31,8 +31,7 @@ The as-built system architecture. Companion documents:
                                   │ read / long-poll
                                   ▼
                                CLIENTS
-                                  ├─ @circuits/client  (shapes, subset queries, aggregations)
-                                  └─ ElectricSQL client     (GET /v1/shape on the engine)
+                                  └─ @circuits/client  (shapes, subset queries, aggregations)
 ```
 
 Three ideas carry the whole design:
@@ -59,8 +58,7 @@ Three ideas carry the whole design:
   one `shape/<id>` stream per distinct shape (the
   result feed). The decoupling boundary between write and read paths.
 - **engine** (`apps/engine`, Rust) — the core: replication ingest, per-change Z-set deltas, fan-out to
-  shapes/subqueries/aggregations, the control-plane HTTP API, and the Electric-compatible
-  `GET /v1/shape` endpoint.
+  shapes/subqueries/aggregations, and the control-plane HTTP API.
 - **API** (`apps/api`, tRPC) — the extended surface used by `@circuits/client`: `schema.define`,
   `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
@@ -283,10 +281,7 @@ as before. An **aggregate** folds each chunk into an `AggSeed` and drops the row
 through it. A **subquery inner-set node's** seed is the one thing still collected whole, because that
 set *is* the state the node will maintain; a subquery *shape's* outer backfill is chunked like any
 other, keeping only the pk set the gated replay is fenced against. The `REPEATABLE READ` bracket, the
-fence capture and `row_json_expr`'s casts are unchanged. The compat adapter's `/v1/shape` snapshot is
-the one place a whole result is still held at once, and it has to be — the snapshot body *is* every
-row; its sibling fold, the client's key set for a catch-up read, drops values as it goes and keeps
-keys only.
+fence capture and `row_json_expr`'s casts are unchanged.
 
 **LSN comparison alone is not sound.** `pg_current_wal_lsn()` is a WAL *write* position, but snapshot
 visibility is decided later, at `ProcArrayEndTransaction` (after the commit record is fsynced). A
@@ -373,7 +368,7 @@ The shape of the predicate picks the strategy (full detail + cost model: interna
   subquery form — the registry is the one membership implementation (row data lives in
   Postgres; see §6b).
 
-**Aggregations** (Circuits extension, not part of the Electric-compatible API): a scalar
+**Aggregations**: a scalar
 COUNT/SUM/AVG/MIN/MAX over a non-subquery predicate, maintained incrementally as a fold over the
 delta — COUNT/SUM/AVG hold running scalars, MIN/MAX a `value → net-weight` multiset so retractions
 restore the previous extreme. A COUNT whose predicate decomposes over a counts pipeline's group
@@ -427,12 +422,10 @@ Any two **equal** shapes share one maintained stream, held by a set of named sub
   release is not a teardown. N subscribers hold the same id, each releasing its own; the client
   still enforces one-shot `close()`, but a double or retried close is now harmless on the wire
   because it names a claim that is already gone.
-- **Both public surfaces share.** The Electric `/v1/shape` adapter passes `share=true` as well and
-  keys its per-request live state by the SHARED shape id (`electric.rs`), so identical Electric
-  definitions collapse onto one maintained stream like everything else; `share=false` remains for a
-  caller that genuinely needs its own handle, and nothing in the tree currently is one. The join's
-  stream-liveness `HEAD` therefore applies to `/v1/shape` too — one storage round trip per join is
-  the cheaper half of that trade against handing a client a stream storage has already lost.
+- **The public surface shares.** `POST /shapes` passes `share=true`; `share=false` remains for a
+  caller that genuinely needs its own handle, and nothing in the tree currently is one. Every join
+  therefore pays the stream-liveness `HEAD` — one storage round trip per join is the cheaper half of
+  that trade against handing a client a stream storage has already lost.
 
 ### 5.4 Creation is atomic; failures never leave zombies
 
@@ -444,7 +437,7 @@ the "zombie shape" failure mode: a shape that is registered, streams nothing, an
 signature so all future identical creates silently join a dead feed.
 
 **The closing check is taken again AFTER the catalog durability wait.** `Created`/`Joined` are
-durable-before-ack (§9), and that wait is unbounded external I/O — a whole interval, externally
+durable-before-ack (§8), and that wait is unbounded external I/O — a whole interval, externally
 controllable by anyone who can make storage slow, in which a `TRUNCATE`, a schema drift, an epoch
 reset or a native purge can retire the very shape the request is about to acknowledge. So
 `Engine::recheck_after_durability` re-runs the degradation latch, the captured schema generations
@@ -490,9 +483,7 @@ degraded subquery reap — it **retires** it (`ds.retire_stream`): first a close
 `Stream-Closed: true`), then the delete. The close releases every waiting long-poll immediately with
 `stream-closed` instead of leaving it parked until the 30 s read timeout, and "closed" unambiguously
 means *the engine retired this shape; re-subscribe*. Clients **must** treat `stream-closed`, 404 and
-410 alike; on the `/v1/shape` adapter the engine does that for them (a closed stream ends the live
-poll with `409 must-refetch`, the evicted-handle answer). Closing is terminal, so it is applied only
-to retirement: a **dormant** shape's retained
+410 alike. Closing is terminal, so it is applied only to retirement: a **dormant** shape's retained
 stream stays appendable for reactivation, a rolled-back create's stream was never handed to a
 subscriber, and a restart keeps restored shapes on their existing streams
 (`docs/adr/0007-retirement-closes-before-delete.md`).
@@ -535,7 +526,7 @@ sequencer feeds every table's deltas into:
   restarting it from the roots would derive nothing and silently lose the dependents' moves). If
   the retries are exhausted the batch's effects are gone for good — the node already moved — so
   the engine **fails closed**: the batch never decrements `pendingFlips` (the barrier can only
-  reach zero when every computed effect really landed), `flipFailures` counts it, `/v1/health`
+  reach zero when every computed effect really landed), `flipFailures` counts it, `/ready`
   turns `degraded` (503), every membership-bearing route answers 503, and every subquery shape's
   durable stream is retired — closed, then deleted (§5.6) — so clients reading storage directly
   learn it too: a tailing read is released with `stream-closed` and must re-subscribe. Recovery is a
@@ -740,26 +731,7 @@ Paging is **keyset**, and the cursor has to agree with the page query's `ORDER B
 
 ---
 
-## 8. Electric protocol adapter
-
-`GET /v1/shape` (`electric.rs`) serves the ElectricSQL client protocol directly from the engine:
-`table` + SQL `where` (+ `columns`) are parsed (`where_sql.rs`) into the same predicate AST used
-everywhere else, identical `/v1/shape` definitions share ONE engine shape (`share=true`, so the
-handle is the shared shape id), the shape stream is folded into the Electric message shape
-(insert/update/delete + `up-to-date` control messages), and live requests long-poll. Handle state
-is evicted after an idle TTL (`ELECTRIC_HANDLE_TTL`); the backing shape + stream are **retained**
-and follow the engine's three-tier retention lifecycle (active / dormant / evicted — idle shapes
-drop their engine state but keep the stream, and any touch reactivates them by change-log replay
-from the captured resume offset (through the sequencer's two-phase pending-buffer handshake);
-eviction **retires** the stream: closed, then deleted (§5.6), so a client tailing it is released
-with `stream-closed` and must re-subscribe; see `apps/engine/src/retention.rs`). A request with an
-evicted handle gets `409 must-refetch`,
-which the Electric client handles by re-syncing onto the retained shape. Row `tags` are not emitted: absolute
-membership emission makes them unnecessary for convergence.
-
----
-
-## 9. Consistency & durability model (summary)
+## 8. Consistency & durability model (summary)
 
 | seam | mechanism | guarantee |
 |---|---|---|
@@ -768,11 +740,11 @@ membership emission makes them unnecessary for convergence.
 | engine → shape streams | `append_reliable` + offset published only after landing | no silently-lost deltas; barrier implies subscriber streams reflect the batch |
 | cross-table subquery order | absolute membership emission + flip query-backs | convergence independent of deferred-flip timing |
 | shared shapes | signature + a SET of named subscriptions + ready-watch + atomic rollback (create and join alike) | joiners see a live, backfilled stream or an error; a repeated create/release is one claim, not two; an abandoned join gives its own claim back |
-| subscriber liveness | a subscription is a **lease**: created/renewed within `CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A native subscriber renews by repeating its create; a `/v1/shape` handle is renewed by its own poll, in memory, since the engine sees those reads and the handle does not survive a restart | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
+| subscriber liveness | a subscription is a **lease**: created/renewed within `CIRCUITS_SHAPE_IDLE_SECS` (strictly — a window lasts its whole length), released by the sweeper otherwise (ADR-0008). A subscriber renews by repeating its create | a client that vanished cannot pin a shape (and its stream, and its change-log segment) for ever, even though native reads are invisible to the engine; a late renewal simply re-subscribes |
 | catalog event → fold | every event carries an `eid` assigned at enqueue; the boot fold applies an `eid` at most once | the writer's retry-in-place (a response lost after the append committed) can never double-apply a join, a leave, a drop or a rotation |
 | subset page ↔ live tail | per-pk LSN watermarks + delete tombstones | no double-count, no resurrections/ghosts across the seam (LSN-based; see §4 residual) |
 | client lifecycle | one-shot close, delete-with-retry | balanced create/drop; no refcount pinning or steal |
-| client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset, retention and the `/v1/shape` adapter. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
+| client-facing mutation → catalog | **durable-before-ack** = every record a CLIENT is told about: `Created`, the `Joined` of a NEW claim, and the `Left`/`Dropped` of a native `DELETE` — awaited to storage before the HTTP answer (`CatalogWriter::send_durable`; a retry of an idempotent removal waits on the same barrier via `CatalogWriter::wait_durable`). **Queued-never-dropped** = what the engine does to itself: a *renewal's* `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the epoch reset and retention. The writer retries a transient failure in place, forever, and exits 74 on a definite refusal | an acknowledged create/join is in the durable record: a restart never turns it into an unmaintained stream — and an acknowledged release or purge is in it too, so neither comes back. That matters most under `CIRCUITS_SHAPE_IDLE_SECS=0`, a supported setting that disables lease expiry: there is no lease repair to fall back on. A queued record cannot be lost, only delayed — and if a process dies with one still queued, the **lease** reconverges it: the shape comes back with its subscriptions' restored ages, so a `Left` that never landed is re-applied within one idle window, and a `Dropped` that never landed leaves a shape whose stale claims lapse the same way. The cost is availability: a create, a release or a purge while storage is down **waits** rather than lying. A client that times out and gives up loses only its answer — the record still lands, and the teardown a purge promised is finished by a spawned task, not by the dropped request future |
 | shape ids → streams | the boot resumes `next_shape_id` past the maximum id of every `Created` in the log, dropped ones included (`CatalogFold::max_shape_id`) | an id is never re-minted while the `shape/*` stream it named still exists: a new shape can never inherit a dead one\'s stream (and its rows), and a pending retirement can never delete a live shape\'s stream |
 | shape removal → stream removal | `Dropped` (intent) is written BEFORE the retirement, `Retired` (completion) only after storage accepts the delete; failures go to a background queue that retries to completion, and every boot re-queues each `Dropped` with no `Retired` — ADR-0007 | no shape stream outlives its shape, whatever storage was doing at the moment it was retired or which process was alive at the time; this is also the orphan-`shape/*` GC, bounded by the catalog rather than a storage listing |
 | change log ↔ disk | segment rotation by size/age + delete-when-nothing-can-resume (the DURABLE checkpoint past it AND no shape pinning it; a dormant shape pinning past the retain window is evicted first, a reactivating one is never evicted mid-replay) — ADR-0006 | the log is bounded without prefix trimming; no reader ever loses its place (positions are `(segment, offset)`, the pointer is followed, the current segment is never deleted) |
@@ -782,7 +754,7 @@ membership emission makes them unnecessary for convergence.
 | graceful shutdown | `SIGTERM` → readiness 503 (drain window) → stop accepting → ingestor finishes the commit it is APPENDING → sequencer finishes its batch, flushes, writes a final `Offset` → catalog drains → exit 0 (71 if it does not drain); bounded by a watchdog armed at the signal, second signal exits 70 | a planned stop costs a bounded, de-duplicated replay at worst and nothing at best; shape streams are never closed or deleted (a restored shape continues its stream). The slot is never advanced BY the shutdown: the wire ack rides the client's 1 s status interval, so the last second's commits are re-delivered and dropped by the sequencer's `(lsn, seq)` highwater |
 | engine ↔ replication slot | `SlotBound { system_identifier, timeline_id, slot }` in the catalog, verified before every connection; auto-reset or fail-closed refusal on a break (ADR-0004) | a slot lost to a restore, `max_slot_wal_keep_size`, an upgrade or an operator is never silently recreated at the WAL head: every shape is retired into a new epoch, or the engine refuses until one is |
 | change-log envelope ↔ the schema that decodes it | every data envelope carries `headers.schema` — the digest of the compiled `SchemaFingerprint` the ingestor decoded it under (never on an output envelope); the sequencer compares it with the schema about to decode it, and with the CURRENT one when they differ (ADR-0010). The live loop, a pending shape's buffered replay and a dormant shape's reactivation replay all apply it | exactly two envelopes may go unprocessed, and both are already orphaned: one whose schema a drift replaced (`sequencer_stale_schema_skipped_total`) and one whose table the engine does not compile (`sequencer_unknown_table_skipped_total`) — in both cases the dependents were retired (ADR-0005). A stale executor is refreshed rather than skipped past, an unstamped envelope is decoded as current, and a stamp that is not exactly 16 lowercase hex characters counts as unstamped rather than as some other schema — a position-based fence could do none of this, because the schema swap happens mid-transaction |
-| sequencer ↔ a change it cannot process | the transaction is unwound (highwater restored, counts deltas never applied, nothing flushed), the cursor rewound to the replay boundary (the page, or the page a held run began in), nothing published or checkpointed past it — on shutdown either — and the engine latches `EpochBreakReason::ChangeLogUnprocessable`, which is never auto-reset (ADR-0010) | a change the schema says the engine should be able to process is never skipped: no shape is maintained past it, `/ready` and `/v1/health` say `degraded`, every shape route answers 503, and `GET /metrics` + `/replication/lsn` name the exact envelope. A restart re-derives the same park rather than stepping over it; the sequencer keeps serving commands so the recovery can reach it |
+| sequencer ↔ a change it cannot process | the transaction is unwound (highwater restored, counts deltas never applied, nothing flushed), the cursor rewound to the replay boundary (the page, or the page a held run began in), nothing published or checkpointed past it — on shutdown either — and the engine latches `EpochBreakReason::ChangeLogUnprocessable`, which is never auto-reset (ADR-0010) | a change the schema says the engine should be able to process is never skipped: no shape is maintained past it, `/ready` says `degraded`, every shape route answers 503, and `GET /metrics` + `/replication/lsn` name the exact envelope. A restart re-derives the same park rather than stepping over it; the sequencer keeps serving commands so the recovery can reach it |
 | epoch reset ↔ the change log | after retiring every shape the reset force-rotates the log, restarts the sequencer at the start of the fresh segment (`SequencerCmd::Jump` — executors and pending creations dropped, no highwater) and records that position durably with the drops (ADR-0004, ADR-0010) | nothing written under the epoch that ended is ever read again — including the envelope a parked sequencer stopped on, which is what makes `POST /epoch/reset` a recovery rather than a loop. A reset whose cause was not the slot keeps the slot (healthy, and held by our own walsender) and rebinds it |
 
 The invariant the conformance suite asserts end-to-end: *for any shape and any op stream, the
@@ -791,7 +763,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 
 ---
 
-## 10. Threading model
+## 9. Threading model
 
 | unit | threads | notes |
 |------|---------|-------|
@@ -809,9 +781,9 @@ Threads are flat in the number of shapes *and* in the number of equality templat
 
 **Shutdown is cooperative** (`src/shutdown.rs`): one `tokio::sync::watch` token on `Engine`, flipped
 once by the binary's signal handler, joined by every select that could otherwise block — the
-sequencer's change-log long-poll, the ingestor's `recv` (and its reconnect backoff), and the
-`/v1/shape` live poll — so a parked long-poll returns in milliseconds instead of pinning the
-termination grace for its full window. The ingestor and the sequencer each register a named
+sequencer's change-log long-poll and the ingestor's `recv` (and its reconnect backoff) — so a
+parked long-poll returns in milliseconds instead of pinning the termination grace for its full
+window. The ingestor and the sequencer each register a named
 **party**; the binary waits for both (bounded), then drains the catalog writer, then exits. The
 ingestor's only safe point is *between* messages, so a commit that is being appended runs to
 completion; a transaction still buffering just stops, having appended nothing, and Postgres
@@ -827,7 +799,7 @@ than the mechanism.
 
 ---
 
-## 11. Telemetry
+## 10. Telemetry
 
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
   `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
@@ -839,15 +811,15 @@ than the mechanism.
   dedicated one): `replication_slot_retained_wal_bytes`
   (`pg_current_wal_lsn() - restart_lsn` — the WAL the source database holds on disk for this engine),
   `replication_confirmed_flush_lag_bytes` (`… - confirmed_flush_lsn` — ingest lag) and
-  `replication_slot_active`. The same sample feeds StatsD, so the numbers exist with or without it.
+  `replication_slot_active`.
 - `GET /memory` + OTel gauges (`engine_shapes`, `engine_subquery_nodes`, `engine_subquery_contributors`,
   `engine_family_circuits`, …) — the cardinalities that drive RSS. `GET /metrics/prometheus` exports
   those **and** every counter/gauge above (it used to carry only the memory/cardinality half), so it
   is a complete scrape target.
 - **Probes:** `GET /health` is liveness (`ok` while the process runs, and never more than that);
   `GET /ready` is readiness (200 `active`, else 503 `waiting` / `starting` / `degraded` /
-  `shutting_down`); `GET /v1/health` is unchanged Electric-fleet parity. The HTTP surface comes up
-  before Postgres so readiness is answerable while the boot is still retrying.
+  `shutting_down`). The HTTP surface comes up before Postgres so readiness is answerable while the
+  boot is still retrying.
 - `GET /graph`, `GET /graph/node?sig=…`, `GET /shapes/{id}/rows` — the live pipeline topology + node
   indexes + shape contents, for inspecting a running engine.
 - `GET /state`, `GET /state/node?id=…` — per-node live state: summaries for every pipeline node
@@ -860,7 +832,7 @@ than the mechanism.
 
 ---
 
-## 12. Potential speedups
+## 11. Potential speedups
 
 The engine's internal per-change cost stays small even at a large shape count; the end-to-end
 ceiling under load is **storage throughput** (the single-process durable-streams test server), not
@@ -889,7 +861,7 @@ engine compute.
 
 ---
 
-## 13. Client query layer (two-level querying)
+## 12. Client query layer (two-level querying)
 
 There are **two query layers** with different jobs:
 
@@ -907,7 +879,7 @@ For permissioned/faceted lists, prefer **per-facet feeds reused across filter ch
 merge (identical predicates across users ⇒ shared engine families) over folding UI filters into the
 predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 
-## 14. File map
+## 13. File map
 
 | path | role |
 |------|------|
@@ -918,15 +890,12 @@ predicate (which recreates the feed per click) — see AGENTS.md "gotchas".
 | `apps/engine/src/replication.rs` | ingestor: streaming pgoutput (decoder: `pgoutput.rs`), per-txn buffering, (lsn, xid, seq) stamping, append-then-acknowledge, schema-drift/TRUNCATE reporting (`SchemaEvents`) |
 | `apps/engine/src/pg.rs` | connect/introspect (+ schema fingerprints), slot + REPLICA IDENTITY, backfill (+ `SnapshotGate`), subset query-back, value normalization |
 | `apps/engine/src/predicate.rs` | predicate compile, three-valued eval, equality templates, subquery signatures |
-| `apps/engine/src/sql.rs` / `where_sql.rs` | predicate → SQL (pushdown) / SQL `WHERE` → predicate (Electric path) |
-| `apps/engine/src/electric.rs` | Electric `/v1/shape` adapter (handles, offsets, TTL eviction) |
+| `apps/engine/src/sql.rs` | predicate → SQL (pushdown) |
 | `apps/engine/src/ds.rs` | durable-streams client: `append`, `append_checked`, `append_reliable`, `head`, `close_stream`, `retire_stream`, `delete_stream`, reads |
 | `apps/engine/src/changelog.rs` | the segmented change log (ADR-0006): `LogPosition`, the control envelope, the rotation writer + boot walk-forward, the segment-deletion planner |
 | `apps/engine/src/http.rs` | control-plane HTTP |
 | `apps/engine/src/retention.rs` | shape retention: the active / dormant / evicted lifecycle + layered dormant-only eviction |
-| `apps/engine/src/config.rs` | boot config: `CIRCUITS_*` env + Electric fleet-surface mapping |
-| `apps/engine/src/params.rs` | Electric `params[N]` / `$N` substitution for `/v1/shape` |
-| `apps/engine/src/statsd.rs` | StatsD (datadog wire) telemetry for the benchmarking fleet |
+| `apps/engine/src/config.rs` | boot config: the `CIRCUITS_*` environment |
 | `apps/engine/src/trace.rs` | per-envelope pipeline trace broadcast (`GET /trace` SSE) |
 | `apps/api/src/core.ts` | extended API core (writes, shape/subset/aggregate forwarding) |
 | `packages/client/src/index.ts` | client: shapes/aggregations, tracked lifecycles, `awaitTxId` |

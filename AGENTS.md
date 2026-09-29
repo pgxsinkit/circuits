@@ -8,16 +8,16 @@ tested and released together, and run as separate processes. `CONTEXT.md` is the
 words.
 
 The surface this repository develops is the **native path**: the engine's control plane
-(`POST /shapes`, the predicate AST) plus reads straight from the log server. The Electric
-compatibility adapter (`GET /v1/shape`) is still in the engine and is being removed
-([ADR-0011](docs/adr/0011-one-repository-no-longer-a-fork.md)): do
-not extend it, and do not justify anything by compatibility with Electric.
+(`POST /shapes`, the predicate AST) plus reads straight from the log server. It is the only one —
+the Electric compatibility adapter was removed
+([ADR-0011](docs/adr/0011-one-repository-no-longer-a-fork.md)) — and nothing is justified by
+compatibility with Electric.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `electric.rs` (`/v1/shape`), `where_sql.rs`/`sql.rs` (SQL⇄predicate), `ds.rs` (streams client incl. `append_reliable`). |
+| `apps/engine` | Rust engine. Key files: `engine/` (the engine module — `sequencer.rs` the LSN-ordered sequencer, `lifecycle.rs` shape creation/sharing/retention, `circuit_serving.rs` circuit-tier serving, `executors.rs` routers/filters/folds, `planning.rs` circuit placement, `catalog.rs` durable catalog, `drift.rs` schema-drift retirement + the reconciler, `epoch.rs` slot binding + epoch reset, `introspection.rs` graph/state, `membership.rs` the shared membership kernel (flips, query-backs), `output.rs` envelope codec, `mod.rs` the `Engine` handle), `arrangements.rs` (the circuit: in-memory counts pipelines, group-aggregated boot seeding), `subquery.rs` (cross-table registry: shared inner-set nodes, flips, absolute emission), `replication.rs` (streaming pgoutput ingestor) + `pgoutput.rs` (message decoder), `pg.rs` (backfill + `SnapshotGate`), `sql.rs` (predicate → SQL), `ds.rs` (streams client incl. `append_reliable`). |
 | `apps/durable-streams` | The log server (crate `durable-streams`, binary `durable-streams-server`): `store.rs` the stream store, `wal/` the group-commit write-ahead log, `handlers.rs` the protocol, `http1.rs` + `engine_raw.rs` + `sse_reactor.rs` its own HTTP serving. `conformance/` runs the Durable Streams protocol suite against it. |
 | `apps/api` | tRPC API (`router.ts`) over the engine + the log server (`core.ts`). The test harness drives the engine through it. |
 | `packages/protocol` | Shared types + the change-event envelope (`types.ts`, `envelope.ts`). |
@@ -269,7 +269,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   enqueues nothing and waits on the same barrier (`CatalogWriter::wait_durable`) rather than
   answering from memory. **Queued-never-dropped = everything the engine does to itself**: a lease
   RENEWAL's `Joined` (that claim is already in the log), and the removals of drift, `TRUNCATE`, the
-  epoch reset, retention and the `/v1/shape` adapter — those have their own completion barriers, and
+  epoch reset and retention — those have their own completion barriers, and
   the lease still reconverges them (the restore brings the shape back with its subscriptions' **lease
   ages**, so an unrenewed claim is released within one sweep — ADR-0008). If you add a mutation whose
   acknowledgement PROMISES something — that a shape exists, or that it is gone — use `send_durable`,
@@ -351,9 +351,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   ONLY legitimate `BackfillReader::collect` callers are the ones whose *result* is an in-memory set
   with nothing to stream it to — a subquery inner-set node's seed, a membership query-back's
   candidate rows. If you add a backfill site, take chunks; if you find yourself building a
-  `Vec<Row>` of a whole table, that is the bug. The same rule governs stream folds: `/v1/shape`'s
-  snapshot must materialise (the body *is* every row), the key set it rebuilds for a catch-up must
-  not (`StreamFold::up_to` is keys-only by construction).
+  `Vec<Row>` of a whole table, that is the bug.
 - **`SIGTERM` drains; it never retires anything** (`src/shutdown.rs`). Order: `/ready` → 503
   `shutting_down` FIRST (so a load balancer drains) and the port stays open for the drain window;
   stop accepting; the ingestor completes a commit it is *appending* and records its position
@@ -364,13 +362,13 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   the catalog writer drains; exit 0. **Shape streams are left untouched**
   — closing a stream means "this shape is gone, re-subscribe", and a restart is not that. Every
   select that could block past the grace must join the shutdown token (the sequencer's change-log
-  long-poll, the ingestor's `recv` and its backoff, `poll_live_until`); if you add a long-poll, join
-  it, and if you add a task that must reach a safe point, register a `party`.
+  long-poll, the ingestor's `recv` and its backoff); if you add a long-poll, join it, and if you add
+  a task that must reach a safe point, register a `party`.
 - **Shapes vs subset queries stay distinct.** Ranges/`orderBy`/`limit` live ONLY in subset queries
   (never live-tailed); a `changes_only` feed uses a passthrough gate and the client reads from the
   offset captured *before* the page snapshot.
 - **Aggregations follow SQL NULL semantics** (ignore NULLs; `COUNT(col)` = non-NULLs; empty
-  SUM/AVG/MIN/MAX = NULL). Extended API only — the Electric surface doesn't cover them.
+  SUM/AVG/MIN/MAX = NULL).
 - Branch before committing if on the default branch.
 
 ## Gotchas (know these before touching the respective areas)
