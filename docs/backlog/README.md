@@ -27,6 +27,9 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 - [0010 — The harness client does not re-subscribe when its stream is retired](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) — candidate
 - [0011 — A forced exit replays the checkpoint window onto shape streams](0011-a-forced-exit-replays-the-checkpoint-window.md) — candidate
 - [0012 — vitest is held at 4.x by the protocol suite](0012-vitest-held-at-4-by-the-protocol-suite.md) — parked
+- [0013 — The change-log "skips the envelopes a migration outran" test times out under load](0013-fail-closed-skip-test-times-out-under-load.md) — candidate
+- [0014 — The log server's second-server test failed once under heavy load](0014-log-server-lock-test-failed-once-under-load.md) — parked
+- [0015 — Two dbsp settings are read, logged and do nothing](0015-two-dbsp-settings-are-read-and-do-nothing.md) — candidate
 
 ## Not carried over
 
