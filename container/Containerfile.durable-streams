@@ -22,10 +22,18 @@ COPY apps/durable-streams apps/durable-streams
 # Default features only (no `tier`/`telemetry`) — minimal image, matching the conformance matrix.
 # To ship S3 tiering, add `--features tier` here AND `ca-certificates` to the runtime stage.
 RUN cargo build --profile release-durable-streams --locked -p durable-streams
+# The conventional data directory, made here because the runtime image has no shell to make it in.
+RUN mkdir -p /var/lib/durable-streams
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
-FROM gcr.io/distroless/cc-debian12 AS runtime
+# The `nonroot` variant: the server runs as uid 65532, never as root.
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 COPY --from=build /repo/target/release-durable-streams/durable-streams-server /usr/local/bin/durable-streams-server
+# A data directory that user can write to. A volume mounted at this path for the first time takes
+# its ownership from here; a volume or host directory with an owner of its own has to be writable by
+# uid 65532. `--data-dir` may name any other path, on the same condition.
+COPY --from=build --chown=65532:65532 /var/lib/durable-streams /var/lib/durable-streams
+USER 65532:65532
 # Protocol default port (PROTOCOL.md §13.1); override with `--port`.
 EXPOSE 4437
 ENTRYPOINT ["/usr/local/bin/durable-streams-server"]

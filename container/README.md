@@ -13,6 +13,8 @@ podman build -f container/Containerfile.engine          -t localhost/circuits-en
 podman build -f container/Containerfile.durable-streams -t localhost/circuits-durable-streams:dev .
 ```
 
+Neither image runs as root: the engine runs as uid 10001 and the log server as uid 65532.
+
 Both build stages use the Rust version in `rust-toolchain.toml`. The log server is built with its
 own release profile (`release-durable-streams`: link-time optimisation, one codegen unit); the
 engine with cargo's default release profile.
@@ -49,3 +51,10 @@ The log server is configured through command-line flags; see
 arguments. The image's default arguments are not enough to start it: with the default durability
 (`wal`) the server refuses to run without `--data-dir`. Mount a volume and pass, for example,
 `--host 0.0.0.0 --port 8791 --data-dir /var/lib/durable-streams`.
+
+The data directory has to be writable by uid 65532. `/var/lib/durable-streams` exists in the image
+with that owner, so a volume mounted there for the first time takes it over. A host directory or a
+volume that already has an owner needs it set, and in Kubernetes that is what `fsGroup: 65532` in
+the pod's security context is for. The engine needs the same for uid 10001 only if
+`CIRCUITS_TXN_SPILL_DIR` or `CIRCUITS_SUBQ_STORAGE_DIR` points it at a mounted directory; by
+default it writes to the temporary directory.

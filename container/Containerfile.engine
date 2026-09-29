@@ -21,7 +21,13 @@ COPY apps/durable-streams apps/durable-streams
 RUN cargo build --release --locked -p circuits-engine
 
 FROM debian:bookworm-slim
+# The engine runs as its own user, never as root. It keeps nothing of its own on disk that outlives
+# the process: what it writes (a large transaction's spill, the membership circuit's spill) goes to
+# the temporary directory unless CIRCUITS_TXN_SPILL_DIR or CIRCUITS_SUBQ_STORAGE_DIR name another,
+# and a directory named there has to be writable by uid 10001.
+RUN useradd --system --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin circuits
 COPY --from=build /repo/target/release/circuits-engine /usr/local/bin/circuits-engine
+USER 10001:10001
 
 # Required:
 #   CIRCUITS_DS_URL   durable-streams base URL (e.g. http://ds:8791)
