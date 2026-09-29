@@ -848,14 +848,14 @@ pub(crate) async fn sequencer_loop(
                         // highwater, so staging pre-dedup envelopes is safe.
                         let mut txn_arr_deltas = Vec::new();
                         if let Some(arr) = &arr {
-                            for k in i..j {
-                                match stamped_delta_for_arrangements(&tables, arr, &arr_gates, &envs[k]) {
+                            for (k, env) in envs.iter().enumerate().take(j).skip(i) {
+                                match stamped_delta_for_arrangements(&tables, arr, &arr_gates, env) {
                                     Ok(Some(d)) => txn_arr_deltas.push(d),
                                     // Not a counted table, an empty delta, fenced out by the seed
                                     // gate, or an envelope from before a drift (ADR-0010).
                                     Ok(None) => {}
                                     Err(e) => {
-                                        failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                        failure = Some(ChangeLogFailure::of(env, k, &e));
                                         break;
                                     }
                                 }
@@ -865,9 +865,9 @@ pub(crate) async fn sequencer_loop(
                             break;
                         }
                         let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                        for k in i..j {
+                        for (k, env) in envs.iter_mut().enumerate().take(j).skip(i) {
                             // Skip redelivered changes (see `highwater` above).
-                            let pos = match (envs[k].headers.lsn.as_deref(), envs[k].headers.seq) {
+                            let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
                                 (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
                                 _ => None,
                             };
@@ -880,7 +880,7 @@ pub(crate) async fn sequencer_loop(
                             // Route the envelope to an executor, under THE SCHEMA FENCE (ADR-0010):
                             // ready to decode, consumed without decoding (the only two reasons there
                             // are), or fatal.
-                            match resolve_exec(&mut execs, &tables, &envs[k]) {
+                            match resolve_exec(&mut execs, &tables, env) {
                                 Resolve::Ready => {}
                                 Resolve::Consume(why) => {
                                     // CONSUMED, deliberately: no shape can want this change, so the
@@ -891,27 +891,27 @@ pub(crate) async fn sequencer_loop(
                                     match why {
                                         Consume::PreDrift(digest) => {
                                             metrics().sequencer_stale_schema_skipped.fetch_add(1, Ordering::Relaxed);
-                                            if stale_schema_reported.insert((envs[k].type_.clone(), digest)) {
+                                            if stale_schema_reported.insert((env.type_.clone(), digest)) {
                                                 tracing::warn!(
                                                     "sequencer: skipping changes to '{}' that were decoded under \
                                                      schema {} — a drift has replaced it (ADR-0005) and every \
                                                      dependent shape is retired, so these changes have no consumer \
                                                      left. Counted as sequencer_stale_schema_skipped_total.",
-                                                    envs[k].type_,
+                                                    env.type_,
                                                     crate::schema::digest_hex(digest)
                                                 );
                                             }
                                         }
                                         Consume::TableGone => {
                                             metrics().sequencer_unknown_table_skipped.fetch_add(1, Ordering::Relaxed);
-                                            if unknown_table_reported.insert(envs[k].type_.clone()) {
+                                            if unknown_table_reported.insert(env.type_.clone()) {
                                                 tracing::warn!(
                                                     "sequencer: skipping changes to '{}' — the engine does not \
                                                      compile that table (dropped, or parked unresolved — ADR-0005), \
                                                      so its dependents are retired and these changes have no \
                                                      consumer left. Counted as \
                                                      sequencer_unknown_table_skipped_total.",
-                                                    envs[k].type_
+                                                    env.type_
                                                 );
                                             }
                                         }
@@ -920,11 +920,11 @@ pub(crate) async fn sequencer_loop(
                                     continue;
                                 }
                                 Resolve::Fatal(e) => {
-                                    failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                    failure = Some(ChangeLogFailure::of(env, k, &e));
                                     break;
                                 }
                             }
-                            let exec = execs.get_mut(envs[k].type_.as_str()).expect("resolved above");
+                            let exec = execs.get_mut(env.type_.as_str()).expect("resolved above");
                             // LIBRARY MODE: no Postgres wrote this change, so nothing stamped a
                             // before-image on it. Fill it in from the sequencer's own per-key view
                             // (`TableExec::library_rows`) HERE — after the de-duplication highwater
@@ -938,17 +938,17 @@ pub(crate) async fn sequencer_loop(
                             // refuses to start without a `pg_url`, so `arr` is always `None` here
                             // in library mode.
                             if library_mode {
-                                exec.stamp_before_image(&mut envs[k]);
+                                exec.stamp_before_image(env);
                             }
                             // Buffer for in-flight creations on this table: their `BeginShape` was
                             // acknowledged before the creator's snapshot, so everything the
                             // snapshot cannot contain lands in the buffer.
                             for pending in exec.pending.values_mut() {
-                                pending.buffered.push(envs[k].clone());
+                                pending.buffered.push(env.clone());
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
-                                &mut exec.aggregates, &exec.agg_index, envs[k].clone(), &mut txn_pending,
+                                &mut exec.aggregates, &exec.agg_index, env.clone(), &mut txn_pending,
                                 &subq, &trace_tx, library_mode,
                             )
                             .await
@@ -956,7 +956,7 @@ pub(crate) async fn sequencer_loop(
                                 // The schema fence says this envelope IS ours, so failing to process
                                 // it is an engine bug or corrupt storage — never something to step
                                 // over, which would leave a shape silently short of a change. Stop.
-                                failure = Some(ChangeLogFailure::of(&envs[k], k, &e));
+                                failure = Some(ChangeLogFailure::of(env, k, &e));
                                 break;
                             }
                             exec.envelopes_total += 1;
