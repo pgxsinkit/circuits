@@ -1,14 +1,16 @@
 // Drop-in replacement for `@durable-streams/server`'s DurableStreamTestServer, backed by the
-// Rust durable-streams server (https://crates.io/crates/durable-streams). Same constructor
-// options and `start()` / `stop()` surface, but the server is a spawned native binary instead
-// of an in-process Node store — the same wire protocol the production server speaks.
+// Rust log server built from this repository (apps/durable-streams, crate `durable-streams`).
+// Same constructor options and `start()` / `stop()` surface, but the server is a spawned native
+// binary instead of an in-process Node store — the same wire protocol the production server speaks.
 //
-// Binary resolution (first hit wins):
-//   1. $DS_RUST_BIN                                  (explicit path override)
-//   2. `durable-streams-server` on $PATH
-//   3. ~/.cargo/bin/durable-streams-server
-//   4. self-provision: `cargo install durable-streams --version <PIN> --locked`
-//      (guarded by an exclusive mkdir lock so parallel vitest workers install once)
+// Binary resolution:
+//   1. $DS_RUST_BIN, when set: an explicit path, which must exist.
+//   2. Otherwise the workspace build: <target>/debug/durable-streams-server, where <target> is
+//      $CARGO_TARGET_DIR (a relative path is taken from the repository root) or <repo>/target.
+// Nothing else is searched: a `durable-streams-server` on $PATH, in ~/.cargo/bin or from crates.io
+// is some other build, and picking one up silently would test the wrong server. A missing binary
+// is an error that names the command to build it. The vitest global setup builds it before the
+// workers start.
 //
 // Semantics mapping vs the Node test server:
 //   - `dataDir` omitted (the Node "in-memory" mode) → a fresh temp dir, deleted on stop().
@@ -17,14 +19,16 @@
 //   - `port: 0` → the wrapper picks a free port itself (the binary logs the *requested*
 //     address, so OS-assigned ports would be unreadable); bind races are retried.
 
-import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, rmdirSync, rmSync } from 'node:fs'
+import { type ChildProcess, spawn } from 'node:child_process'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const CRATE_VERSION = '0.1.5'
 const BIN_NAME = 'durable-streams-server'
+/** The repository root (the Cargo workspace root): this file is packages/ds-rust/src/index.ts. */
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '../../..')
 
 export interface TestServerOptions {
   /** Listen port; 0 (default) picks a free port. */
@@ -36,60 +40,38 @@ export interface TestServerOptions {
   /** `live=long-poll` block time in ms (server default 30000). */
   longPollTimeout?: number
   /**
-   * Storage durability passed explicitly to the pinned server. `wal` is supported on every host
+   * Storage durability passed explicitly to the server. `wal` is supported on every host
    * used by this suite; `memory` is retained for the Linux-only ephemeral compatibility mode.
    */
   durability?: 'wal' | 'memory'
 }
 
-function cargoBin(): string {
-  const home = process.env.CARGO_HOME ?? join(process.env.HOME ?? '', '.cargo')
-  return join(home, 'bin', BIN_NAME)
+/** Where the workspace's debug build of the log server lands (it may not exist yet). */
+export function workspaceServerBinary(): string {
+  const targetDir = process.env.CARGO_TARGET_DIR
+    ? resolve(REPO_ROOT, process.env.CARGO_TARGET_DIR)
+    : join(REPO_ROOT, 'target')
+  return join(targetDir, 'debug', BIN_NAME)
 }
 
-function onPath(): string | undefined {
-  for (const dir of (process.env.PATH ?? '').split(delimiter)) {
-    if (dir && existsSync(join(dir, BIN_NAME))) return join(dir, BIN_NAME)
-  }
-  return undefined
-}
-
-/** Locate the server binary, installing it via cargo if absent (once across processes). */
+/**
+ * Locate the server binary: $DS_RUST_BIN, else the workspace build. Never builds, installs or
+ * searches anywhere else; a missing binary throws with the command that builds it.
+ */
 export function ensureServerBinary(): string {
   const override = process.env.DS_RUST_BIN
   if (override) {
     if (!existsSync(override)) throw new Error(`DS_RUST_BIN=${override} does not exist`)
     return override
   }
-  const found = onPath() ?? (existsSync(cargoBin()) ? cargoBin() : undefined)
-  if (found) return found
-  // Exclusive install lock: mkdir is atomic; losers spin until the winner's install lands.
-  const lock = join(tmpdir(), `ds-rust-install-${CRATE_VERSION}.lock`)
-  try {
-    mkdirSync(lock)
-  } catch {
-    const deadline = Date.now() + 300_000
-    while (Date.now() < deadline) {
-      if (existsSync(cargoBin())) return cargoBin()
-      execFileSync('sleep', ['1'])
-    }
-    throw new Error(`timed out waiting for concurrent 'cargo install durable-streams' (lock: ${lock})`)
+  const bin = workspaceServerBinary()
+  if (!existsSync(bin)) {
+    throw new Error(
+      `${bin} does not exist: build the log server with \`cargo build -p durable-streams\` ` +
+        `from the repository root (${REPO_ROOT}), or point DS_RUST_BIN at a durable-streams-server binary`,
+    )
   }
-  try {
-    // eslint-disable-next-line no-console
-    console.error(`[ds-rust] installing durable-streams ${CRATE_VERSION} (one-time cargo install)…`)
-    execFileSync('cargo', ['install', 'durable-streams', '--version', CRATE_VERSION, '--locked'], {
-      stdio: ['ignore', 'inherit', 'inherit'],
-    })
-  } finally {
-    try {
-      rmdirSync(lock)
-    } catch {
-      /* ignore */
-    }
-  }
-  if (!existsSync(cargoBin())) throw new Error(`cargo install did not produce ${cargoBin()}`)
-  return cargoBin()
+  return bin
 }
 
 /** Ask the OS for a currently-free port (tiny race window; bind failures are retried). */
@@ -243,7 +225,7 @@ export class DurableStreamTestServer {
 
   /**
    * Simulate an abrupt storage-process failure and restore the same durable store in place.
-   * Resolves only after SIGKILL has reaped and the exact pinned binary reports ready again at the
+   * Resolves only after SIGKILL has reaped and the exact same binary reports ready again at the
    * original host/port/data directory. `stop()` still owns final process and temp-dir cleanup.
    */
   async crashAndRestart(): Promise<string> {

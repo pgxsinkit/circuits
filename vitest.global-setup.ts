@@ -1,5 +1,6 @@
-// Global test setup: build the engine once (so parallel workers don't race the cargo lock) and boot
-// one ephemeral Postgres with logical replication enabled. Each harness then creates its own database
+// Global test setup: build the engine and the log server once (so parallel workers don't race the
+// cargo lock, and @circuits/ds-rust runs the log server built from this workspace) and boot one
+// ephemeral Postgres with logical replication enabled. Each harness then creates its own database
 // + slot inside it (logical slots are per-database), so test files stay isolated. The admin
 // connection string is exported via CIRCUITS_TEST_PG_URL (inherited by forked workers).
 import { execFileSync } from 'node:child_process'
@@ -8,7 +9,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 export default function setup() {
+  // One `cargo build` per package, not `-p circuits-engine -p durable-streams` in one invocation:
+  // cargo unifies features across the packages of one build, and the log server's
+  // (tracing/release_max_level_info, hashbrown/raw) would give the engine a feature set it has
+  // nowhere else, recompiling its whole dependency graph a second time.
   execFileSync('cargo', ['build', '-p', 'circuits-engine'], { stdio: 'inherit' })
+  execFileSync('cargo', ['build', '-p', 'durable-streams'], { stdio: 'inherit' })
   process.env.CIRCUITS_ENGINE_PREBUILT = '1'
 
   const dir = mkdtempSync(join(tmpdir(), 'el-pg-'))

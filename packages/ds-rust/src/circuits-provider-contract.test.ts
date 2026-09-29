@@ -1,5 +1,5 @@
 // Characterization of the Durable Streams operations Circuits actually uses.  This is
-// deliberately a real-process lane: the wrapper resolves the same pinned durable-streams Rust
+// deliberately a real-process lane: the wrapper resolves the same workspace-built durable-streams
 // binary used by the conformance harness and gives every test a fresh data directory and port.
 //
 // It pins the provider wire behaviour the engine depends on; it is not a durability or fault
