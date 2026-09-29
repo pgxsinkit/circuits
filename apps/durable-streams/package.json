@@ -1,10 +1,9 @@
 {
-  "name": "@electric-ax/durable-streams-server-rust",
+  "name": "@circuits/durable-streams",
   "version": "0.1.5",
-  "description": "High-performance Durable Streams server (Rust) — native binary distributed via npm.",
+  "description": "The Durable Streams protocol conformance suite, run against the Rust log server in this directory.",
   "license": "Apache-2.0",
   "type": "module",
-  "packageManager": "bun@1.4.0",
   "private": true,
   "repository": {
     "type": "git",
@@ -15,6 +14,6 @@
   },
   "devDependencies": {
     "@durable-streams/server-conformance-tests": "0.3.6",
-    "vitest": "^4.1.0"
+    "vitest": "4.1.11"
   }
 }

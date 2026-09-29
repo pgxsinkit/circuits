@@ -4,26 +4,30 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@10.15.1",
+  "packageManager": "bun@1.4.2",
   "engines": {
     "node": ">=22"
   },
+  "workspaces": [
+    "packages/*",
+    "apps/api",
+    "apps/durable-streams"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:conformance": "vitest run packages/conformance",
     "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
+    "test:durable-streams": "cargo test -p durable-streams",
+    "test:durable-streams:conformance": "cargo build --profile release-durable-streams -p durable-streams && bun run --cwd apps/durable-streams test:conformance",
     "engine:build": "cargo build -p circuits-engine",
     "engine:test": "cargo test -p circuits-engine",
     "loop": "bash scripts/conformance-loop.sh"
   },
   "devDependencies": {
-    "@types/node": "^22.20.1",
-    "typescript": "^7.0.2",
-    "vitest": "^3.0.0",
-    "tsx": "^4.19.2"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": ["esbuild", "lmdb", "msgpackr-extract"]
+    "@types/node": "22.20.1",
+    "typescript": "7.0.2",
+    "vitest": "3.2.6",
+    "tsx": "4.22.4"
   }
 }

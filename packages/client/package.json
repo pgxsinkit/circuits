@@ -13,10 +13,10 @@
   "dependencies": {
     "@circuits/protocol": "workspace:*",
     "@circuits/api": "workspace:*",
-    "@trpc/client": "^11.18.0",
+    "@trpc/client": "11.18.0",
     "@durable-streams/client": "0.2.6",
-    "@durable-streams/state": "^0.3.1",
-    "@tanstack/db": "^0.6.12",
-    "zod": "^4.4.3"
+    "@durable-streams/state": "0.3.1",
+    "@tanstack/db": "0.6.12",
+    "zod": "4.4.3"
   }
 }

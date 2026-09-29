@@ -3,11 +3,14 @@
  *
  * Two modes:
  *   - CI / default: builds nothing, but spawns the release binary itself,
- *     mirroring the Caddy harness. Build it first with `cargo build --release`,
- *     then run `bun run test:conformance`. The binary is located through
- *     `cargo metadata` (honouring CARGO_TARGET_DIR and any workspace target
- *     directory); RUST_SERVER_BIN overrides it outright, which is what a CI job
- *     that downloads a prebuilt binary should use.
+ *     mirroring the Caddy harness. Build it first with
+ *     `cargo build --profile release-durable-streams -p durable-streams` (the
+ *     workspace profile the log server is released with), then run
+ *     `bun run test:conformance`; the repository root's
+ *     `bun run test:durable-streams:conformance` does both. The binary is
+ *     located through `cargo metadata` (honouring CARGO_TARGET_DIR and the
+ *     workspace target directory); RUST_SERVER_BIN overrides it outright, which
+ *     is what a CI job that downloads a prebuilt binary should use.
  *   - Manual: set RUST_SERVER_URL to point at an already-running server, e.g.
  *     RUST_SERVER_URL=http://localhost:4562 bun run test:conformance
  */
@@ -99,7 +102,7 @@ function resolveServerBinary(): string {
   ) as { target_directory: string }
   return path.join(
     metadata.target_directory,
-    `release`,
+    `release-durable-streams`,
     `durable-streams-server`
   )
 }

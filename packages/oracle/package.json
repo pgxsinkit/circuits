@@ -12,10 +12,10 @@
   },
   "dependencies": {
     "@circuits/protocol": "workspace:*",
-    "@electric-sql/pglite": "^0.5.3",
-    "pg": "^8.13.1"
+    "@electric-sql/pglite": "0.5.3",
+    "pg": "8.22.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.11.10"
+    "@types/pg": "8.20.0"
   }
 }
