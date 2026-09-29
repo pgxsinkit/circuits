@@ -10,15 +10,12 @@
     "packages/*/src/**/*.ts",
     "packages/conformance/scripts/**/*.ts",
     "apps/api/src/**/*.ts",
-    "docker/*.ts",
     "vitest.config.ts",
     "vitest.global-setup.ts"
   ],
   "exclude": [
     "**/node_modules",
     "**/dist",
-    "apps/pipeline-viz",
-    "examples",
     "target",
     "tmp"
   ]

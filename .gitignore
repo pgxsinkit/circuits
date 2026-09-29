@@ -20,4 +20,6 @@ erl_crash.dump
 memtest.txt
 /results/
 data/dbsp/
-packages/bench/data/
+
+# Scratch for local runs and agents (not source)
+/tmp/

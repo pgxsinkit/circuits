@@ -5,8 +5,7 @@
 //! backpressure into the hot path, and zero cost when nobody is subscribed
 //! (`receiver_count() == 0` short-circuits before any serialization).
 //!
-//! Node ids use the same namespace the pipeline visualizer derives from `/graph`
-//! (`apps/pipeline-viz/src/build-graph.ts`): `table:<t>`, `filter:<shape-id>`,
+//! Node ids use the same namespace as `/graph`: `table:<t>`, `filter:<shape-id>`,
 //! `family:<t>:<col,col>`, `node:<subquery-sig>`, `shape:<shape-id>` — so a UI can animate trace
 //! events and apply [`StateEvent`] summaries onto the graph without translation.
 

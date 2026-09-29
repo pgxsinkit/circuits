@@ -11,8 +11,7 @@
     "url": "git+https://github.com/pgxsinkit/durable-streams-rust.git"
   },
   "scripts": {
-    "test:conformance": "vitest run --config conformance/vitest.config.ts",
-    "sync-version": "node scripts/sync-cargo-version.mjs"
+    "test:conformance": "vitest run --config conformance/vitest.config.ts"
   },
   "devDependencies": {
     "@durable-streams/server-conformance-tests": "0.3.6",
