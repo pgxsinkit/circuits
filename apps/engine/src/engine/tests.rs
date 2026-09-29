@@ -1047,16 +1047,16 @@ fn inactive(id: i64) -> Row {
 #[test]
 fn aggregate_count_incremental() {
     let mut a = agg(AggFn::Count, None);
-    a.apply(&vec![Tup2(active(1), 1), Tup2(active(2), 1), Tup2(inactive(3), 1)]);
+    a.apply(&[Tup2(active(1), 1), Tup2(active(2), 1), Tup2(inactive(3), 1)]);
     assert_eq!(a.value(), serde_json::json!(2)); // only the two active rows count
 
-    a.apply(&vec![Tup2(active(1), -1), Tup2(active(4), 1)]); // one leaves, one enters
+    a.apply(&[Tup2(active(1), -1), Tup2(active(4), 1)]); // one leaves, one enters
     assert_eq!(a.value(), serde_json::json!(2));
 
-    a.apply(&vec![Tup2(inactive(3), -1), Tup2(active(3), 1)]); // update: crosses INTO the filter
+    a.apply(&[Tup2(inactive(3), -1), Tup2(active(3), 1)]); // update: crosses INTO the filter
     assert_eq!(a.value(), serde_json::json!(3));
 
-    a.apply(&vec![Tup2(active(2), -1), Tup2(inactive(2), 1)]); // update: crosses OUT of the filter
+    a.apply(&[Tup2(active(2), -1), Tup2(inactive(2), 1)]); // update: crosses OUT of the filter
     assert_eq!(a.value(), serde_json::json!(2));
 }
 
@@ -1071,25 +1071,25 @@ fn aggregate_null_semantics() {
 
     // COUNT(*) counts all matching rows; COUNT(name) only rows with non-NULL name.
     let mut star = agg(AggFn::Count, None);
-    star.apply(&vec![Tup2(active(1), 1), Tup2(null_name(2), 1)]);
+    star.apply(&[Tup2(active(1), 1), Tup2(null_name(2), 1)]);
     assert_eq!(star.value(), serde_json::json!(2));
     let mut cnt_col = agg(AggFn::Count, Some(2));
-    cnt_col.apply(&vec![Tup2(active(1), 1), Tup2(null_name(2), 1)]);
+    cnt_col.apply(&[Tup2(active(1), 1), Tup2(null_name(2), 1)]);
     assert_eq!(cnt_col.value(), serde_json::json!(1));
 
     // AVG over id where one row's aggregated column is NULL: denominator excludes it.
     let mut avg = agg(AggFn::Avg, Some(1));
-    avg.apply(&vec![Tup2(active(10), 1), Tup2(active(20), 1), Tup2(null_id.clone(), 1)]);
+    avg.apply(&[Tup2(active(10), 1), Tup2(active(20), 1), Tup2(null_id.clone(), 1)]);
     assert_eq!(avg.value(), serde_json::json!(15.0));
 
     // MIN ignores NULLs (never surfaces NULL as the extreme).
     let mut min = agg(AggFn::Min, Some(1));
-    min.apply(&vec![Tup2(active(5), 1), Tup2(null_id.clone(), 1)]);
+    min.apply(&[Tup2(active(5), 1), Tup2(null_id.clone(), 1)]);
     assert_eq!(min.value(), serde_json::json!(5));
 
     // SUM over zero non-NULL values is NULL (not 0), matching SQL.
     let mut sum = agg(AggFn::Sum, Some(1));
-    sum.apply(&vec![Tup2(null_id, 1)]);
+    sum.apply(&[Tup2(null_id, 1)]);
     assert_eq!(sum.value(), serde_json::Value::Null);
 }
 
@@ -1097,14 +1097,14 @@ fn aggregate_null_semantics() {
 #[test]
 fn aggregate_min_with_retraction() {
     let mut a = agg(AggFn::Min, Some(1)); // col 1 = id (sorted: active,id,name)
-    a.apply(&vec![Tup2(active(5), 1), Tup2(active(3), 1), Tup2(active(8), 1)]);
+    a.apply(&[Tup2(active(5), 1), Tup2(active(3), 1), Tup2(active(8), 1)]);
     assert_eq!(a.value(), serde_json::json!(3));
-    a.apply(&vec![Tup2(active(3), -1)]); // remove the current min → next-smallest surfaces
+    a.apply(&[Tup2(active(3), -1)]); // remove the current min → next-smallest surfaces
     assert_eq!(a.value(), serde_json::json!(5));
     let mut mx = agg(AggFn::Max, Some(1));
-    mx.apply(&vec![Tup2(active(5), 1), Tup2(active(8), 1)]);
+    mx.apply(&[Tup2(active(5), 1), Tup2(active(8), 1)]);
     assert_eq!(mx.value(), serde_json::json!(8));
-    mx.apply(&vec![Tup2(active(8), -1)]);
+    mx.apply(&[Tup2(active(8), -1)]);
     assert_eq!(mx.value(), serde_json::json!(5));
 }
 
@@ -1116,22 +1116,22 @@ fn aggregate_min_with_retraction() {
 fn aggregate_sum_of_big_integers_is_exact() {
     let big = |id: i64| Row(vec![Value::Bool(true), Value::Int(id), Value::Text("n".into())]);
     let mut a = agg(AggFn::Sum, Some(1)); // col 1 = id
-    a.apply(&vec![Tup2(big(9_007_199_254_740_993), 1)]);
+    a.apply(&[Tup2(big(9_007_199_254_740_993), 1)]);
     assert_eq!(a.value(), serde_json::json!("9007199254740993"));
 
     // Still exact under retraction: adding then removing 1 returns the same odd value.
-    a.apply(&vec![Tup2(big(1), 1)]);
+    a.apply(&[Tup2(big(1), 1)]);
     assert_eq!(a.value(), serde_json::json!("9007199254740994"));
-    a.apply(&vec![Tup2(big(1), -1)]);
+    a.apply(&[Tup2(big(1), -1)]);
     assert_eq!(a.value(), serde_json::json!("9007199254740993"));
 
     // Back inside the exactly-representable range it is a plain JSON number again.
-    a.apply(&vec![Tup2(big(9_007_199_254_740_993), -1), Tup2(big(7), 1)]);
+    a.apply(&[Tup2(big(9_007_199_254_740_993), -1), Tup2(big(7), 1)]);
     assert_eq!(a.value(), serde_json::json!(7));
 
     // Negative sums cross the same boundary symmetrically.
     let mut neg = agg(AggFn::Sum, Some(1));
-    neg.apply(&vec![Tup2(big(-9_007_199_254_740_993), 1)]);
+    neg.apply(&[Tup2(big(-9_007_199_254_740_993), 1)]);
     assert_eq!(neg.value(), serde_json::json!("-9007199254740993"));
 }
 
@@ -1141,10 +1141,10 @@ fn aggregate_sum_of_big_integers_is_exact() {
 fn aggregate_sum_of_floats_stays_floating() {
     let row = |f: f64| Row(vec![Value::Bool(true), Value::Float(f.into()), Value::Text("n".into())]);
     let mut a = agg(AggFn::Sum, Some(1));
-    a.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.25), 1)]);
+    a.apply(&[Tup2(row(1.5), 1), Tup2(row(2.25), 1)]);
     assert_eq!(a.value(), serde_json::json!(3.75));
     let mut avg = agg(AggFn::Avg, Some(1));
-    avg.apply(&vec![Tup2(row(1.5), 1), Tup2(row(2.5), 1)]);
+    avg.apply(&[Tup2(row(1.5), 1), Tup2(row(2.5), 1)]);
     assert_eq!(avg.value(), serde_json::json!(2.0));
 }
 
@@ -1246,12 +1246,13 @@ async fn membership_flips_agree_between_refcount_and_contributor_set() {
     }
     // Circuit path: the same changes as exactly-once weighted contributions.
     let mut groups: HashMap<Value, i64> = HashMap::new();
-    let mut ref_flips: Vec<Vec<Flip>> = Vec::new();
-    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]));
-    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]));
-    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1), (Value::Int(8), 1)]));
-    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1)]));
-    ref_flips.push(membership::fold_refcount_flips(&mut groups, [(Value::Int(8), -1)]));
+    let ref_flips: Vec<Vec<Flip>> = vec![
+        membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]),
+        membership::fold_refcount_flips(&mut groups, [(Value::Int(7), 1)]),
+        membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1), (Value::Int(8), 1)]),
+        membership::fold_refcount_flips(&mut groups, [(Value::Int(7), -1)]),
+        membership::fold_refcount_flips(&mut groups, [(Value::Int(8), -1)]),
+    ];
     // Same flips at every step (order within a step normalized by value).
     let norm = |mut v: Vec<Flip>| {
         v.sort_by(|a, b| format!("{:?}", a.value).cmp(&format!("{:?}", b.value)));
@@ -1291,7 +1292,7 @@ fn membership_latest_rows_by_pk() {
 fn agg_envelope_shared_wire_format() {
     let ts = users();
     let mut a = agg(AggFn::Count, None);
-    a.apply(&vec![Tup2(active(1), 1), Tup2(active(2), 1)]);
+    a.apply(&[Tup2(active(1), 1), Tup2(active(2), 1)]);
     let fold_env = a.envelope(&ts, Some("t1".into()), Some("0/1".into()));
     let circuit = CircuitAgg { stream_path: "shape/x".into(), constraints: vec![None], value: 2 };
     let circuit_env = circuit.envelope(&"users".into(), Some("t1".into()), Some("0/1".into()));

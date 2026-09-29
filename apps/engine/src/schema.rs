@@ -682,7 +682,7 @@ mod tests {
         let reordered = fp(vec![col("name", 25, -1), col("id", 23, -1)]);
         let repk = SchemaFingerprint { pk: Some(vec!["name".into()]), ..base() };
         let reident = SchemaFingerprint { replident: b'd', ..base() };
-        let mut digests = vec![base(), added, retyped, reordered, repk, reident]
+        let mut digests = [base(), added, retyped, reordered, repk, reident]
             .iter()
             .map(SchemaFingerprint::digest)
             .collect::<Vec<_>>();
