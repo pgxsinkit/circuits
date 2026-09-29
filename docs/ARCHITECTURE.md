@@ -63,7 +63,7 @@ Three ideas carry the whole design:
   `ingest.write` (library mode), `shapes.create/get/delete`, `subset.query/live`, `aggregate`.
 - **client** (`packages/client`) — `shape()` (a live TanStack DB collection), `subset()` (an ordered,
   windowed page + a shared live tail), `aggregate()` (a live scalar), typed writes, `awaitTxId`.
-- **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres/pgwasm reference
+- **oracle + conformance** (`packages/oracle`, `packages/conformance`) — a Postgres reference
   implementation and the harness asserting engine ≡ oracle for the same op stream, through the real
   API + client, including live replication, fuzzing, NULLs, and concurrent writers.
 

@@ -56,8 +56,6 @@
         "@durable-streams/client": "0.2.7",
         "@durable-streams/state": "0.3.2",
         "@faker-js/faker": "10.6.0",
-        "@pgxsinkit/pgwasm": "0.5.2",
-        "@pgxsinkit/pgwasm-c": "0.5.2",
         "@tanstack/db": "0.9.2",
         "@trpc/client": "11.19.0",
         "pg": "8.23.0",
@@ -76,8 +74,6 @@
       "version": "0.0.0",
       "dependencies": {
         "@circuits/protocol": "workspace:*",
-        "@pgxsinkit/pgwasm": "0.5.2",
-        "@pgxsinkit/pgwasm-c": "0.5.2",
         "pg": "8.23.0",
       },
       "devDependencies": {
@@ -257,10 +253,6 @@
     "@oxlint/binding-win32-ia32-msvc": ["@oxlint/binding-win32-ia32-msvc@1.86.0", "", { "os": "win32", "cpu": "ia32" }, "sha512-a47ga7EKVfMU8rO0i1m3mGwfNRj3FhQyt1d/ukO/E9u1HHF3KpR3tyb3VhuJBGEVPF8uR4exSyHUyx7xbE+uxw=="],
 
     "@oxlint/binding-win32-x64-msvc": ["@oxlint/binding-win32-x64-msvc@1.86.0", "", { "os": "win32", "cpu": "x64" }, "sha512-az4dzifCRzES1crwu6pDFXzJTIanrdxXFL9TbiJWrx9LKcuacbR83aPvxDA1LKLNswi/RoqitC7Afcflhu3zBQ=="],
-
-    "@pgxsinkit/pgwasm": ["@pgxsinkit/pgwasm@0.5.2", "", { "peerDependencies": { "drizzle-orm": "1.0.0-rc.4" }, "optionalPeers": ["drizzle-orm"] }, "sha512-NNfTJAUYieZwAENVYkOlALDJidLRPuTXSpXBjuAj1kNwpIPwLGn+bijq3aODhegQHjchEPUZLZVGP8bCamArhQ=="],
-
-    "@pgxsinkit/pgwasm-c": ["@pgxsinkit/pgwasm-c@0.5.2", "", { "peerDependencies": { "@pgxsinkit/pgwasm": "0.5.2" } }, "sha512-2wmqMn4buBGH99Kh+H0IfLBWlziUOry1QlPIr+0l5W9Tl4TcbrIGnTPDgREuozV0xiCPl8/6FiPhEy4z6vejsw=="],
 
     "@rolldown/binding-android-arm-eabi": ["@rolldown/binding-android-arm-eabi@1.2.5", "", { "os": "android", "cpu": "arm" }, "sha512-DLe/i+l8ynIBY7XEQ191TeZvCoowIGa18R+dIV30GW7DiOtp74i/xX8hs8GUjW5ARV7VZuie3d6AumSmCwbeRA=="],
 

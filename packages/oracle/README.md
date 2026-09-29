@@ -10,7 +10,7 @@ The oracle is built entirely from the [`@circuits/protocol`](../protocol/README.
 `shapeSelectSql` compiles the shape's predicate AST to a parameterized `WHERE`. Postgres itself is
 the semantics: NULL three-valued logic, `IN (SELECT …)`, ordering — nothing is re-implemented.
 
-## Two backends, one interface
+## The interface
 
 ```ts
 interface Oracle {
@@ -21,11 +21,8 @@ interface Oracle {
 }
 ```
 
-- **`createOracle(schema)`** — in-memory [pgwasm](https://pgxsinkit.github.io/packages/pgwasm/)
-  (`memory://`). Standalone truth for library-mode tests: changes are applied to the oracle _and_ to
-  Circuits, then the two are compared.
-- **`createPgOracle(schema, connectionString)`** — a real Postgres connection. Used by the
-  Postgres-mode harness, where the _same_ database is both the write source (changes flow
+- **`createPgOracle(schema, connectionString)`** — the oracle, on a Postgres connection. In the
+  conformance harness the _same_ database is both the write source (changes flow
   source → logical replication → engine) and the comparison truth.
 - **`createPgTables(connectionString, schema)`** — creates the schema's tables with
   `REPLICA IDENTITY FULL` (so logical decoding carries the full old row). Run before starting the
@@ -34,9 +31,10 @@ interface Oracle {
 ## Usage
 
 ```ts
-import { createOracle } from "@circuits/oracle";
+import { createPgOracle, createPgTables } from "@circuits/oracle";
 
-const oracle = await createOracle(schema);
+await createPgTables(connectionString, schema);
+const oracle = await createPgOracle(schema, connectionString);
 await oracle.applyChange("todos", { op: "insert", pk: 1, row: { id: 1, title: "x", done: false } });
 const truth = await oracle.queryShape({ table: "todos", where: { col: "done", op: "eq", value: false } });
 ```

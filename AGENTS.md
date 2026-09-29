@@ -127,8 +127,7 @@ puts `/usr/lib/postgresql/18/bin` on `PATH` itself when it finds no `initdb` the
 runs it right after install, before the suites).
 
 **Every vitest file is in exactly one of two projects** (`vitest.config.ts`). `unit` is an explicit
-list of files that need neither the engine, a log server nor a Postgres server (the oracle's tests
-use in-process pgwasm); its setup, `vitest.unit-setup.ts`, only builds the log server, which
+list of files that need neither the engine, a log server nor a Postgres server; its setup, `vitest.unit-setup.ts`, only builds the log server, which
 `packages/ds-rust/src/binary.test.ts` resolves but never starts. `integration` is every other file,
 so a new test file lands there unless it is added to the list.
 

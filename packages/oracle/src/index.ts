@@ -1,9 +1,6 @@
-// pgwasm-backed oracle: a real Postgres that receives the same change events as Circuits
-// and answers `SELECT * WHERE <predicate>` for any shape. The conformance invariant is that
-// Circuits' materialized shape set equals this oracle's result set for the same op stream.
-
-import { readFile } from "node:fs/promises";
-import { fileURLToPath } from "node:url";
+// The oracle: a real Postgres that receives the same change events as Circuits and answers
+// `SELECT * WHERE <predicate>` for any shape. The conformance invariant is that Circuits'
+// materialized shape set equals this oracle's result set for the same op stream.
 
 import {
   type ChangeEvent,
@@ -16,8 +13,6 @@ import {
   shapeSelectSql,
   tableDDL,
 } from "@circuits/protocol";
-import { createPgwasm, type PostgresBuild } from "@pgxsinkit/pgwasm";
-import { cBuildArtefacts, createCBuild } from "@pgxsinkit/pgwasm-c";
 import pgpkg from "pg";
 
 export interface Oracle {
@@ -30,66 +25,8 @@ export interface Oracle {
   close(): Promise<void>;
 }
 
-// The C build loads its artefacts (the Postgres and initdb WebAssembly modules, the filesystem
-// bundle) with `fetch`, which reads their `file://` URLs on Bun but not on Node, and vitest runs the
-// tests on Node. So the oracle reads and compiles them itself and hands them to the build, once per
-// process; every oracle boots from the same compiled modules.
-let oracleBuild: PostgresBuild | undefined;
-
-async function compileArtefact(url: URL): Promise<WebAssembly.Module> {
-  return WebAssembly.compile(await readFile(fileURLToPath(url)));
-}
-
-function pgwasmBuild(): PostgresBuild {
-  oracleBuild ??= createCBuild({
-    postgresWasmModule: compileArtefact(cBuildArtefacts.postgresWasm),
-    initdbWasmModule: compileArtefact(cBuildArtefacts.initdbWasm),
-    fsBundle: readFile(fileURLToPath(cBuildArtefacts.fsBundle)).then((bytes) => new Blob([bytes])),
-  });
-  return oracleBuild;
-}
-
-export async function createOracle(schema: Schema): Promise<Oracle> {
-  const db = await createPgwasm({ build: pgwasmBuild(), dataDir: "memory://" });
-  for (const [name, def] of Object.entries(schema.tables)) {
-    // A non-`public` table needs its schema to exist first (a bare key is `public.<name>` sugar,
-    // which always exists).
-    const ref = parseTableRef(name);
-    if (ref.schema !== "public") await db.exec(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`);
-    await db.exec(`${tableDDL(name, def)};`);
-  }
-
-  return {
-    async applyChange(table, ev) {
-      const def = schema.tables[table];
-      if (!def) throw new Error(`oracle: unknown table "${table}"`);
-      const { text, params } = changeEventToDML(table, def, ev);
-      await db.query(text, params);
-    },
-
-    async queryShape(shape) {
-      const def = schema.tables[shape.table];
-      if (!def) throw new Error(`oracle: unknown table "${shape.table}"`);
-      const { text, params } = shapeSelectSql(shape.table, shape.where);
-      const res = await db.query<Row>(text, params);
-      return res.rows;
-    },
-
-    async reset() {
-      for (const name of Object.keys(schema.tables)) {
-        await db.exec(`TRUNCATE ${qualifiedIdent(name)} RESTART IDENTITY CASCADE;`);
-      }
-    },
-
-    async close() {
-      await db.close();
-    },
-  };
-}
-
-// --- Real Postgres backend -------------------------------------------------------------------
-// Used by the Postgres-mode conformance harness: the *same* Postgres is the write source (changes
-// flow source -> logical replication -> engine) and the comparison oracle (SELECT ... WHERE pred).
+// In the conformance harness the *same* Postgres is the write source (changes flow source ->
+// logical replication -> engine) and the comparison oracle (SELECT ... WHERE pred).
 
 /** Create the schema's tables in Postgres with `REPLICA IDENTITY FULL` (so logical decoding carries
  * the full old row). Run before starting the engine. */
@@ -98,7 +35,8 @@ export async function createPgTables(connectionString: string, schema: Schema): 
   await client.connect();
   try {
     for (const [name, def] of Object.entries(schema.tables)) {
-      // Non-`public` tables need their schema created before the table (see `createOracle`).
+      // A non-`public` table needs its schema to exist first (a bare key is `public.<name>` sugar,
+      // which always exists).
       const ref = parseTableRef(name);
       if (ref.schema !== "public") {
         await client.query(`CREATE SCHEMA IF NOT EXISTS "${ref.schema.replace(/"/g, '""')}";`);

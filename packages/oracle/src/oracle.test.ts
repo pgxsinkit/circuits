@@ -1,7 +1,46 @@
 import type { Schema } from "@circuits/protocol";
+import pgpkg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createOracle, type Oracle } from "./index.js";
+import { createPgOracle, createPgTables, type Oracle } from "./index.js";
+
+// The oracle is a real Postgres, so its tests need one: the cluster the integration project's global
+// setup boots. Each suite gets a database of its own and drops it afterwards.
+function adminUrl(): string {
+  const url = process.env.CIRCUITS_TEST_PG_URL;
+  if (!url) throw new Error("CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)");
+  return url;
+}
+
+let databases = 0;
+
+async function oracleOn(schema: Schema): Promise<{ oracle: Oracle; drop: () => Promise<void> }> {
+  const name = `oracle_test_${process.pid}_${++databases}`;
+  const admin = new pgpkg.Client({ connectionString: adminUrl() });
+  await admin.connect();
+  try {
+    await admin.query(`CREATE DATABASE ${name}`);
+  } finally {
+    await admin.end();
+  }
+  const url = new URL(adminUrl());
+  url.pathname = `/${name}`;
+  await createPgTables(url.toString(), schema);
+  const oracle = await createPgOracle(schema, url.toString());
+  return {
+    oracle,
+    drop: async () => {
+      await oracle.close();
+      const again = new pgpkg.Client({ connectionString: adminUrl() });
+      await again.connect();
+      try {
+        await again.query(`DROP DATABASE ${name}`);
+      } finally {
+        await again.end();
+      }
+    },
+  };
+}
 
 // The ids are numbers: order them as numbers, not as the strings a bare `sort()` compares.
 const byNumber = (a: unknown, b: unknown): number => Number(a) - Number(b);
@@ -30,11 +69,12 @@ const familySchema: Schema = {
 
 describe("oracle", () => {
   let oracle: Oracle;
+  let drop: () => Promise<void>;
   beforeAll(async () => {
-    oracle = await createOracle(schema);
+    ({ oracle, drop } = await oracleOn(schema));
   });
   afterAll(async () => {
-    await oracle.close();
+    await drop();
   });
 
   it("upserts and filters rows", async () => {
@@ -116,8 +156,9 @@ describe("oracle", () => {
 
 describe("oracle subqueries", () => {
   let oracle: Oracle;
+  let drop: () => Promise<void>;
   beforeAll(async () => {
-    oracle = await createOracle(familySchema);
+    ({ oracle, drop } = await oracleOn(familySchema));
     for (const [id, active] of [
       [1, true],
       [2, false],
@@ -131,7 +172,7 @@ describe("oracle subqueries", () => {
     }
   });
   afterAll(async () => {
-    await oracle.close();
+    await drop();
   });
 
   it("answers an IN (SELECT … active) subquery shape", async () => {

@@ -12,8 +12,6 @@
   },
   "dependencies": {
     "@circuits/protocol": "workspace:*",
-    "@pgxsinkit/pgwasm": "0.5.2",
-    "@pgxsinkit/pgwasm-c": "0.5.2",
     "pg": "8.23.0"
   },
   "devDependencies": {
