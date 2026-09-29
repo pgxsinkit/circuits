@@ -1,33 +1,42 @@
 {
   "name": "circuits",
-  "description": "The server side of pgxsinkit's read path: the Circuits engine, which keeps shapes in sync from Postgres logical replication, and the durable-streams log server that stores and serves them.",
   "version": "0.0.0",
   "private": true,
-  "type": "module",
-  "packageManager": "bun@1.4.2",
-  "engines": {
-    "node": ">=22"
-  },
+  "description": "The server side of pgxsinkit's read path: the Circuits engine, which keeps shapes in sync from Postgres logical replication, and the durable-streams log server that stores and serves them.",
   "workspaces": [
     "packages/*",
     "apps/api",
     "apps/durable-streams"
   ],
+  "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
-    "test:conformance": "vitest run packages/conformance",
-    "test:fuzz": "vitest run packages/conformance/src/conformance-fuzz.test.ts",
-    "test:durable-streams": "cargo test -p durable-streams",
-    "test:durable-streams:conformance": "cargo build --profile release-durable-streams -p durable-streams && bun run --cwd apps/durable-streams test:conformance",
-    "engine:build": "cargo build -p circuits-engine",
-    "engine:test": "cargo test -p circuits-engine",
-    "loop": "bash scripts/conformance-loop.sh"
+    "build": "bun run engine:build && bun run durable-streams:build",
+    "durable-streams:build": "bash scripts/with-toolchain.sh cargo build -p durable-streams",
+    "engine:build": "bash scripts/with-toolchain.sh cargo build -p circuits-engine",
+    "engine:test": "bash scripts/with-toolchain.sh cargo test -p circuits-engine",
+    "format": "oxfmt --config .oxfmtrc.jsonc --check . && bash scripts/with-toolchain.sh cargo fmt --check",
+    "format:write": "oxfmt --config .oxfmtrc.jsonc --write . && bash scripts/with-toolchain.sh cargo fmt",
+    "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings",
+    "lint:fix": "oxlint --fix -c .oxlintrc.jsonc .",
+    "loop": "bash scripts/with-toolchain.sh bash scripts/conformance-loop.sh",
+    "test": "bash scripts/with-toolchain.sh vitest run",
+    "test:conformance": "bash scripts/with-toolchain.sh vitest run packages/conformance",
+    "test:durable-streams": "bash scripts/with-toolchain.sh cargo test -p durable-streams",
+    "test:durable-streams:conformance": "bun run durable-streams:build --profile release-durable-streams && bun run --cwd apps/durable-streams test:conformance",
+    "test:fuzz": "bash scripts/with-toolchain.sh vitest run packages/conformance/src/conformance-fuzz.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "@types/node": "22.20.1",
+    "oxfmt": "0.71.0",
+    "oxlint": "1.86.0",
+    "oxlint-tsgolint": "7.0.2003",
+    "tsx": "4.22.4",
     "typescript": "7.0.2",
-    "vitest": "3.2.6",
-    "tsx": "4.22.4"
-  }
+    "vitest": "3.2.6"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "bun@1.4.2"
 }
