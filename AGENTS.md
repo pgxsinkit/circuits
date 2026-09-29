@@ -98,7 +98,7 @@ bun run validate:full                      # the pre-push gate, and what CI runs
 
 bun run format                             # check: oxfmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
 bun run format:write                       # apply both
-bun run lint                               # check: oxlint (type-aware), then clippy on the log server, release profile, -D warnings
+bun run lint                               # check: oxlint (type-aware), then clippy -D warnings: the log server (release profile), the engine (dev profile)
 bun run lint:fix                           # oxlint --fix
 bun run typecheck                          # tsc --noEmit over the whole TS workspace (seconds; no PG, no engine)
 bun run test                               # unit only: both crates' Rust tests + the vitest `unit` project; no Postgres

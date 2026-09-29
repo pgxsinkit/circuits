@@ -58,7 +58,8 @@ jobs:
       - name: Log server tests
         run: bun run test:durable-streams --profile release-durable-streams --locked
 
-      # oxlint over the TypeScript, then clippy on the log server in its release profile.
+      # oxlint over the TypeScript, then clippy with warnings denied: the log server in its release
+      # profile, then the engine in its dev profile.
       - name: Lint
         run: bun run lint
 

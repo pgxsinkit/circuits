@@ -17,7 +17,7 @@
     "engine:test": "bash scripts/with-toolchain.sh cargo test -p circuits-engine",
     "format": "oxfmt --config .oxfmtrc.jsonc --check . && bash scripts/with-toolchain.sh cargo fmt --check",
     "format:write": "oxfmt --config .oxfmtrc.jsonc --write . && bash scripts/with-toolchain.sh cargo fmt",
-    "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings",
+    "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings && bash scripts/with-toolchain.sh cargo clippy -p circuits-engine --all-targets -- -D warnings",
     "lint:fix": "oxlint --fix -c .oxlintrc.jsonc .",
     "loop": "bash scripts/with-toolchain.sh bash scripts/conformance-loop.sh",
     "prepare": "git config core.hooksPath .githooks || true",
