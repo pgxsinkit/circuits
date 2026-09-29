@@ -982,7 +982,6 @@ pub(crate) async fn sequencer_loop(
                                 &trace_tx,
                             );
                         }
-                        emit_storage_txn_metrics(&txn_pending);
                         for (path, envs) in &txn_pending {
                             *emitted.entry(sid_of_path(path).to_string()).or_insert(0) += envs.len() as u64;
                         }
@@ -1753,7 +1752,6 @@ async fn stream_backfill(
 
     let mut agg_seed = aggregate.map(|_| AggSeed::default());
     let mut rows_total = 0u64;
-    let mut snapshot_bytes = 0u64;
     let mut emitted_seed = 0u64;
     let mut appends = 0u64;
     loop {
@@ -1776,9 +1774,6 @@ async fn stream_backfill(
                     continue;
                 }
                 let envs = translate_output(ts, out, None, None, out_cols.map(|c| c.as_slice()));
-                if crate::statsd::enabled() {
-                    snapshot_bytes += envs_bytes(&envs);
-                }
                 emitted_seed += envs.len() as u64;
                 if let Err(e) = ds.append(stream_path, &envs).await {
                     return Err(e.context("append snapshot"));
@@ -1799,9 +1794,6 @@ async fn stream_backfill(
         );
     }
     let fences = reader.finish().await;
-    if agg_seed.is_none() {
-        crate::statsd::snapshot_stored(rows_total, snapshot_bytes, t0.elapsed().as_secs_f64() * 1000.0);
-    }
     Ok((fences.gate, agg_seed, emitted_seed))
 }
 
@@ -2115,25 +2107,6 @@ fn publish_envelope_trace(
     if let Ok(json) = serde_json::to_string(&ev) {
         let _ = trace_tx.send(Arc::new(json));
     }
-}
-
-/// Total serialized byte size of a set of output envelopes (for storage/snapshot byte metrics).
-pub(crate) fn envs_bytes(envs: &[Envelope]) -> u64 {
-    envs.iter().map(|e| serde_json::to_string(e).map(|s| s.len() as u64).unwrap_or(0)).sum()
-}
-
-/// Emit the per-source-transaction storage StatsD metrics from one txn's staged appends.
-/// `affected_shape_count` = distinct shape streams the txn touched; `operations`/`bytes` = output
-/// envelopes appended + their serialized size. (Subquery-registry appends go out synchronously inside
-/// `process_envelope` and are not reflected here.) No-op when the txn produced no appends.
-pub(crate) fn emit_storage_txn_metrics(txn_pending: &HashMap<String, Vec<Envelope>>) {
-    let ops: u64 = txn_pending.values().map(|v| v.len() as u64).sum();
-    if ops == 0 {
-        return;
-    }
-    let bytes: u64 =
-        txn_pending.values().flatten().map(|e| serde_json::to_string(e).map(|s| s.len() as u64).unwrap_or(0)).sum();
-    crate::statsd::storage_txn(ops, bytes, txn_pending.len() as u64);
 }
 
 /// Flush the batch's staged appends, bounded-concurrently. Each envelope keeps its own txid, so

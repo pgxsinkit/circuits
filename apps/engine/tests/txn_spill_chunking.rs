@@ -133,7 +133,7 @@ fn spilled_buffer(dir: &std::path::Path, n: usize, memory_bytes: u64, append_byt
     let cfg = TxnBufferConfig { memory_bytes, append_bytes, spill_dir: dir.to_path_buf() };
     let mut buf = TxnBuffer::new(3141, cfg);
     for i in 0..n {
-        buf.push(env_of(&format!("k{i:04}"), 48), 64).unwrap();
+        buf.push(env_of(&format!("k{i:04}"), 48)).unwrap();
     }
     buf
 }
@@ -202,7 +202,7 @@ async fn a_small_commit_is_still_a_single_append() {
         TxnBufferConfig { memory_bytes: 128 * 1024 * 1024, append_bytes: 64 * 1024 * 1024, spill_dir: dir.0.clone() };
     let mut buf = TxnBuffer::new(7, cfg);
     for i in 0..25 {
-        buf.push(env_of(&format!("k{i}"), 16), 32).unwrap();
+        buf.push(env_of(&format!("k{i}"), 16)).unwrap();
     }
     assert!(!buf.spilled());
 

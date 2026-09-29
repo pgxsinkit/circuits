@@ -3,7 +3,7 @@
 //!
 //! One table has ONE spelling: the envelope `type` on the change log and shape streams, the `table`
 //! field of every native-API request/response, the durable catalog's `rec.table`, sharing
-//! signatures, trace/graph node ids and StatsD tags all carry `TableRef`'s canonical `Display` form.
+//! signatures and trace/graph node ids all carry `TableRef`'s canonical `Display` form.
 //! `users` and `public.users` are the same table, so they must never become two separately
 //! maintained shapes.
 //!
@@ -18,7 +18,7 @@
 //! unconstructible (the fields are private; every path in goes through validation), and — the
 //! ergonomic reason — gives [`TableRef::as_str`] a borrow of the canonical form for the sites that
 //! genuinely need a `&str`: the `Arc<str>` bucket keys in [`crate::subq_index`], trace/graph node
-//! ids, StatsD tags, `format!` messages. [`TableRef::schema`] / [`TableRef::name`] hand out the two
+//! ids, `format!` messages. [`TableRef::schema`] / [`TableRef::name`] hand out the two
 //! parts.
 
 use std::fmt;

@@ -29,17 +29,14 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use circuits_engine::config::{self, Config};
+use circuits_engine::config::Config;
 use circuits_engine::ds::DsClient;
 use circuits_engine::engine::Engine;
+use circuits_engine::pg;
 use circuits_engine::shutdown::{self, ShutdownToken};
-use circuits_engine::{pg, statsd};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Anchor process-uptime / boot-to-ready timing before anything else runs.
-    statsd::mark_start();
-
     // Configuration is resolved before tracing exists (the log filter comes out of it), so a
     // refusal here writes to stderr itself — and exits 78 like every other boot refusal, rather
     // than the anyhow default of 1. An operator reading `kubectl describe` should not have to know
@@ -51,12 +48,6 @@ async fn main() -> Result<()> {
     init_tracing(&config.log_filter);
 
     tracing::info!("resolved config: {}", config.redacted());
-
-    // Publish the metric-tag globals (instance id, stack id) and wire up StatsD.
-    config::set_globals(&config.instance_id, &config.stack_id);
-    if let Some(target) = &config.statsd {
-        statsd::init(target, &config.instance_id);
-    }
 
     let Some(ds_url) = config.ds_url.clone() else {
         refuse_boot(
@@ -100,9 +91,7 @@ async fn main() -> Result<()> {
         _ => {
             // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
             // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            let engine = Engine::new(DsClient::new(ds_url.clone()));
-            statsd::consumers_ready(engine.table_count().await as u64);
-            engine
+            Engine::new(DsClient::new(ds_url.clone()))
         }
     };
 
@@ -112,10 +101,6 @@ async fn main() -> Result<()> {
     let _otel = circuits_engine::mem::init_otel();
     circuits_engine::mem::publish(&engine.mem_cardinalities().await);
     circuits_engine::mem::spawn_sampler(engine.clone(), Duration::from_millis(500));
-
-    // StatsD periodic samplers (no-ops when StatsD is off): system metrics + storage size.
-    statsd::spawn_system_sampler(config.metrics_period);
-    statsd::spawn_storage_sampler(config.storage_dir.clone());
 
     let shutdown = engine.shutdown_token();
     // Kept past the router so the Postgres setup and the shutdown path still have a handle.
@@ -148,9 +133,8 @@ async fn main() -> Result<()> {
         if setup_postgres_until_ready(&boot_engine, &config).await {
             let tables = boot_engine.table_count().await;
             tracing::info!("postgres mode: {tables} table(s), slot '{}', streaming pgoutput", config.slot);
-            statsd::consumers_ready(tables as u64);
-            // Replication-slot gauges (engine-owned: `/metrics`, `/metrics/prometheus` AND StatsD
-            // read the same ~10 s sample, taken on a POOLED connection).
+            // Replication-slot gauges (`/metrics` and `/metrics/prometheus` read the same ~10 s
+            // sample, taken on a POOLED connection).
             circuits_engine::metrics::spawn_replication_slot_sampler(
                 url,
                 config.slot.clone(),

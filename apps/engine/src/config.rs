@@ -9,19 +9,6 @@ use anyhow::{Context, Result, bail};
 use crate::table_ref::{TableRef, TableSelector};
 use crate::txn_buffer::TxnBufferConfig;
 
-/// A StatsD destination (`host[:port]`, default port 8125).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatsdTarget {
-    pub host: String,
-    pub port: u16,
-}
-
-impl StatsdTarget {
-    pub fn addr(&self) -> String {
-        format!("{}:{}", self.host, self.port)
-    }
-}
-
 /// Fully-resolved boot configuration.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -43,16 +30,6 @@ pub struct Config {
     /// Legacy replication poll interval (ms). Unused since the ingestor streams pgoutput (push
     /// delivery); still parsed so existing `CIRCUITS_PG_POLL_MS` settings are accepted.
     pub poll_ms: u64,
-    /// This instance's id — tags every StatsD metric.
-    pub instance_id: String,
-    /// The `stack_id` tag value on shape metrics (`single_stack`).
-    pub stack_id: String,
-    /// StatsD destination (absent → StatsD off).
-    pub statsd: Option<StatsdTarget>,
-    /// Period for the periodic system-metrics sampler.
-    pub metrics_period: Duration,
-    /// Root dir of durable-streams file storage, for `electric.storage.used.bytes` (`du`).
-    pub storage_dir: Option<String>,
     /// Max pooled Postgres connections for backfills/query-backs (`CIRCUITS_PG_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
@@ -81,9 +58,8 @@ pub struct Config {
 /// Settings for the dbsp arrangement layer (all under `CIRCUITS_DBSP*`).
 #[derive(Clone, Debug)]
 pub struct DbspConfig {
-    /// State directory (`CIRCUITS_DBSP_DIR`; default
-    /// `<ELECTRIC_STORAGE_DIR|./data>/dbsp/<slot>` — slot-keyed so parallel engines and
-    /// different source databases never share dbsp state).
+    /// State directory (`CIRCUITS_DBSP_DIR`; default `./data/dbsp/<slot>` — slot-keyed so parallel
+    /// engines and different source databases never share dbsp state).
     pub dir: std::path::PathBuf,
     /// Storage-cache budget in MiB (`CIRCUITS_DBSP_CACHE_MIB`).
     pub cache_mib: Option<usize>,
@@ -107,38 +83,6 @@ pub struct DbspConfig {
 
 fn nonempty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
-}
-
-/// Parse a human-readable duration (`5s`, `200ms`, `1m`, `2h`) or a bare integer (milliseconds).
-/// Returns `None` on any parse failure so the caller can fall through to the next source.
-pub fn parse_human_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (num, unit): (&str, &str) = if let Some(p) = s.strip_suffix("ms") {
-        (p, "ms")
-    } else if let Some(p) = s.strip_suffix('s') {
-        (p, "s")
-    } else if let Some(p) = s.strip_suffix('m') {
-        (p, "m")
-    } else if let Some(p) = s.strip_suffix('h') {
-        (p, "h")
-    } else {
-        (s, "ms") // bare integer == milliseconds
-    };
-    let n: f64 = num.trim().parse().ok()?;
-    if !n.is_finite() || n < 0.0 {
-        return None;
-    }
-    let ms = match unit {
-        "ms" => n,
-        "s" => n * 1_000.0,
-        "m" => n * 60_000.0,
-        "h" => n * 3_600_000.0,
-        _ => return None,
-    };
-    Some(Duration::from_millis(ms as u64))
 }
 
 impl Config {
@@ -203,27 +147,6 @@ impl Config {
 
         let poll_ms = g("CIRCUITS_PG_POLL_MS").and_then(|s| s.trim().parse().ok()).unwrap_or(50);
 
-        let instance_id = g("ELECTRIC_INSTANCE_ID").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let stack_id = "single_stack".to_string();
-
-        let statsd = g("ELECTRIC_STATSD_HOST").map(|h| {
-            let h = h.trim();
-            match h.rsplit_once(':') {
-                Some((host, port)) if port.parse::<u16>().is_ok() => {
-                    StatsdTarget { host: host.to_string(), port: port.parse().unwrap() }
-                }
-                _ => StatsdTarget { host: h.to_string(), port: 8125 },
-            }
-        });
-
-        // ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL (Electric's spelling, human duration) wins over the
-        // fleet's TELEMETRY_POLLER_PERIOD (bare ms); default 5s (Electric's default).
-        let metrics_period = g("ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL")
-            .and_then(|s| parse_human_duration(&s))
-            .or_else(|| g("TELEMETRY_POLLER_PERIOD").and_then(|s| parse_human_duration(&s)))
-            .unwrap_or_else(|| Duration::from_secs(5));
-
-        let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let db_pool_size =
             g("CIRCUITS_PG_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
 
@@ -239,9 +162,9 @@ impl Config {
             // Default dir is keyed by the replication slot: dbsp state is only valid for the
             // database identity it was built from, and parallel engines (conformance harnesses)
             // get disjoint state dirs for free.
-            dir: g("CIRCUITS_DBSP_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| {
-                std::path::Path::new(storage_dir.as_deref().unwrap_or("./data")).join("dbsp").join(&slot)
-            }),
+            dir: g("CIRCUITS_DBSP_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::Path::new("./data").join("dbsp").join(&slot)),
             cache_mib: g("CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
             min_storage_bytes: Some(
                 g("CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024) * 1024,
@@ -334,11 +257,6 @@ impl Config {
             slot,
             tables,
             poll_ms,
-            instance_id,
-            stack_id,
-            statsd,
-            metrics_period,
-            storage_dir,
             db_pool_size,
             trace,
             dbsp,
@@ -357,19 +275,13 @@ impl Config {
     /// The resolved configuration with the Postgres URL's credentials redacted — safe to log.
     pub fn redacted(&self) -> String {
         format!(
-            "bind={} pg_url={} ds_url={} slot={} instance_id={} stack_id={} statsd={} metrics_period={:?} \
-             storage_dir={} trace={} log={} \
+            "bind={} pg_url={} ds_url={} slot={} trace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
              backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
             self.slot,
-            self.instance_id,
-            self.stack_id,
-            self.statsd.as_ref().map(|s| s.addr()).unwrap_or_else(|| "<off>".into()),
-            self.metrics_period,
-            self.storage_dir.as_deref().unwrap_or("<none>"),
             self.trace,
             self.log_filter,
             self.txn.memory_bytes,
@@ -398,27 +310,6 @@ fn redact_url(url: &str) -> String {
         },
         None => url.to_string(),
     }
-}
-
-// ---- process-global accessors set once at boot (read from request handlers) --------------------
-
-use std::sync::OnceLock;
-
-static INSTANCE_ID: OnceLock<String> = OnceLock::new();
-static STACK_ID: OnceLock<String> = OnceLock::new();
-
-/// Publish the metric-tag globals (instance id, stack id) once at boot.
-pub fn set_globals(instance_id: &str, stack_id: &str) {
-    let _ = INSTANCE_ID.set(instance_id.to_string());
-    let _ = STACK_ID.set(stack_id.to_string());
-}
-
-pub fn instance_id() -> &'static str {
-    INSTANCE_ID.get().map(String::as_str).unwrap_or("unknown")
-}
-
-pub fn stack_id() -> &'static str {
-    STACK_ID.get().map(String::as_str).unwrap_or("single_stack")
 }
 
 #[cfg(test)]
@@ -497,46 +388,6 @@ mod tests {
     fn slot_name() {
         assert_eq!(cfg(&[]).slot, "circuits");
         assert_eq!(cfg(&[("CIRCUITS_PG_SLOT", "custom")]).slot, "custom");
-    }
-
-    #[test]
-    fn instance_id_default_is_a_uuid() {
-        let c = cfg(&[]);
-        assert_eq!(c.instance_id.len(), 36, "generated instance id should be a UUID");
-        assert_eq!(cfg(&[("ELECTRIC_INSTANCE_ID", "fixed-id")]).instance_id, "fixed-id");
-    }
-
-    #[test]
-    fn statsd_host_and_port() {
-        assert_eq!(cfg(&[]).statsd, None);
-        assert_eq!(
-            cfg(&[("ELECTRIC_STATSD_HOST", "host.docker.internal")]).statsd,
-            Some(StatsdTarget { host: "host.docker.internal".into(), port: 8125 })
-        );
-        assert_eq!(
-            cfg(&[("ELECTRIC_STATSD_HOST", "10.0.0.5:9999")]).statsd,
-            Some(StatsdTarget { host: "10.0.0.5".into(), port: 9999 })
-        );
-    }
-
-    #[test]
-    fn metrics_period_precedence() {
-        assert_eq!(cfg(&[]).metrics_period, Duration::from_secs(5));
-        assert_eq!(cfg(&[("TELEMETRY_POLLER_PERIOD", "200")]).metrics_period, Duration::from_millis(200));
-        // Electric's spelling wins even when both are set.
-        assert_eq!(
-            cfg(&[("ELECTRIC_SYSTEM_METRICS_POLL_INTERVAL", "2s"), ("TELEMETRY_POLLER_PERIOD", "200")]).metrics_period,
-            Duration::from_secs(2)
-        );
-    }
-
-    #[test]
-    fn duration_parsing() {
-        assert_eq!(parse_human_duration("5s"), Some(Duration::from_secs(5)));
-        assert_eq!(parse_human_duration("200ms"), Some(Duration::from_millis(200)));
-        assert_eq!(parse_human_duration("1m"), Some(Duration::from_secs(60)));
-        assert_eq!(parse_human_duration("500"), Some(Duration::from_millis(500)));
-        assert_eq!(parse_human_duration("garbage"), None);
     }
 
     #[test]

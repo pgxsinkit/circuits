@@ -522,7 +522,7 @@ async fn stream_loop(
                     // disk past its memory cap, so a transaction of any size stays bounded
                     // (ADR-0003). A spill-file write failure tears the connection down
                     // unacknowledged, exactly like a failed append.
-                    Decoded::Env(env) => t.push(env, data.len() as u64).context("buffering a change")?,
+                    Decoded::Env(env) => t.push(env).context("buffering a change")?,
                     Decoded::Sync(n) => t.set_sync(n),
                     Decoded::None => {}
                 }
@@ -531,7 +531,7 @@ async fn stream_loop(
                 let Some(mut t) = txn.take() else { continue };
                 let t0 = std::time::Instant::now();
                 let commit_lsn = lsn.to_string();
-                let (ops, raw_bytes, sync) = (t.len(), t.raw_bytes(), t.sync());
+                let sync = t.sync();
                 // Append the whole transaction — from memory, or from its spill file — in chunks,
                 // in order, to the CURRENT segment. `?` here is the ack-after-the-last-chunk rule:
                 // nothing below runs unless every chunk landed.
@@ -547,12 +547,6 @@ async fn stream_loop(
                 // Releasing the buffer here (rather than at the end of the arm) removes the spill
                 // file as soon as the commit is durable, not after the rotation check.
                 drop(t);
-                // Per-txn replication metrics. `receive_lag` here is ingest-side append latency
-                // (commit frame received → appended), not source-commit→receipt lag.
-                if ops > 0 && crate::statsd::enabled() {
-                    let lag_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    crate::statsd::replication_txn(ops, raw_bytes, lag_ms);
-                }
                 // Rotation is a TRANSACTION-BOUNDARY decision, taken after the commit is on the log
                 // and acknowledged: a segment never splits a transaction — chunking does not change
                 // that, every chunk of a commit goes to the segment that was current when the

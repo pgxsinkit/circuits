@@ -144,9 +144,6 @@ impl Engine {
         // past it checks again under the state lock before registering, and once more before
         // handing back a handle (see `ensure_create_not_degraded`).
         self.ensure_not_degraded()?;
-        // Whole shape-creation timer (backfill + registration); emitted by the creator on success only
-        // (joiners return early before this fires) as `create_snapshot_task.stop.duration`.
-        let created_at = std::time::Instant::now();
         let mut st = self.state.lock().await;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
@@ -388,7 +385,6 @@ impl Engine {
                         &self.trace_tx,
                         crate::trace::GraphLifecycle::ShapeAdded { shape: id, table: table.clone() },
                     );
-                    crate::statsd::create_snapshot_task(created_at.elapsed());
                     return Ok(rec);
                 }
                 Err(e) => {
@@ -521,7 +517,6 @@ impl Engine {
                     &self.trace_tx,
                     crate::trace::GraphLifecycle::ShapeAdded { shape: rec.id.clone(), table: rec.table.clone() },
                 );
-                crate::statsd::create_snapshot_task(created_at.elapsed());
                 Ok(rec)
             }
             Err(e) => {

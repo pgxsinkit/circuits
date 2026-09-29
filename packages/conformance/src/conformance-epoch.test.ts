@@ -142,7 +142,7 @@ describe('losing the replication slot ends the epoch (ADR-0004)', () => {
     await expectRetired(items.shapeId, items.streamUrl)
     await expectRetired(other.shapeId, other.streamUrl)
 
-    // A new epoch on a fresh slot of the same name — the StatsD slot gauges keep working precisely
+    // A new epoch on a fresh slot of the same name — the slot gauges keep working precisely
     // because the name does not change. The BINDING is the barrier, not the slot row: the row is
     // visible while Postgres is still finding the slot's consistent point, and the engine records the
     // epoch after that. Waiting on the row would race the rebind and read a stale `boundAt`.

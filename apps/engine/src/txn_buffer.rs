@@ -240,25 +240,13 @@ pub struct TxnBuffer {
     /// In-memory bytes of everything pushed so far (memory + what has gone to the file) — what the
     /// cap is measured against.
     buffered_bytes: u64,
-    /// Raw pgoutput payload bytes of the tracked changes (StatsD only).
-    raw_bytes: u64,
     /// `__el_sync` counter carried by this transaction (drain barrier).
     sync: Option<i64>,
 }
 
 impl TxnBuffer {
     pub fn new(xid: u32, cfg: TxnBufferConfig) -> TxnBuffer {
-        TxnBuffer {
-            xid,
-            cfg,
-            mem: Vec::new(),
-            mem_bytes: 0,
-            spill: None,
-            count: 0,
-            buffered_bytes: 0,
-            raw_bytes: 0,
-            sync: None,
-        }
+        TxnBuffer { xid, cfg, mem: Vec::new(), mem_bytes: 0, spill: None, count: 0, buffered_bytes: 0, sync: None }
     }
 
     pub fn xid(&self) -> u32 {
@@ -272,11 +260,6 @@ impl TxnBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.count == 0
-    }
-
-    /// Raw pgoutput payload bytes of the tracked changes (StatsD).
-    pub fn raw_bytes(&self) -> u64 {
-        self.raw_bytes
     }
 
     /// In-memory bytes of everything buffered — the quantity the memory cap is measured on.
@@ -302,17 +285,16 @@ impl TxnBuffer {
         self.sync = Some(n);
     }
 
-    /// Buffer one decoded change. `raw_len` is the pgoutput payload's size (StatsD accounting only).
+    /// Buffer one decoded change.
     ///
     /// Nothing is serialized here while the transaction fits in memory — an ordinary commit costs
     /// exactly what it did before ADR-0003. An I/O failure on the spill file propagates: the
     /// ingestor tears the connection down unacknowledged and Postgres re-delivers the whole
     /// transaction.
-    pub fn push(&mut self, env: Envelope, raw_len: u64) -> Result<()> {
+    pub fn push(&mut self, env: Envelope) -> Result<()> {
         let bytes = envelope_memory_bytes(&env);
         self.count += 1;
         self.buffered_bytes += bytes;
-        self.raw_bytes += raw_len;
         if self.spill.is_some() {
             let line = serde_json::to_vec(&env).context("serializing a change for the spill file")?;
             return self.write_spilled(&line);
@@ -746,7 +728,7 @@ mod tests {
         let mut buf = TxnBuffer::new(7, cfg(dir.path(), 512, 1 << 20));
         let mut spilled_after = None;
         for i in 0..40 {
-            buf.push(env_of(&format!("k{i}"), 32), 10).unwrap();
+            buf.push(env_of(&format!("k{i}"), 32)).unwrap();
             if buf.spilled() && spilled_after.is_none() {
                 spilled_after = Some(i);
             }
@@ -777,7 +759,7 @@ mod tests {
         // 512-byte cap and a 900-byte append budget: several chunks, and a spill part-way.
         let mut buf = TxnBuffer::new(9, cfg(dir.path(), 512, 900));
         for i in 0..50 {
-            buf.push(env_of(&format!("k{i:03}"), 40), 10).unwrap();
+            buf.push(env_of(&format!("k{i:03}"), 40)).unwrap();
         }
         assert!(buf.spilled());
         let chunks = drain_all(&mut buf);
@@ -798,7 +780,7 @@ mod tests {
         let dir = Scratch::new("nospill");
         let mut buf = TxnBuffer::new(11, cfg(dir.path(), 0, 900));
         for i in 0..30 {
-            buf.push(env_of(&format!("k{i:03}"), 40), 10).unwrap();
+            buf.push(env_of(&format!("k{i:03}"), 40)).unwrap();
         }
         assert!(!buf.spilled(), "TXN_MEMORY_BYTES=0 never spills");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "and writes nothing to disk");
@@ -820,7 +802,7 @@ mod tests {
         const BUDGET: u64 = 1500;
         let mut buf = TxnBuffer::new(13, cfg(dir.path(), 400, BUDGET));
         for i in 0..60 {
-            buf.push(env_of(&format!("k{i:03}"), 60), 10).unwrap();
+            buf.push(env_of(&format!("k{i:03}"), 60)).unwrap();
         }
         let chunks = drain_all(&mut buf);
         assert!(chunks.len() > 1);
@@ -835,9 +817,9 @@ mod tests {
     fn an_oversized_envelope_becomes_its_own_chunk() {
         let dir = Scratch::new("oversized");
         let mut buf = TxnBuffer::new(15, cfg(dir.path(), 0, 200));
-        buf.push(env_of("small-a", 4), 10).unwrap();
-        buf.push(env_of("huge", 4000), 10).unwrap();
-        buf.push(env_of("small-b", 4), 10).unwrap();
+        buf.push(env_of("small-a", 4)).unwrap();
+        buf.push(env_of("huge", 4000)).unwrap();
+        buf.push(env_of("small-b", 4)).unwrap();
         let chunks = drain_all(&mut buf);
         assert_eq!(chunks.len(), 3, "each envelope is over the 200-byte budget on its own");
         assert_eq!(chunks[1].len(), 1);
@@ -855,7 +837,7 @@ mod tests {
         let dir = Scratch::new("marker");
         let mut buf = TxnBuffer::new(23, cfg(dir.path(), 400, 900));
         for i in 0..40 {
-            buf.push(env_of(&format!("k{i:03}"), 40), 10).unwrap();
+            buf.push(env_of(&format!("k{i:03}"), 40)).unwrap();
         }
         let chunks = drain_all(&mut buf);
         assert!(chunks.len() > 1, "several chunks");
@@ -878,7 +860,7 @@ mod tests {
     fn a_single_chunk_commit_is_marked_as_well() {
         let dir = Scratch::new("marker-one");
         let mut buf = TxnBuffer::new(25, cfg(dir.path(), 0, 1 << 20));
-        buf.push(env_of("only", 8), 10).unwrap();
+        buf.push(env_of("only", 8)).unwrap();
         let chunks = drain_all(&mut buf);
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0][0].headers.last, Some(true));
@@ -896,8 +878,8 @@ mod tests {
         let one = serialized_len(&env_of("a", 8)).unwrap();
         let budget = 2 + 2 * (one + STAMP_BYTES) + 1;
         let mut buf = TxnBuffer::new(27, cfg(dir.path(), 0, budget));
-        buf.push(env_of("a", 8), 10).unwrap();
-        buf.push(env_of("b", 8), 10).unwrap();
+        buf.push(env_of("a", 8)).unwrap();
+        buf.push(env_of("b", 8)).unwrap();
         let mut drain = buf.drain(Stamp { lsn: "0/1".into(), txid: "27".into() }).unwrap();
         let first = drain.next_chunk().unwrap().expect("a chunk");
         assert_eq!(first.len(), 2, "both fit — exactly");
@@ -908,8 +890,8 @@ mod tests {
         // One byte less and they do NOT both fit: the split is real, and only the second chunk is
         // marked.
         let mut buf = TxnBuffer::new(28, cfg(dir.path(), 0, budget - 1));
-        buf.push(env_of("a", 8), 10).unwrap();
-        buf.push(env_of("b", 8), 10).unwrap();
+        buf.push(env_of("a", 8)).unwrap();
+        buf.push(env_of("b", 8)).unwrap();
         let chunks = drain_all(&mut buf);
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0][0].headers.last, None);
@@ -933,7 +915,7 @@ mod tests {
         let path = {
             let mut buf = TxnBuffer::new(19, cfg(dir.path(), 128, 1 << 20));
             for i in 0..10 {
-                buf.push(env_of(&format!("k{i}"), 32), 10).unwrap();
+                buf.push(env_of(&format!("k{i}"), 32)).unwrap();
             }
             let path = buf.spill_path().expect("spilled").to_path_buf();
             assert!(path.exists());
@@ -976,7 +958,7 @@ mod tests {
         let dir = Scratch::new("sweep-live");
         let mut buf = TxnBuffer::new(88, cfg(dir.path(), 128, 1 << 20));
         for i in 0..8 {
-            buf.push(env_of(&format!("k{i}"), 32), 10).unwrap();
+            buf.push(env_of(&format!("k{i}"), 32)).unwrap();
         }
         let live = buf.spill_path().expect("spilled").to_path_buf();
         assert_eq!(sweep_spill_dir_except(dir.path(), std::slice::from_ref(&live)), 0);
@@ -1009,7 +991,7 @@ mod tests {
         let dir = base.path().join("nested");
         let mut buf = TxnBuffer::new(21, cfg(&dir, 128, 1 << 20));
         for i in 0..8 {
-            buf.push(env_of(&format!("k{i}"), 32), 10).unwrap();
+            buf.push(env_of(&format!("k{i}"), 32)).unwrap();
         }
         let path = buf.spill_path().expect("spilled").to_path_buf();
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);

@@ -372,11 +372,10 @@ const SLOT_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Spawn the replication-slot gauge sampler (Postgres mode only).
 ///
-/// These are engine-owned gauges, not StatsD-owned ones: `GET /metrics`,
-/// `GET /metrics/prometheus` and StatsD all read the same sample, so an operator without StatsD can
-/// still see the number that fills the source database's disk (`replication_slot_retained_wal_bytes`)
-/// and how far behind ingest is (`replication_confirmed_flush_lag_bytes`). It stops when the
-/// process begins shutting down.
+/// `GET /metrics` and `GET /metrics/prometheus` read the same sample, so an operator can see the
+/// number that fills the source database's disk (`replication_slot_retained_wal_bytes`) and how far
+/// behind ingest is (`replication_confirmed_flush_lag_bytes`). It stops when the process begins
+/// shutting down.
 pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: crate::shutdown::ShutdownToken) {
     tokio::spawn(async move {
         let mut logged_err = false;
@@ -406,8 +405,7 @@ pub fn spawn_replication_slot_sampler(pg_url: String, slot: String, shutdown: cr
     });
 }
 
-/// One sample: read `pg_current_wal_lsn()` and the slot's row, publish the engine gauges, and
-/// forward the same numbers to StatsD (a no-op when StatsD is off).
+/// One sample: read `pg_current_wal_lsn()` and the slot's row, and publish the engine gauges.
 ///
 /// A slot that is not there at all leaves `replication_slot_active` at 0 and the two byte gauges
 /// **untouched** — their last real value, never a fabricated zero (a zero would read as "no lag",
@@ -425,7 +423,6 @@ async fn sample_replication_slot(pg_url: &str, slot: &str) -> anyhow::Result<()>
     let confirmed: Option<String> = row.get(2);
     let active: bool = row.get(3);
     publish_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref(), active);
-    crate::statsd::replication_slot_gauges(&wal, restart.as_deref(), confirmed.as_deref());
     Ok(())
 }
 
