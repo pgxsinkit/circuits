@@ -375,10 +375,10 @@ impl MembershipCircuit {
                 break;
             }
             let w = key_weight(&mut cursor);
-            if w > 0 {
-                if let Some(v) = key.0.get(1) {
-                    vals.push((v.clone(), w as usize));
-                }
+            if w > 0
+                && let Some(v) = key.0.get(1)
+            {
+                vals.push((v.clone(), w as usize));
             }
             cursor.step_key();
         }
@@ -498,11 +498,11 @@ fn drain_flips(handle: &OutputHandle<SpineSnapshot<OrdZSet<Row>>>, out: &mut Vec
             delta += **cursor.weight();
             cursor.step_val();
         }
-        if delta != 0 {
-            if let Some(Value::Int(node_id)) = key.0.first() {
-                let value = key.0.get(1).cloned().unwrap_or(Value::Null);
-                out.push(MemberDelta { node_id: *node_id, value, delta });
-            }
+        if delta != 0
+            && let Some(Value::Int(node_id)) = key.0.first()
+        {
+            let value = key.0.get(1).cloned().unwrap_or(Value::Null);
+            out.push(MemberDelta { node_id: *node_id, value, delta });
         }
         cursor.step_key();
     }

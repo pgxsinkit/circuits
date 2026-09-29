@@ -182,88 +182,87 @@ impl Engine {
             self.retire_join_target_if_stream_lost(sig).await?;
             st = self.state.lock().await;
         }
-        if let Some(sig) = &feed_sig {
-            if let Some(existing_id) = st.feed_by_sig.get(sig).cloned() {
-                if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                    // Refuse BEFORE taking the claim: a join that is going to be turned away must
-                    // not leave a `Joined` in the durable catalog or a subscription for the caller
-                    // to give back. A joiner is re-checked against the same `gens` a creator is —
-                    // the ones captured with `ts` above, so a drift that landed during the `HEAD`
-                    // window refuses this join instead of acknowledging a shape the drift retired.
-                    self.ensure_schema_resolved(&st, &dep_tables)?;
-                    // One subscription id belongs to one shape (ADR-0008). Reusing it for a
-                    // different predicate is refused rather than silently accepted: the caller
-                    // would hold one name for two shapes and could release neither unambiguously.
-                    ensure_subscription_free(&st, sub, &existing_id)?;
-                    // A join and a RENEWAL are the same call: `subscribe` returns false when the
-                    // shape already holds this id, in which case nothing is claimed and only the
-                    // lease moves.
-                    let now = crate::changelog::now_secs();
-                    let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                    let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
-                    // A NEW claim is enqueued here (under the lock, so the log order matches the
-                    // state order) and WAITED on immediately before the join is acknowledged: a
-                    // subscription the durable record does not carry is one a restart forgets. A
-                    // renewal promises nothing new — the claim is already in the log — so its
-                    // record is queued like any engine-initiated event and the caller is not made
-                    // to wait on storage to keep a lease it already holds.
-                    let joined_durable = if fresh {
-                        Some(self.catalog_tx.send_durable(ev))
-                    } else {
-                        self.catalog_tx.send(ev);
-                        None
-                    };
-                    let ready = st.feed_shares.get(&existing_id).expect("share entry for live feed").ready.clone();
-                    // Release the lock, then wait for the creator's backfill to land: a joiner must not
-                    // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
-                    // failed creation.
-                    drop(st);
-                    // Everything the join has claimed before its first await, given back if it
-                    // never reaches its own end — including when the CLIENT disappears mid-wait.
-                    let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
-                    if let Err(e) = await_share_ready(ready, &existing_id).await {
-                        // The failed creator already removed the share entries; undo nothing.
-                        // A degraded outcome arrives typed, so this joiner answers 503 with the
-                        // same reason the creator did.
-                        joining.rollback().await;
-                        return Err(e);
-                    }
-                    // The creator succeeded — but it may have succeeded a moment BEFORE the
-                    // degradation mark, in which case the reaper is about to delete the very
-                    // stream this handle points at. This is the joiner's equivalent of the
-                    // creator's final `ensure_create_not_degraded`: check the same latch after
-                    // the work is done, and give back the claim taken above so a refused
-                    // join does not pin the shape.
-                    if let Err(e) = self.ensure_not_degraded() {
-                        joining.rollback().await;
-                        return Err(e);
-                    }
-                    // A rejoin is a touch: if the shape went dormant since the last subscriber
-                    // left, reactivate it (change-log replay) before handing out the stream.
-                    if let Err(e) = self.ensure_active(&existing_id).await {
-                        // Roll the failed join back so the dead subscription doesn't pin the shape.
-                        joining.rollback().await;
-                        return Err(e);
-                    }
-                    if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
-                        joining.rollback().await;
-                        return Err(e);
-                    }
-                    if let Some(durable) = joined_durable {
-                        durable.await;
-                    }
-                    // ...and the same check ONCE MORE, after the wait: the target may have been
-                    // purged or retired while this join was blocked on storage (see
-                    // `recheck_after_durability`). Give the provisional claim back and answer
-                    // retryable rather than hand out a handle whose stream is already 404.
-                    if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
-                        joining.rollback().await;
-                        return Err(e);
-                    }
-                    joining.complete();
-                    return Ok(rec);
-                }
+        if let Some(sig) = &feed_sig
+            && let Some(existing_id) = st.feed_by_sig.get(sig).cloned()
+            && let Some(rec) = st.shapes.get(&existing_id).cloned()
+        {
+            // Refuse BEFORE taking the claim: a join that is going to be turned away must
+            // not leave a `Joined` in the durable catalog or a subscription for the caller
+            // to give back. A joiner is re-checked against the same `gens` a creator is —
+            // the ones captured with `ts` above, so a drift that landed during the `HEAD`
+            // window refuses this join instead of acknowledging a shape the drift retired.
+            self.ensure_schema_resolved(&st, &dep_tables)?;
+            // One subscription id belongs to one shape (ADR-0008). Reusing it for a
+            // different predicate is refused rather than silently accepted: the caller
+            // would hold one name for two shapes and could release neither unambiguously.
+            ensure_subscription_free(&st, sub, &existing_id)?;
+            // A join and a RENEWAL are the same call: `subscribe` returns false when the
+            // shape already holds this id, in which case nothing is claimed and only the
+            // lease moves.
+            let now = crate::changelog::now_secs();
+            let fresh = st.subscribe(&existing_id, sub.to_string(), now);
+            let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+            // A NEW claim is enqueued here (under the lock, so the log order matches the
+            // state order) and WAITED on immediately before the join is acknowledged: a
+            // subscription the durable record does not carry is one a restart forgets. A
+            // renewal promises nothing new — the claim is already in the log — so its
+            // record is queued like any engine-initiated event and the caller is not made
+            // to wait on storage to keep a lease it already holds.
+            let joined_durable = if fresh {
+                Some(self.catalog_tx.send_durable(ev))
+            } else {
+                self.catalog_tx.send(ev);
+                None
+            };
+            let ready = st.feed_shares.get(&existing_id).expect("share entry for live feed").ready.clone();
+            // Release the lock, then wait for the creator's backfill to land: a joiner must not
+            // see a stream whose snapshot isn't readable yet, and must surface (not mask) a
+            // failed creation.
+            drop(st);
+            // Everything the join has claimed before its first await, given back if it
+            // never reaches its own end — including when the CLIENT disappears mid-wait.
+            let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
+            if let Err(e) = await_share_ready(ready, &existing_id).await {
+                // The failed creator already removed the share entries; undo nothing.
+                // A degraded outcome arrives typed, so this joiner answers 503 with the
+                // same reason the creator did.
+                joining.rollback().await;
+                return Err(e);
             }
+            // The creator succeeded — but it may have succeeded a moment BEFORE the
+            // degradation mark, in which case the reaper is about to delete the very
+            // stream this handle points at. This is the joiner's equivalent of the
+            // creator's final `ensure_create_not_degraded`: check the same latch after
+            // the work is done, and give back the claim taken above so a refused
+            // join does not pin the shape.
+            if let Err(e) = self.ensure_not_degraded() {
+                joining.rollback().await;
+                return Err(e);
+            }
+            // A rejoin is a touch: if the shape went dormant since the last subscriber
+            // left, reactivate it (change-log replay) before handing out the stream.
+            if let Err(e) = self.ensure_active(&existing_id).await {
+                // Roll the failed join back so the dead subscription doesn't pin the shape.
+                joining.rollback().await;
+                return Err(e);
+            }
+            if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                joining.rollback().await;
+                return Err(e);
+            }
+            if let Some(durable) = joined_durable {
+                durable.await;
+            }
+            // ...and the same check ONCE MORE, after the wait: the target may have been
+            // purged or retired while this join was blocked on storage (see
+            // `recheck_after_durability`). Give the provisional claim back and answer
+            // retryable rather than hand out a handle whose stream is already 404.
+            if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
+                joining.rollback().await;
+                return Err(e);
+            }
+            joining.complete();
+            return Ok(rec);
         }
         // Nothing to join: this create is about to mint a shape, so the id must be free of any
         // OTHER shape as well (the join path checked it against the one it was joining).
@@ -607,45 +606,45 @@ impl Engine {
         drop(st);
         self.retire_join_target_if_stream_lost(&agg_sig).await?;
         st = self.state.lock().await;
-        if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned() {
-            if let Some(rec) = st.shapes.get(&existing_id).cloned() {
-                // Refuse before taking the claim — see the row-shape join path. Re-checked against
-                // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
-                self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
-                ensure_subscription_free(&st, sub, &existing_id)?;
-                let now = crate::changelog::now_secs();
-                let fresh = st.subscribe(&existing_id, sub.to_string(), now);
-                let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
-                // Durable for a new claim, queued for a renewal — see the row-shape join path.
-                let joined = if fresh {
-                    Some(self.catalog_tx.send_durable(ev))
-                } else {
-                    self.catalog_tx.send(ev);
-                    None
-                };
-                let ready = st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
-                drop(st);
-                let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
-                if let Err(e) = await_share_ready(ready, &existing_id).await {
-                    joining.rollback().await;
-                    return Err(e);
-                }
-                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
-                    joining.rollback().await;
-                    return Err(e);
-                }
-                self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
-                if let Some(durable) = joined {
-                    durable.await;
-                }
-                // ...and again after the wait — see `recheck_after_durability`.
-                if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
-                    joining.rollback().await;
-                    return Err(e);
-                }
-                joining.complete();
-                return Ok(rec);
+        if let Some(existing_id) = st.feed_by_sig.get(&agg_sig).cloned()
+            && let Some(rec) = st.shapes.get(&existing_id).cloned()
+        {
+            // Refuse before taking the claim — see the row-shape join path. Re-checked against
+            // the `gens` captured with `ts`, so a drift inside the `HEAD` window refuses the join.
+            self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+            ensure_subscription_free(&st, sub, &existing_id)?;
+            let now = crate::changelog::now_secs();
+            let fresh = st.subscribe(&existing_id, sub.to_string(), now);
+            let ev = CatalogEvent::Joined { id: existing_id.clone(), subscription: sub.to_string(), at: now };
+            // Durable for a new claim, queued for a renewal — see the row-shape join path.
+            let joined = if fresh {
+                Some(self.catalog_tx.send_durable(ev))
+            } else {
+                self.catalog_tx.send(ev);
+                None
+            };
+            let ready = st.feed_shares.get(&existing_id).expect("share entry for aggregate").ready.clone();
+            drop(st);
+            let mut joining = JoinGuard::new(self, &existing_id, sub, fresh);
+            if let Err(e) = await_share_ready(ready, &existing_id).await {
+                joining.rollback().await;
+                return Err(e);
             }
+            if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                joining.rollback().await;
+                return Err(e);
+            }
+            self.touch_shape(&existing_id); // aggregates never park, but the read is a touch
+            if let Some(durable) = joined {
+                durable.await;
+            }
+            // ...and again after the wait — see `recheck_after_durability`.
+            if let Err(e) = self.recheck_after_durability(&existing_id, &rec.stream_path, &gens).await {
+                joining.rollback().await;
+                return Err(e);
+            }
+            joining.complete();
+            return Ok(rec);
         }
         ensure_subscription_free(&st, sub, "")?;
 
@@ -661,108 +660,104 @@ impl Engine {
         // pipeline is seeded by summing groups and updated from group deltas — no Postgres.
         if matches!(func, AggFn::Count) && col_idx.is_none() {
             let arr = self.arrangements.lock().unwrap().clone();
-            if let Some(arr) = arr {
-                if let Some(gcols) = arr.counts_group_cols(table).map(|g| g.to_vec()) {
-                    if let Some(constraints) = plan_circuit_agg(where_.as_ref(), &ts, &gcols) {
-                        let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
-                        let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
-                        cmd_tx
-                            .send(SequencerCmd::CreateCircuitAgg {
-                                table: table.clone(),
-                                shape_id: id.clone(),
-                                stream_path: stream_path.clone(),
-                                constraints,
-                                ready: ready_tx2,
-                            })
-                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                        let rec = ShapeRecord {
-                            id: id.clone(),
-                            table: table.clone(),
-                            stream_path: stream_path.clone(),
-                            changes_only: false,
-                            where_json: where_,
-                            columns: None,
-                            family_key: None,
-                            is_subquery: false,
-                            aggregate: Some(AggInfo { func, col }),
-                            fingerprint: ts.fingerprint.clone(),
-                        };
-                        // Under the state lock, immediately before registering — see
-                        // `ensure_create_not_degraded` for why this check and the one after the
-                        // create's work are together sufficient.
-                        self.ensure_not_degraded()?;
-                        st.shapes.insert(id.clone(), rec.clone());
-                        st.circuit_placement
-                            .insert(id.clone(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
-                        // Durable before the create is acknowledged — see `create_shape`.
-                        let created = self.catalog_tx.send_durable(CatalogEvent::Created {
-                            rec: rec.clone(),
-                            sig: Some(agg_sig.clone()),
-                            subscription: sub.to_string(),
-                            at: crate::changelog::now_secs(),
-                        });
-                        self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
-                        self.ensure_retention_sweeper();
-                        let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
-                        st.feed_by_sig.insert(agg_sig.clone(), id.clone());
-                        st.feed_shares
-                            .insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
-                        st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
-                        drop(st);
-                        let mut creating =
-                            CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
-                        return match ready_rx2
-                            .await
-                            .unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
-                        {
-                            Ok(()) => {
-                                // The create's work is done, but it may have overlapped a degradation — its stream is
-                                // then already reaped and the handle would be dead on arrival. Refuse instead of
-                                // answering success (see `ensure_create_not_degraded`).
-                                if let Err(e) = self.ensure_create_not_degraded() {
-                                    let _ = share_tx.send(ShareOutcome::Degraded);
-                                    creating.rollback().await;
-                                    return Err(e);
-                                }
-                                if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
-                                    let _ = share_tx.send(ShareOutcome::Raced);
-                                    creating.rollback().await;
-                                    return Err(e);
-                                }
-                                created.await;
-                                // The wait is an interval of its own: re-check before acknowledging.
-                                if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
-                                    // `Raced`, not `Failed` — see the subquery path.
-                                    let _ = share_tx.send(ShareOutcome::Raced);
-                                    creating.rollback().await;
-                                    return Err(e);
-                                }
-                                creating.complete();
-                                let _ = share_tx.send(ShareOutcome::Ready);
-                                trace_lifecycle(
-                                    &self.trace_tx,
-                                    crate::trace::GraphLifecycle::ShapeAdded {
-                                        shape: rec.id.clone(),
-                                        table: rec.table.clone(),
-                                    },
-                                );
-                                Ok(rec)
-                            }
-                            Err(e) => {
-                                if let Some(raced) =
-                                    self.create_race_after_work_failure(&id, &rec.stream_path, &gens).await
-                                {
-                                    let _ = share_tx.send(ShareOutcome::Raced);
-                                    creating.rollback().await;
-                                    return Err(raced);
-                                }
-                                let _ = share_tx.send(ShareOutcome::Failed);
-                                creating.rollback().await;
-                                bail!("aggregate '{id}' creation failed: {e:#}")
-                            }
-                        };
+            if let Some(arr) = arr
+                && let Some(gcols) = arr.counts_group_cols(table).map(|g| g.to_vec())
+                && let Some(constraints) = plan_circuit_agg(where_.as_ref(), &ts, &gcols)
+            {
+                let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
+                let (ready_tx2, ready_rx2) = tokio::sync::oneshot::channel();
+                cmd_tx
+                    .send(SequencerCmd::CreateCircuitAgg {
+                        table: table.clone(),
+                        shape_id: id.clone(),
+                        stream_path: stream_path.clone(),
+                        constraints,
+                        ready: ready_tx2,
+                    })
+                    .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                let rec = ShapeRecord {
+                    id: id.clone(),
+                    table: table.clone(),
+                    stream_path: stream_path.clone(),
+                    changes_only: false,
+                    where_json: where_,
+                    columns: None,
+                    family_key: None,
+                    is_subquery: false,
+                    aggregate: Some(AggInfo { func, col }),
+                    fingerprint: ts.fingerprint.clone(),
+                };
+                // Under the state lock, immediately before registering — see
+                // `ensure_create_not_degraded` for why this check and the one after the
+                // create's work are together sufficient.
+                self.ensure_not_degraded()?;
+                st.shapes.insert(id.clone(), rec.clone());
+                st.circuit_placement
+                    .insert(id.clone(), CircuitPlacement { label: "counts".into(), col: None, counts: true });
+                // Durable before the create is acknowledged — see `create_shape`.
+                let created = self.catalog_tx.send_durable(CatalogEvent::Created {
+                    rec: rec.clone(),
+                    sig: Some(agg_sig.clone()),
+                    subscription: sub.to_string(),
+                    at: crate::changelog::now_secs(),
+                });
+                self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
+                self.ensure_retention_sweeper();
+                let (share_tx, share_rx) = tokio::sync::watch::channel(ShareOutcome::Pending);
+                st.feed_by_sig.insert(agg_sig.clone(), id.clone());
+                st.feed_shares
+                    .insert(id.clone(), FeedShare { sig: agg_sig, subs: Default::default(), ready: share_rx });
+                st.subscribe(&id, sub.to_string(), crate::changelog::now_secs());
+                drop(st);
+                let mut creating = CreateGuard::new(self, &id, table, &rec.stream_path, Registration::Sequencer);
+                return match ready_rx2
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
+                {
+                    Ok(()) => {
+                        // The create's work is done, but it may have overlapped a degradation — its stream is
+                        // then already reaped and the handle would be dead on arrival. Refuse instead of
+                        // answering success (see `ensure_create_not_degraded`).
+                        if let Err(e) = self.ensure_create_not_degraded() {
+                            let _ = share_tx.send(ShareOutcome::Degraded);
+                            creating.rollback().await;
+                            return Err(e);
+                        }
+                        if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
+                            let _ = share_tx.send(ShareOutcome::Raced);
+                            creating.rollback().await;
+                            return Err(e);
+                        }
+                        created.await;
+                        // The wait is an interval of its own: re-check before acknowledging.
+                        if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
+                            // `Raced`, not `Failed` — see the subquery path.
+                            let _ = share_tx.send(ShareOutcome::Raced);
+                            creating.rollback().await;
+                            return Err(e);
+                        }
+                        creating.complete();
+                        let _ = share_tx.send(ShareOutcome::Ready);
+                        trace_lifecycle(
+                            &self.trace_tx,
+                            crate::trace::GraphLifecycle::ShapeAdded {
+                                shape: rec.id.clone(),
+                                table: rec.table.clone(),
+                            },
+                        );
+                        Ok(rec)
                     }
-                }
+                    Err(e) => {
+                        if let Some(raced) = self.create_race_after_work_failure(&id, &rec.stream_path, &gens).await {
+                            let _ = share_tx.send(ShareOutcome::Raced);
+                            creating.rollback().await;
+                            return Err(raced);
+                        }
+                        let _ = share_tx.send(ShareOutcome::Failed);
+                        creating.rollback().await;
+                        bail!("aggregate '{id}' creation failed: {e:#}")
+                    }
+                };
             }
         }
 
@@ -981,11 +976,10 @@ impl Engine {
                 None
             }
         });
-        if let Some(rec) = &removed {
-            if let Some(seq) = st.sequencer.as_ref() {
-                let _ =
-                    seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
-            }
+        if let Some(rec) = &removed
+            && let Some(seq) = st.sequencer.as_ref()
+        {
+            let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
         }
         let owned_barrier = if removed.is_some() {
             let barrier = Arc::new(crate::engine::PurgeBarrier::new());
@@ -1458,11 +1452,8 @@ impl Engine {
         }
         // A dormant shape is already unregistered from the sequencer; a non-parkable one is still
         // live and needs the full teardown (sequencer routing for aggregates, registry for subqueries).
-        if !parkable {
-            if let Some(seq) = st.sequencer.as_ref() {
-                let _ =
-                    seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
-            }
+        if !parkable && let Some(seq) = st.sequencer.as_ref() {
+            let _ = seq.cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
         }
         drop(st);
         if !parkable {

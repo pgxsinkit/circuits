@@ -1345,12 +1345,12 @@ impl SubqueryRegistry {
         let Some(node) = self.nodes.remove(sig) else { return Vec::new() };
         let child_sigs: Vec<SubquerySig> = collect_in_leaves(&node.pred).into_iter().map(|l| l.sig).collect();
         for (pk_id, _v) in self.circuit.contributor_entries(node.node_id) {
-            if let Some(tpl) = self.templates.get_mut(&node.template_key) {
-                if let Some(set) = tpl.pk_nodes.get_mut(&pk_id) {
-                    set.remove(sig);
-                    if set.is_empty() {
-                        tpl.pk_nodes.remove(&pk_id);
-                    }
+            if let Some(tpl) = self.templates.get_mut(&node.template_key)
+                && let Some(set) = tpl.pk_nodes.get_mut(&pk_id)
+            {
+                set.remove(sig);
+                if set.is_empty() {
+                    tpl.pk_nodes.remove(&pk_id);
                 }
             }
             asserts.contributors.push(Tup2(PkKey { id: node.node_id, pk: pk_id }, Assert::Delete));
@@ -1658,10 +1658,10 @@ impl SubqueryRegistry {
                     asserts.extend(self.assert_node_row(&sig, &pk, None));
                 }
             }
-            if let Some((sig, v)) = target {
-                if node_applies(self, &sig) {
-                    asserts.extend(self.assert_node_row(&sig, &pk, Some(v)));
-                }
+            if let Some((sig, v)) = target
+                && node_applies(self, &sig)
+            {
+                asserts.extend(self.assert_node_row(&sig, &pk, Some(v)));
             }
         }
         asserts

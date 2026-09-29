@@ -301,10 +301,10 @@ fn circuit_thread(
                 for d in deltas {
                     // De-duplication: redelivery upstream (the ingestor is at-least-once).
                     if let (Some(l), Some(s)) = (d.lsn, d.seq) {
-                        if let Some(hw) = highwater {
-                            if (l, s) <= hw {
-                                continue;
-                            }
+                        if let Some(hw) = highwater
+                            && (l, s) <= hw
+                        {
+                            continue;
                         }
                         highwater = Some((l, s));
                     }

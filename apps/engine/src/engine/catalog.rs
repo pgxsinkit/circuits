@@ -1332,25 +1332,25 @@ impl Engine {
         if let Some(arr) = self.arrangements.lock().unwrap().clone() {
             match &rec.aggregate {
                 Some(a) if matches!(a.func, AggFn::Count) && a.col.is_none() => {
-                    if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec()) {
-                        if let Some(constraints) = plan_circuit_agg(rec.where_json.as_ref(), ts, &gcols) {
-                            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-                            cmd_tx
-                                .send(SequencerCmd::CreateCircuitAgg {
-                                    table: rec.table.clone(),
-                                    shape_id: rec.id.clone(),
-                                    stream_path: rec.stream_path.clone(),
-                                    constraints,
-                                    ready: ready_tx,
-                                })
-                                .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-                            ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped")))?;
-                            self.state.lock().await.circuit_placement.insert(
-                                rec.id.clone(),
-                                CircuitPlacement { label: "counts".into(), col: None, counts: true },
-                            );
-                            return Ok(());
-                        }
+                    if let Some(gcols) = arr.counts_group_cols(&rec.table).map(|g| g.to_vec())
+                        && let Some(constraints) = plan_circuit_agg(rec.where_json.as_ref(), ts, &gcols)
+                    {
+                        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                        cmd_tx
+                            .send(SequencerCmd::CreateCircuitAgg {
+                                table: rec.table.clone(),
+                                shape_id: rec.id.clone(),
+                                stream_path: rec.stream_path.clone(),
+                                constraints,
+                                ready: ready_tx,
+                            })
+                            .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
+                        ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped")))?;
+                        self.state.lock().await.circuit_placement.insert(
+                            rec.id.clone(),
+                            CircuitPlacement { label: "counts".into(), col: None, counts: true },
+                        );
+                        return Ok(());
                     }
                 }
                 _ => {}

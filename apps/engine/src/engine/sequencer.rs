@@ -871,11 +871,11 @@ pub(crate) async fn sequencer_loop(
                                 (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
                                 _ => None,
                             };
-                            if let (Some(p), Some(hw)) = (pos, highwater) {
-                                if p <= hw {
-                                    tracing::debug!("sequencer: skipping duplicate change at {p:?}");
-                                    continue;
-                                }
+                            if let (Some(p), Some(hw)) = (pos, highwater)
+                                && p <= hw
+                            {
+                                tracing::debug!("sequencer: skipping duplicate change at {p:?}");
+                                continue;
                             }
                             // Route the envelope to an executor, under THE SCHEMA FENCE (ADR-0010):
                             // ready to decode, consumed without decoding (the only two reasons there
@@ -2049,10 +2049,10 @@ pub(crate) async fn process_envelope(
     let agg_candidates: Option<HashSet<String>> =
         if tr.is_none() { Some(agg_index.candidates(&delta).into_iter().collect()) } else { None };
     for (sid, agg) in aggregates.iter_mut() {
-        if let Some(c) = &agg_candidates {
-            if !c.contains(sid) {
-                continue;
-            }
+        if let Some(c) = &agg_candidates
+            && !c.contains(sid)
+        {
+            continue;
         }
         if agg.gate.should_skip(lsn_u64, xid) {
             if let Some((hops, _)) = tr.as_mut() {

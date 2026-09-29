@@ -407,15 +407,17 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() + 1 && i + 2 < b.len() + 1 {
-            if let (Some(h), Some(l)) = (
+        if b[i] == b'%'
+            && i + 2 < b.len() + 1
+            && i + 2 < b.len() + 1
+            && let (Some(h), Some(l)) = (
                 b.get(i + 1).and_then(|c| (*c as char).to_digit(16)),
                 b.get(i + 2).and_then(|c| (*c as char).to_digit(16)),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;
@@ -732,10 +734,10 @@ impl Decoder {
         };
         let Some(table) = rel.table.as_ref() else { return Decoded::None };
         if table == sync_table() {
-            if let Message::Insert { new, .. } | Message::Update { new, .. } = &msg {
-                if let Some(n) = sync_counter(rel, new) {
-                    return Decoded::Sync(n);
-                }
+            if let Message::Insert { new, .. } | Message::Update { new, .. } = &msg
+                && let Some(n) = sync_counter(rel, new)
+            {
+                return Decoded::Sync(n);
             }
             return Decoded::None;
         }

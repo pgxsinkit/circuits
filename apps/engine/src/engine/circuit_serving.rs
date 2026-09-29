@@ -43,10 +43,10 @@ pub(crate) fn stamped_delta_for_arrangements(
     let xid_u = txid.as_deref().and_then(|t| t.parse::<u64>().ok());
     // Fresh-seed fence: skip changes the seed snapshot already contains (Z-set deltas are not
     // idempotent, so a double-apply would corrupt counts).
-    if let Some(gate) = arr_gates.get(&table) {
-        if gate.should_skip(lsn_u.unwrap_or(0), xid_u) {
-            return Ok(None);
-        }
+    if let Some(gate) = arr_gates.get(&table)
+        && gate.should_skip(lsn_u.unwrap_or(0), xid_u)
+    {
+        return Ok(None);
     }
     Ok(Some(crate::arrangements::StampedDelta { table, delta, lsn: lsn_u, seq: env.headers.seq }))
 }
