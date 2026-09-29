@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/engine"]
+members = ["apps/engine", "apps/durable-streams"]
 resolver = "2"
 
 [workspace.package]
@@ -10,3 +10,17 @@ license = "MIT OR Apache-2.0"
 [profile.dev]
 opt-level = 0
 debug = 1
+
+# The log server's release build. Cargo ignores a member's own [profile.*], so the settings the log
+# server was always released with live here, as a custom profile, and the engine keeps cargo's
+# default release profile: `cargo build --profile release-durable-streams -p durable-streams`
+# (output in target/release-durable-streams/).
+[profile.release-durable-streams]
+inherits = "release"
+lto = true
+codegen-units = 1
+# Unwind (the default), not abort: a panic in one connection task is caught by
+# the runtime and drops only that connection, instead of aborting the whole
+# process and killing every other in-flight request. For a network-facing
+# server the per-connection isolation is worth more than abort's small
+# binary-size / codegen win.

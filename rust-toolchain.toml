@@ -9,6 +9,10 @@
 # 1.96.0 is the last known-good stable. Do NOT float back to "stable" until the
 # upstream ICE is fixed. See PR #24.
 #
+# The pin covers the whole workspace, the log server (apps/durable-streams) included. The log
+# server is not what holds it back: it has no dbsp, its declared MSRV is 1.75, and it builds on
+# anything newer, so it moves when the engine can.
+#
 # NOTE for mise users: mise exports RUSTUP_TOOLCHAIN, which rustup ranks ABOVE this
 # file, so a global `rust = "latest"` would silently override the pin. The repo's
 # mise.toml turns on `idiomatic_version_file_enable_tools` for rust, so mise takes the

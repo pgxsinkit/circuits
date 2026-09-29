@@ -1,10 +1,12 @@
-# The toolchain for `mise install`. Rust's version is rust-toolchain.toml's (pinned there,
-# with the reason): the setting below makes mise read that file rather than export a
-# RUSTUP_TOOLCHAIN of its own.
+# The tools for `mise install`, for the whole repository (the engine, the log server and the
+# TypeScript test harness). Rust is not listed: its version is rust-toolchain.toml's (pinned there,
+# with the reason), and the setting below makes mise read that file rather than export a
+# RUSTUP_TOOLCHAIN of its own, so `mise exec -- cargo …` builds with the pinned toolchain.
 [settings]
 idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
+# The TypeScript workspace's package manager and script runner (bun install, bun run …).
+bun = "1.4.2"
+# vitest runs under node; `bun run test` only launches it.
 node = "26"
-# Only the pnpm that starts: it switches itself to package.json's packageManager version.
-pnpm = "12"

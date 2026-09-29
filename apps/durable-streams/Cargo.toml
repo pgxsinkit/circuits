@@ -75,12 +75,8 @@ telemetry = [
 # AWS/S3 transport, which works against any S3-compatible endpoint (AWS, R2,
 # Fly/Tigris, MinIO, Backblaze B2) via path-style + custom endpoint config.
 tier = ["dep:object_store"]
-[profile.release]
-lto = true
-codegen-units = 1
-# Unwind (the default), not abort: a panic in one connection task is caught by
-# the runtime and drops only that connection, instead of aborting the whole
-# process and killing every other in-flight request. For a network-facing
-# server the per-connection isolation is worth more than abort's small
-# binary-size / codegen win.
+
+# The release profile it is built with (LTO, one codegen unit) is the workspace's
+# `release-durable-streams`, in the root Cargo.toml: cargo ignores a member's own
+# [profile.*].
 
