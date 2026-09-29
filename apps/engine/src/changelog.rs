@@ -205,10 +205,7 @@ impl ChangeLogConfig {
         let d = ChangeLogConfig::default();
         ChangeLogConfig {
             segment_bytes: env_u64("CIRCUITS_CHANGES_SEGMENT_BYTES", d.segment_bytes),
-            segment_age: Duration::from_secs(env_u64(
-                "CIRCUITS_CHANGES_SEGMENT_SECS",
-                d.segment_age.as_secs(),
-            )),
+            segment_age: Duration::from_secs(env_u64("CIRCUITS_CHANGES_SEGMENT_SECS", d.segment_age.as_secs())),
             retain: Duration::from_secs(env_u64("CIRCUITS_CHANGES_RETAIN_SECS", d.retain.as_secs())),
         }
     }

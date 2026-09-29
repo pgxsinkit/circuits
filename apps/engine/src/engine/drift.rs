@@ -80,10 +80,8 @@ const RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `CIRCUITS_SCHEMA_RECONCILE_SECS`, default 60; `0` disables the reconciler.
 fn reconcile_interval() -> std::time::Duration {
-    let secs = std::env::var("CIRCUITS_SCHEMA_RECONCILE_SECS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(60);
+    let secs =
+        std::env::var("CIRCUITS_SCHEMA_RECONCILE_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(60);
     std::time::Duration::from_secs(secs)
 }
 

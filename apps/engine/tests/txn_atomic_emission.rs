@@ -453,9 +453,7 @@ async fn a_failure_after_a_held_prefix_rewinds_to_the_held_boundary() {
 async fn an_uncompiled_table_is_consumed_and_an_unspellable_type_parks() {
     let (engine, log, stream, _t) = boot().await;
     let skipped = || {
-        circuits_engine::metrics::metrics()
-            .sequencer_unknown_table_skipped
-            .load(std::sync::atomic::Ordering::Relaxed)
+        circuits_engine::metrics::metrics().sequencer_unknown_table_skipped.load(std::sync::atomic::Ordering::Relaxed)
     };
     let before = skipped();
 

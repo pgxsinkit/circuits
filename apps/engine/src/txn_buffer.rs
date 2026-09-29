@@ -1076,19 +1076,16 @@ mod tests {
     #[test]
     fn an_unusable_append_budget_is_refused() {
         let too_big = (DS_MAX_BODY_BYTES + 1).to_string();
-        let err =
-            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone()))
-                .expect_err("above the durable-streams body cap");
+        let err = TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| too_big.clone()))
+            .expect_err("above the durable-streams body cap");
         assert!(format!("{err:#}").contains("request-body cap"), "{err:#}");
 
-        let err =
-            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string()))
-                .expect_err("a zero budget cannot append anything");
+        let err = TxnBufferConfig::resolve(|k| (k == "CIRCUITS_CHANGES_APPEND_BYTES").then(|| "0".to_string()))
+            .expect_err("a zero budget cannot append anything");
         assert!(format!("{err:#}").contains("positive byte count"), "{err:#}");
 
-        let err =
-            TxnBufferConfig::resolve(|k| (k == "CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string()))
-                .expect_err("not a byte count");
+        let err = TxnBufferConfig::resolve(|k| (k == "CIRCUITS_TXN_MEMORY_BYTES").then(|| "128MiB".to_string()))
+            .expect_err("not a byte count");
         assert!(format!("{err:#}").contains("CIRCUITS_TXN_MEMORY_BYTES"), "{err:#}");
     }
 }

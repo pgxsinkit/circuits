@@ -294,15 +294,12 @@ impl Config {
             }),
             cache_mib: g("CIRCUITS_DBSP_CACHE_MIB").and_then(|s| s.trim().parse().ok()),
             min_storage_bytes: Some(
-                g("CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024)
-                    * 1024,
+                g("CIRCUITS_DBSP_MIN_STORAGE_KB").and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1024) * 1024,
             ),
             max_rss_bytes: g("CIRCUITS_DBSP_MAX_RSS_MB")
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .map(|mb| mb * 1024 * 1024),
-            checkpoint_every: match g("CIRCUITS_DBSP_CHECKPOINT_SECS")
-                .and_then(|s| s.trim().parse::<u64>().ok())
-            {
+            checkpoint_every: match g("CIRCUITS_DBSP_CHECKPOINT_SECS").and_then(|s| s.trim().parse::<u64>().ok()) {
                 Some(0) => None,
                 Some(s) => Some(Duration::from_secs(s)),
                 None => Some(Duration::from_secs(60)),
@@ -582,8 +579,7 @@ mod tests {
         assert_eq!(cfg(&[("ELECTRIC_LOG_LEVEL", "debug")]).log_filter, "debug");
         // CIRCUITS_LOG wins and passes through verbatim
         assert_eq!(
-            cfg(&[("CIRCUITS_LOG", "circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")])
-                .log_filter,
+            cfg(&[("CIRCUITS_LOG", "circuits_engine=debug"), ("ELECTRIC_LOG_LEVEL", "error")]).log_filter,
             "circuits_engine=debug"
         );
     }
@@ -592,10 +588,7 @@ mod tests {
     fn slot_name_from_stream_id() {
         assert_eq!(cfg(&[]).slot, "circuits");
         assert_eq!(cfg(&[("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "electric_slot_bench");
-        assert_eq!(
-            cfg(&[("CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot,
-            "custom"
-        );
+        assert_eq!(cfg(&[("CIRCUITS_PG_SLOT", "custom"), ("ELECTRIC_REPLICATION_STREAM_ID", "bench")]).slot, "custom");
     }
 
     #[test]

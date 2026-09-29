@@ -97,10 +97,7 @@ impl RetentionConfig {
         let d = RetentionConfig::default();
         RetentionConfig {
             idle_timeout: Duration::from_secs(env_u64("CIRCUITS_SHAPE_IDLE_SECS", d.idle_timeout.as_secs())),
-            dormant_ttl: Duration::from_secs(env_u64(
-                "CIRCUITS_SHAPE_DORMANT_TTL_SECS",
-                d.dormant_ttl.as_secs(),
-            )),
+            dormant_ttl: Duration::from_secs(env_u64("CIRCUITS_SHAPE_DORMANT_TTL_SECS", d.dormant_ttl.as_secs())),
             max_shapes: env_u64("CIRCUITS_MAX_SHAPES", d.max_shapes as u64) as usize,
             disk_budget_bytes: env_u64("CIRCUITS_SHAPE_DISK_BUDGET_MB", 0).saturating_mul(1024 * 1024),
             sweep_interval: Duration::from_secs(env_u64("CIRCUITS_RETENTION_SWEEP_SECS", 60).max(1)),

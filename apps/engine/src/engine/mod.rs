@@ -421,8 +421,7 @@ fn spawn_flip_propagator(
     degrade: Arc<DegradeState>,
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
 ) {
-    let workers: usize =
-        std::env::var("CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
+    let workers: usize = std::env::var("CIRCUITS_FLIP_WORKERS").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1);
     tokio::spawn(async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(workers));
         while let Some(fw) = rx.recv().await {
@@ -1019,9 +1018,7 @@ impl Engine {
             );
         }
         if std::env::var("CIRCUITS_FEED_TRACE").is_ok() {
-            tracing::warn!(
-                "CIRCUITS_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side"
-            );
+            tracing::warn!("CIRCUITS_FEED_TRACE is deprecated and ignored: the feed relation now lives host-side");
         }
         let mut counts: Vec<crate::arrangements::CountSpec> = Vec::new();
         for (t, cols) in &cfg.counts {

@@ -146,8 +146,7 @@ fn spill_config_from_env() -> Result<Option<SpillConfig>> {
     if std::env::var("CIRCUITS_SUBQ_STORAGE").is_ok_and(|v| v == "0") {
         return Ok(None);
     }
-    let min_kb: usize =
-        std::env::var("CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+    let min_kb: usize = std::env::var("CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
     let cache_mib = storage_cache_mib(std::env::var("CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
     let (dir, auto) = match std::env::var("CIRCUITS_SUBQ_STORAGE_DIR") {
         Ok(d) if !d.is_empty() => (d, false),
