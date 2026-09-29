@@ -131,7 +131,7 @@ impl DriftSource {
     }
 
     /// The observation the wire made, if this came from the wire.
-    fn from_wire(&self) -> Option<&SchemaFingerprint> {
+    fn wire_fingerprint(&self) -> Option<&SchemaFingerprint> {
         match self {
             DriftSource::Relation(f) => Some(f),
             _ => None,
@@ -350,7 +350,7 @@ impl Engine {
             // impossible: `pg::inspect_publication` refuses a column list at boot and folds
             // generated-column publishing into the fingerprint. Say so loudly rather than park the
             // table — the engine has no better catalog to consult.
-            if let (Some(wire), Some(fresh)) = (observed.from_wire(), ts.fingerprint.as_ref())
+            if let (Some(wire), Some(fresh)) = (observed.wire_fingerprint(), ts.fingerprint.as_ref())
                 && !fresh.still_serves(wire)
             {
                 tracing::error!(
