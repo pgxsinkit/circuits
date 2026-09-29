@@ -248,13 +248,7 @@ pub(crate) fn value_f64(v: &Value) -> f64 {
     match v {
         Value::Int(i) => *i as f64,
         Value::Float(f) => f.0,
-        Value::Bool(b) => {
-            if *b {
-                1.0
-            } else {
-                0.0
-            }
-        }
+        Value::Bool(true) => 1.0,
         _ => 0.0,
     }
 }
