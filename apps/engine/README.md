@@ -42,6 +42,7 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 | `CIRCUITS_PG_TABLES` | *(empty)* | Comma list of tables to replicate: `schema.name`, a bare `name` (= `public.<name>`), or `schema.*` for every table with a primary key in that schema. `*` (or empty) = `public.*` — never every schema (introspect-all sets `REPLICA IDENTITY FULL`, which must not touch managed system schemas) |
 | `CIRCUITS_PG_SLOT` | `circuits` | Logical replication slot name |
 | `CIRCUITS_PG_POLL_MS` | `50` | Replication-slot poll interval |
+| `CIRCUITS_PG_POOL_SIZE` | `20` | Connections in the shared Postgres pool that backfills, membership query-backs and subset queries draw from. `0` or an unparseable value keeps the default |
 | `CIRCUITS_BIND` | `127.0.0.1:0` | Bind address (`:0` = ephemeral port) |
 | `CIRCUITS_LOG` | `info` | `tracing` EnvFilter (e.g. `warn`, `circuits_engine=debug`) |
 | `CIRCUITS_TRACE` | `1` (on) | `0`/`false`/`off` unregisters the introspection surface (`/trace` SSE, `/graph`, `/graph/node`, `/state`, `/state/node` — the pipeline-visualizer backend). When on, it costs ~nothing until a client subscribes (and stays unauthenticated — see the deployment doc) |

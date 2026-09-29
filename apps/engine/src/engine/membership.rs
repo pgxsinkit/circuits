@@ -4,7 +4,7 @@
 //!
 //!  * **candidate-row resolution** from pooled Postgres ([`query_rows_by_col`],
 //!    [`query_rows_all`]) — parallel across the flip-worker pool, bounded by
-//!    `ELECTRIC_DB_POOL_SIZE`;
+//!    `CIRCUITS_PG_POOL_SIZE`;
 //!  * the **latest-row-per-pk fold** used before an absolute membership evaluation
 //!    ([`latest_rows_by_pk`]);
 //!  * [`fold_refcount_flips`], the reference refcount fold the flip-semantics regression test
@@ -49,7 +49,7 @@ pub(crate) fn fold_refcount_flips(
 
 /// Query candidate rows where `col = value` from Postgres on a pooled connection — row data
 /// lives in Postgres, never engine-side. Concurrency is bounded by the shared pool
-/// (`ELECTRIC_DB_POOL_SIZE`); reads see PG-current state, which converges under absolute
+/// (`CIRCUITS_PG_POOL_SIZE`); reads see PG-current state, which converges under absolute
 /// per-pk emission exactly as deferred flip propagation always has.
 ///
 /// The read's [`SnapshotGate`](crate::pg::SnapshotGate) is returned WITH the rows: it is the

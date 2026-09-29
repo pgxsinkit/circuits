@@ -265,7 +265,7 @@ pub async fn check_wal_level(client: &Client) -> Result<()> {
     Ok(())
 }
 
-/// Maximum connections per [`Pool`], set once at boot from `ELECTRIC_DB_POOL_SIZE` (default 20).
+/// Maximum connections per [`Pool`], set once at boot from `CIRCUITS_PG_POOL_SIZE` (default 20).
 static POOL_SIZE: OnceLock<usize> = OnceLock::new();
 
 /// One shared pool per distinct URL for the process lifetime.

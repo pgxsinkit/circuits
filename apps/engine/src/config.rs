@@ -65,7 +65,7 @@ pub struct Config {
     pub storage_dir: Option<String>,
     /// Optional second listener serving Prometheus text (`ELECTRIC_PROMETHEUS_PORT`).
     pub prometheus_port: Option<u16>,
-    /// Max pooled Postgres connections for backfills/query-backs (`ELECTRIC_DB_POOL_SIZE`, default 20).
+    /// Max pooled Postgres connections for backfills/query-backs (`CIRCUITS_PG_POOL_SIZE`, default 20).
     pub db_pool_size: usize,
     /// Register the introspection surface (`/trace` SSE + `/graph`(`/node`) + `/state`(`/node`) —
     /// the pipeline-visualizer backend). `CIRCUITS_TRACE=0|false|off` disables it: the routes
@@ -274,8 +274,12 @@ impl Config {
 
         let storage_dir = g("ELECTRIC_STORAGE_DIR");
         let prometheus_port = g("ELECTRIC_PROMETHEUS_PORT").and_then(|s| s.trim().parse().ok());
-        let db_pool_size =
-            g("ELECTRIC_DB_POOL_SIZE").and_then(|s| s.trim().parse::<usize>().ok()).filter(|n| *n >= 1).unwrap_or(20);
+        // `CIRCUITS_PG_POOL_SIZE` wins; `ELECTRIC_DB_POOL_SIZE` is the fleet's spelling of it.
+        let db_pool_size = g("CIRCUITS_PG_POOL_SIZE")
+            .or_else(|| g("ELECTRIC_DB_POOL_SIZE"))
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(20);
 
         let trace = g("CIRCUITS_TRACE")
             .map(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
@@ -645,6 +649,15 @@ mod tests {
         assert!(secret_ok(Some("s"), None, Some("s")));
         assert!(!secret_ok(Some("s"), Some("nope"), None));
         assert!(!secret_ok(Some("s"), None, None));
+    }
+
+    #[test]
+    fn pg_pool_size() {
+        assert_eq!(cfg(&[]).db_pool_size, 20);
+        assert_eq!(cfg(&[("CIRCUITS_PG_POOL_SIZE", "5")]).db_pool_size, 5);
+        // A pool of no connections could never serve a backfill: the default stands.
+        assert_eq!(cfg(&[("CIRCUITS_PG_POOL_SIZE", "0")]).db_pool_size, 20);
+        assert_eq!(cfg(&[("CIRCUITS_PG_POOL_SIZE", "many")]).db_pool_size, 20);
     }
 
     #[test]

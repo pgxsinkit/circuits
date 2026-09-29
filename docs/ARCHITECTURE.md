@@ -523,7 +523,7 @@ sequencer feeds every table's deltas into:
   with `connecting_col = value` are queried back and re-evaluated, recursing up the DAG. Flip
   propagation runs on a **semaphore-bounded worker pool** (`CIRCUITS_FLIP_WORKERS`, default 8),
   off the sequencer hot path: the Postgres query-backs run concurrently (bounded by the shared
-  `ELECTRIC_DB_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
+  `CIRCUITS_PG_POOL_SIZE` pool) and never hold the registry lock. Membership evaluation and the
   **enqueue** of the resulting envelopes happen atomically under the lock, and each shape stream
   drains through one ordered **emission lane** (`engine/emission.rs`, `CIRCUITS_EMIT_LANES`),
   so per-shape append order equals evaluation order — without network under the lock. (Evaluation
@@ -629,7 +629,7 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   replay exactly like a shape backfill.
 - **Row lookups** (subquery flip re-derivations, full re-derives, membership move-ins) are
   pooled Postgres queries (`engine/membership.rs`) — parallel across the flip-worker pool,
-  bounded by `ELECTRIC_DB_POOL_SIZE`. `CIRCUITS_DBSP_INDEXES` is **deprecated** and ignored
+  bounded by `CIRCUITS_PG_POOL_SIZE`. `CIRCUITS_DBSP_INDEXES` is **deprecated** and ignored
   (it configured the removed row arrangements).
 - **Membership shapes** — including single-level non-negated `col IN (SELECT …)` — are served
   by the subquery registry (§6): two-phase creation (Postgres backfill + gate), shared inner-set
@@ -884,7 +884,7 @@ engine compute.
 
 **Engine compute / representation**
 7. ~~Backfill connection pooling for burst shape creation (the fleet benchmark's p99 driver).~~
-   Done: backfills/query-backs/subset queries share a per-URL pool (`ELECTRIC_DB_POOL_SIZE`, default 20).
+   Done: backfills/query-backs/subset queries share a per-URL pool (`CIRCUITS_PG_POOL_SIZE`, default 20).
 8. Intern stream paths/txids; pack `Value` (smaller enum, interned strings).
 
 ---

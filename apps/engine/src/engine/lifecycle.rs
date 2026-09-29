@@ -1771,7 +1771,7 @@ impl Engine {
     /// Orchestrate the registry's three-phase subquery-shape creation (see
     /// `SubqueryRegistry::begin_create`): the Postgres seeding queries and the outer backfill
     /// run WITHOUT the registry lock, so concurrent creates parallelize on the shared pool
-    /// (`ELECTRIC_DB_POOL_SIZE`) instead of serializing behind one create's round-trips.
+    /// (`CIRCUITS_PG_POOL_SIZE`) instead of serializing behind one create's round-trips.
     /// A begin-conflict (sharing a node another create is still seeding) retries briefly.
     async fn create_subquery_three_phase(
         &self,

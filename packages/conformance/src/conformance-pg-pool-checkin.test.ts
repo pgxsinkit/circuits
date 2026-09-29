@@ -33,7 +33,7 @@ describe('Postgres pooled-connection check-in', () => {
     harness = await bootHarness(schema, {
       engineEnv: {
         CIRCUITS_LOG: 'info',
-        ELECTRIC_DB_POOL_SIZE: '1',
+        CIRCUITS_PG_POOL_SIZE: '1',
       },
     })
   }, 60_000)
