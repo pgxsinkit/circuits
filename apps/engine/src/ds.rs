@@ -1000,7 +1000,7 @@ mod tests {
                 schema: None,
             },
         };
-        let expected = serde_json::to_vec(&[envelope.clone()]).unwrap();
+        let expected = serde_json::to_vec(std::slice::from_ref(&envelope)).unwrap();
 
         let appended = client.append_checked("shape/s1", &[envelope]).await.unwrap();
 

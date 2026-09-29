@@ -688,7 +688,7 @@ mod tests {
 
         engine.unresolved(&items, "test").await;
         assert!(engine.is_unresolved(&items).await);
-        assert_eq!(engine.unresolved_tables().await, [items.clone()]);
+        assert_eq!(engine.unresolved_tables().await, std::slice::from_ref(&items));
         assert!(
             !engine.tables_shared.read().unwrap().contains_key(&items),
             "a parked table leaves the decode view, so its changes are dropped rather than decoded"

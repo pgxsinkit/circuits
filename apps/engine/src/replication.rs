@@ -1309,7 +1309,7 @@ mod tests {
         let mut d = Decoder::new(tables.clone());
         let altered_msg = rel_msg(1, "public", "users", &[("id", 23), ("tenant", 23), ("name", 25), ("extra", 25)]);
         d.on_relation(altered_msg.clone(), ev.as_ref(), Some(TxnRef { xid: 7 })).await;
-        assert_eq!(ev.drifted(), [t_ref.clone()]);
+        assert_eq!(ev.drifted(), std::slice::from_ref(&t_ref));
         assert_eq!(ev.drifts.lock().unwrap()[0].1, altered);
         // The enclosing transaction travels with the report — it is what lets the engine tell a
         // first delivery from a replay.

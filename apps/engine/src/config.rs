@@ -201,7 +201,7 @@ impl Config {
 
         // Large transactions (ADR-0003). Boot-fatal on an unusable setting: a memory cap or append
         // budget that was meant to be applied and silently was not is the worst of both worlds.
-        let txn = TxnBufferConfig::resolve(&g).context("large-transaction configuration")?;
+        let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
 
         // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
         // to be applied and silently was not is worse than a refused boot.
@@ -237,8 +237,8 @@ impl Config {
         };
         let backfill = crate::pg::BackfillConfig { append_bytes, statement_timeout_ms };
 
-        let shutdown_grace = crate::shutdown::resolve_grace(&g).context("shutdown configuration")?;
-        let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(&g).context("shutdown configuration")?;
+        let shutdown_grace = crate::shutdown::resolve_grace(g).context("shutdown configuration")?;
+        let shutdown_ready_drain = crate::shutdown::resolve_ready_drain(g).context("shutdown configuration")?;
         if shutdown_ready_drain >= shutdown_grace {
             bail!(
                 "CIRCUITS_SHUTDOWN_DRAIN_SECS ({}s) must be less than \

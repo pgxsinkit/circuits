@@ -1362,7 +1362,7 @@ async fn emission_lanes_order_and_barrier() {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-    let ds = crate::ds::DsClient::new(&format!("http://{addr}"));
+    let ds = crate::ds::DsClient::new(format!("http://{addr}"));
     let pending = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let lanes = emission::EmissionLanes::spawn(ds, 4, pending.clone());
 
