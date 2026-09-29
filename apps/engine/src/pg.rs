@@ -1361,6 +1361,18 @@ async fn query_subset_in_txn(
     Ok(SubsetQuery { rows: out, lsn })
 }
 
+/// Parse a Postgres LSN ("X/Y", hex) into a comparable u64. Returns 0 on parse failure.
+pub fn lsn_to_u64(lsn: &str) -> u64 {
+    match lsn.split_once('/') {
+        Some((hi, lo)) => {
+            let hi = u64::from_str_radix(hi.trim(), 16).unwrap_or(0);
+            let lo = u64::from_str_radix(lo.trim(), 16).unwrap_or(0);
+            (hi << 32) | lo
+        }
+        None => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1543,17 +1555,5 @@ mod tests {
         assert_eq!(lsn_to_u64("0/1A2B3C"), 0x1A2B3C);
         assert_eq!(lsn_to_u64("2/10"), (2u64 << 32) | 0x10);
         assert_eq!(lsn_to_u64("garbage"), 0);
-    }
-}
-
-/// Parse a Postgres LSN ("X/Y", hex) into a comparable u64. Returns 0 on parse failure.
-pub fn lsn_to_u64(lsn: &str) -> u64 {
-    match lsn.split_once('/') {
-        Some((hi, lo)) => {
-            let hi = u64::from_str_radix(hi.trim(), 16).unwrap_or(0);
-            let lo = u64::from_str_radix(lo.trim(), 16).unwrap_or(0);
-            (hi << 32) | lo
-        }
-        None => 0,
     }
 }

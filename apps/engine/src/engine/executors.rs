@@ -53,8 +53,8 @@ impl HeapSize for StandaloneShape {
 }
 
 /// Evaluate a stateless WHERE filter directly on a Z-set delta. A filter has no incremental state
-/// (unlike a join), so wrapping it in a dataflow circuit would only add a thread + channel round-trip
-/// + a per-shape clone of the delta. `translate_output` downstream groups by primary key, so emitting
+/// (unlike a join), so wrapping it in a dataflow circuit would only add a thread + channel round-trip +
+/// a per-shape clone of the delta. `translate_output` downstream groups by primary key, so emitting
 /// the matching `(row, weight)` pairs here is equivalent to what the old per-shape filter circuit produced.
 pub(crate) fn eval_standalone(pred: &CompiledPredicate, delta: &[Tup2<Row, ZWeight>]) -> Vec<(Row, ZWeight)> {
     delta.iter().filter(|t| pred.matches(&t.0)).map(|t| (t.0.clone(), t.1)).collect()

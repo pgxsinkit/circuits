@@ -198,6 +198,14 @@ impl HeapSize for Tup2<Row, ZWeight> {
     }
 }
 
+/// Best-effort sanity check used by JSON parsing paths.
+pub fn ensure_object(j: &serde_json::Value) -> Result<&serde_json::Map<String, serde_json::Value>> {
+    match j.as_object() {
+        Some(m) => Ok(m),
+        None => bail!("expected a JSON object, got {j}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,13 +237,5 @@ mod tests {
     #[test]
     fn a_non_numeric_string_is_not_an_int() {
         assert!(Value::from_json(&serde_json::json!("nope"), ColumnType::Int).is_err());
-    }
-}
-
-/// Best-effort sanity check used by JSON parsing paths.
-pub fn ensure_object(j: &serde_json::Value) -> Result<&serde_json::Map<String, serde_json::Value>> {
-    match j.as_object() {
-        Some(m) => Ok(m),
-        None => bail!("expected a JSON object, got {j}"),
     }
 }
