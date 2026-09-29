@@ -23,7 +23,7 @@ describe('durable-streams pin', () => {
     const crateVersion = source.match(/const CRATE_VERSION = '([^']+)'/)?.[1]
     expect(crateVersion).toBeTruthy()
 
-    expect(dockerfilePin('Dockerfile.ds')).toBe(crateVersion)
+    expect(dockerfilePin('Containerfile.durable-streams')).toBe(crateVersion)
     expect(dockerfilePin('Dockerfile.electric')).toBe(crateVersion)
   })
 })

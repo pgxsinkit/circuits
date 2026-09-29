@@ -3,7 +3,7 @@
 The whole Circuits server stack, containerized. From the repo root:
 
 ```bash
-pnpm docker:up            # = docker compose -f docker/compose.yaml up --build
+pnpm docker:up            # = podman compose -f docker/compose.yaml up --build
 ```
 
 Services (see `compose.yaml`):
@@ -11,8 +11,8 @@ Services (see `compose.yaml`):
 | service | image | role | port |
 |---|---|---|---|
 | `postgres` | `postgres:16` (`wal_level=logical`) | system of record | 5432 |
-| `ds` | `docker/Dockerfile.ds` | durable-streams server (the log; Rust binary from crates.io `durable-streams`) | 8791 |
-| `engine` | `docker/Dockerfile.engine` | Rust engine: replication ingest, shape/subquery/aggregation maintenance, control-plane HTTP **and Electric-compatible `GET /v1/shape`** | 7010 |
+| `ds` | `container/Containerfile.durable-streams` | durable-streams server (the log; Rust binary from crates.io `durable-streams`) | 8791 |
+| `engine` | `container/Containerfile.engine` | Rust engine: replication ingest, shape/subquery/aggregation maintenance, control-plane HTTP **and Electric-compatible `GET /v1/shape`** | 7010 |
 | `api` | `docker/Dockerfile.node` | extended tRPC API for `@circuits/client` (shapes, subset queries, aggregations) | 8790 |
 
 Once up:
@@ -23,7 +23,7 @@ Once up:
 - Apps write to Postgres at `postgres://postgres:password@localhost:5432/electric`.
 
 The engine introspects the table set at startup (`CIRCUITS_PG_TABLES=*` = every `public` table
-with a primary key). Create your tables first, or `docker compose -f docker/compose.yaml restart engine`
+with a primary key). Create your tables first, or `podman compose -f docker/compose.yaml restart engine`
 after a migration.
 
 ## Fleet-conformance image (single `electric` container)
@@ -36,7 +36,7 @@ engine in a single container — a drop-in replacement for `electricsql/electric
 The container's entrypoint (`electric-entrypoint.sh`) starts durable-streams on loopback, waits for
 it, then starts the engine bound to `0.0.0.0:$ELECTRIC_PORT` serving `/v1/shape` + `/v1/health`. It
 supervises both: if either exits, the other is killed and the container exits with that code;
-`SIGTERM`/`SIGINT` are forwarded to both (clean `docker stop`, works under `docker run --init`).
+`SIGTERM`/`SIGINT` are forwarded to both (clean `docker stop`, works under `podman run --init`).
 
 **Fleet env contract** (what the fleet sets; the image also accepts the `CIRCUITS_*` knobs):
 
@@ -58,7 +58,7 @@ Run the local test harness (postgres with `wal_level=logical` + the image, wired
 the fleet sets):
 
 ```bash
-docker compose -f docker/compose.electric.yaml up --build
+podman compose -f docker/compose.electric.yaml up --build
 # then create your tables in postgres and sync from http://localhost:3000/v1/shape
 ```
 
@@ -69,7 +69,7 @@ Point the benchmarking-fleet at the published image by setting the run spec's `e
 Build it standalone:
 
 ```bash
-docker build -f docker/Dockerfile.electric -t circuits-electric .
+podman build -f docker/Dockerfile.electric -t circuits-electric .
 ```
 
 ## Published images
@@ -78,17 +78,17 @@ CI publishes all three images to the GitHub Container Registry on every push to 
 tags (`.github/workflows/docker.yml`):
 
 ```bash
-docker pull ghcr.io/pgxsinkit/circuits/engine:main
-docker pull ghcr.io/pgxsinkit/circuits/node:main
-docker pull ghcr.io/pgxsinkit/circuits/electric:main   # single fleet image
+podman pull ghcr.io/pgxsinkit/circuits/engine:main
+podman pull ghcr.io/pgxsinkit/circuits/node:main
+podman pull ghcr.io/pgxsinkit/circuits/electric:main   # single fleet image
 ```
 
 ## Building images individually
 
 ```bash
-docker build -f docker/Dockerfile.engine -t circuits-engine .   # Rust engine (multi-stage)
-docker build -f docker/Dockerfile.node   -t circuits-node .     # API server
-docker build -f docker/Dockerfile.ds     -t circuits-ds .       # durable-streams server (Rust)
+podman build -f container/Containerfile.engine -t circuits-engine .   # Rust engine (multi-stage)
+podman build -f docker/Dockerfile.node   -t circuits-node .     # API server
+podman build -f container/Containerfile.durable-streams     -t circuits-ds .       # durable-streams server (Rust)
 ```
 
 The engine image is a plain-HTTP binary (no TLS backend compiled in) on `debian:bookworm-slim`; the

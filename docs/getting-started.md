@@ -79,7 +79,7 @@ max_wal_senders = 10
 
 ### Option A — Docker
 
-`pnpm docker:up` (or `docker compose -f docker/compose.yaml up`) boots the whole stack:
+`pnpm docker:up` (or `podman compose -f docker/compose.yaml up`) boots the whole stack:
 
 | service | port | role |
 |---|---|---|

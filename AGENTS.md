@@ -20,7 +20,7 @@ the project is growing toward).
 | `packages/bench` | Benchmarks incl. the **benchmarking-fleet runner** (`electric-bench-runner.ts`, `pnpm bench:fleet` — auto-clones electric-sql/benchmarking-fleet). |
 | `packages/loadgen` | Headless load generator (state-machine users; memory/CPU/disk sampling; Docker-scalable clients). |
 | `electric-conformance/` | Electric's own oracle/property/integration tests pointed at our `/v1/shape`. |
-| `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Dockerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
+| `docker/` | Containerized stack: `compose.yaml` (postgres + ds + engine + api), `Containerfile.engine`, `Dockerfile.node`. `pnpm docker:up`. |
 | `apps/pipeline-viz` | Live pipeline explorer (shapes, shared families/nodes, reactive per-node state + index dumps) over `GET /graph` + `/state` + `/trace`. |
 | `examples/linearlite` | The flagship demo. `scripts/linearlite.sh start <size>` boots everything. |
 
@@ -94,7 +94,7 @@ against the same workloads:
 
 ```bash
 # 1. Boot the target, e.g. stock Electric:
-docker run -d --name electric-baseline -p 3000:3000 \
+podman run -d --name electric-baseline -p 3000:3000 \
   -e DATABASE_URL=postgresql://postgres:password@host.docker.internal:54321/electric \
   -e ELECTRIC_INSECURE=true electricsql/electric:latest
 
@@ -148,8 +148,8 @@ The **visualizer** can also attach to any running engine on its own:
 `CIRCUITS_ENGINE_URL=http://127.0.0.1:<port> pnpm --filter @circuits/pipeline-viz dev`.
 Its dev server proxies `/engine/*` → the engine control plane, so browser-side `fetch('/engine/graph')`
 etc. work from the page — the backbone of the verification workflow below. A third way is the
-containerized visualizer (`docker/Dockerfile.viz`): `docker build -f docker/Dockerfile.viz -t
-circuits-viz . && docker run -p 5180:5180 -p 5443:5443 circuits-viz` serves
+containerized visualizer (`docker/Dockerfile.viz`): `podman build -f docker/Dockerfile.viz -t
+circuits-viz . && podman run -p 5180:5180 -p 5443:5443 circuits-viz` serves
 `http://localhost:5180` with Caddy proxying `/engine/*` to the engine; set `ENGINE_UPSTREAM` to
 point it at another engine.
 

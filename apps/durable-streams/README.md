@@ -16,7 +16,7 @@ cargo install durable-streams
 npm install -g @electric-ax/durable-streams-server-rust
 
 # 3. Docker (multi-arch image)
-docker run -p 4437:4437 electricax/durable-streams-server-rust
+podman run -p 4437:4437 electricax/durable-streams-server-rust
 ```
 
 cargo and npm both install the `durable-streams-server` command; the Docker image

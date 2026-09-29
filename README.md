@@ -141,7 +141,7 @@ walkthrough), `pnpm demo:web` (minimal end-to-end app).
 ### Docker
 
 ```bash
-pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see docker/README.md
+pnpm docker:up    # Postgres + durable-streams + engine (+ extended API) — see container/README.md
 ```
 
 Point an ElectricSQL client at `http://localhost:7010/v1/shape`, or `@circuits/client` at

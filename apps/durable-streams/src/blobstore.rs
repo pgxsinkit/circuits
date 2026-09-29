@@ -276,7 +276,7 @@ mod tests {
     // S3-compatible adapter integration test against a real MinIO server.
     // Ignored by default — run manually after starting MinIO:
     //
-    //   docker run -d --rm -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
+    //   podman run -d --rm -p 9000:9000 -e MINIO_ROOT_USER=minioadmin \
     //     -e MINIO_ROOT_PASSWORD=minioadmin minio/minio server /data
     //   # create the bucket (mc or the console at :9000), e.g. "ds-tier-test"
     //

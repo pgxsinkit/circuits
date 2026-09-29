@@ -3,7 +3,7 @@
 # Electric-compatible `GET /v1/shape` endpoint.
 #
 # Build context is the repo root:
-#   docker build -f docker/Dockerfile.engine -t circuits-engine .
+#   podman build -f container/Containerfile.engine -t circuits-engine .
 #
 # The engine speaks plain HTTP to the durable-streams server (reqwest is built with no TLS
 # backend), so the runtime image needs no OpenSSL — just certs-free debian slim.

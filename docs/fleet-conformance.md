@@ -163,7 +163,7 @@ port for our own tooling.
 
 ## 7. Verification gates (all must pass before calling it done)
 
-1. `docker build` succeeds; image runs with only fleet-provided env vars against a
+1. `podman build` succeeds; image runs with only fleet-provided env vars against a
    `wal_level=logical` Postgres.
 2. The fleet's exact health command (curl+awk one-liner) exits 0 within 10 s.
 3. Protocol smoke: initial `offset=-1` fetch returns rows + handle/offset headers; live

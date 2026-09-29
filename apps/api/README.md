@@ -45,6 +45,6 @@ await api.close()
 ```
 
 `docker/api-server.ts` is a complete standalone entrypoint (env: `DS_URL`, `ENGINE_URL`,
-`API_PORT`, `BIND_HOST`) — it is what the `api` service in [docker/](../../docker/README.md) runs.
+`API_PORT`, `BIND_HOST`) — it is what the `api` service in [docker/](../../container/README.md) runs.
 For embedding without HTTP, `createCore` (`src/core.ts`) exposes the same operations as plain
 async methods.

@@ -28,7 +28,7 @@ jobs:
       matrix:
         include:
           - name: engine
-            dockerfile: docker/Dockerfile.engine
+            dockerfile: container/Containerfile.engine
           - name: node
             dockerfile: docker/Dockerfile.node
           - name: electric
