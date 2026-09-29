@@ -93,6 +93,35 @@ async function expectEachKeyExactlyOnce(streamUrl: string, expectedKeys: number)
   expect(counts.size, 'every key that should be on the stream is').toBe(expectedKeys)
 }
 
+/**
+ * Nothing was lost, and whatever is on the stream twice is a REPLAY of what was already there.
+ *
+ * This is the bar after a FORCED exit, and it is deliberately lower than
+ * {@link expectEachKeyExactlyOnce}. The sequencer's checkpoint is lazy (at most every ~2 s of change)
+ * and only a shutdown that completes writes a final one, so an exit that cuts the shutdown short can
+ * leave the durable checkpoint behind what the shape stream already holds. The restart then replays
+ * from that checkpoint and appends those envelopes again: `shutdown.rs` calls it "a replay (correct,
+ * but wasteful)". Whether it happens depends on where the last lazy checkpoint fell, so exactly-once
+ * is not something a forced exit can promise, and asserting it made this test fail whenever the exit
+ * landed inside that window (docs/backlog/0011).
+ *
+ * What a forced exit DOES promise is that a replayed envelope says exactly what the original said.
+ */
+async function expectNothingLostAndOnlyReplays(streamUrl: string, expectedKeys: number): Promise<void> {
+  const byKey = new Map<string, string[]>()
+  for (const e of await streamEnvelopes(streamUrl)) {
+    // The offset is stamped by the log server on read and differs for every append; everything else
+    // is the engine's, and a replay must reproduce it.
+    const { offset: _offset, ...headers } = e.headers
+    const said = JSON.stringify({ type: e.type, value: e.value ?? null, headers })
+    byKey.set(e.key, [...(byKey.get(e.key) ?? []), said])
+  }
+  for (const [key, said] of byKey) {
+    expect(new Set(said).size, `key ${key} was appended with different contents: ${said.join(' | ')}`).toBe(1)
+  }
+  expect(byKey.size, 'every key that should be on the stream is').toBe(expectedKeys)
+}
+
 describe('graceful shutdown (SIGTERM)', () => {
   it('drains readiness, exits 0 without waiting on storage long-polls, and keeps the shape maintained', async () => {
     await boot()
@@ -207,8 +236,9 @@ describe('graceful shutdown (SIGTERM)', () => {
     expect(exit.code, 'the forced-shutdown exit code').toBe(70)
     expect(h!.engineStderr()).toContain('second SIGTERM')
 
-    // Nothing is corrupted by cutting the drain short: the stream is untouched and a restart
-    // resumes it — an unacknowledged commit is re-delivered, the previous checkpoint stands.
+    // Nothing is corrupted by cutting the drain short: a restart resumes the stream from the
+    // previous checkpoint. The exit came before the final checkpoint a completed shutdown writes,
+    // so the first row may be replayed onto the stream; it must not be lost or changed.
     await h!.startEngine()
     await pg('INSERT INTO items (id, n, label) VALUES (2, 2, $1)', ['two'])
     await drainEngine(h!)
@@ -216,7 +246,7 @@ describe('graceful shutdown (SIGTERM)', () => {
       async () => (await foldStream(shape.streamUrl)).has('2'),
       'a post-restart insert to reach the shape after a forced shutdown',
     )
-    await expectEachKeyExactlyOnce(shape.streamUrl, 2)
+    await expectNothingLostAndOnlyReplays(shape.streamUrl, 2)
   })
 
   it('a SIGTERM during a large transaction converges after the restart with no duplicates', async () => {

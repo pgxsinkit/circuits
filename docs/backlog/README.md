@@ -25,6 +25,7 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 - [0008 — `CIRCUITS_DS_URL` is not validated at resolve](0008-ds-url-not-validated-and-prometheus-port-ignored.md) — candidate
 - [0009 — A Postgres error with no SQLSTATE and no io source retries forever at boot](0009-no-sqlstate-postgres-error-retries-forever.md) — candidate
 - [0010 — The harness client does not re-subscribe when its stream is retired](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) — candidate
+- [0011 — A forced exit replays the checkpoint window onto shape streams](0011-a-forced-exit-replays-the-checkpoint-window.md) — candidate
 
 ## Not carried over
 
