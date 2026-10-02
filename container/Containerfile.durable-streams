@@ -10,7 +10,7 @@
 # ---- build stage: compile the release binary (glibc, matches the runtime) ----
 # Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
 # builds use (and rustup has nothing to download).
-FROM rust:1.96.0-bookworm AS build
+FROM rust:1.99.0-bookworm AS build
 WORKDIR /repo
 # Cargo loads every workspace member's manifest, so both members are copied; only the log server
 # is built.
