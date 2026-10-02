@@ -51,6 +51,47 @@ use crate::changelog::LogPosition;
 use crate::heap_size::HeapSize;
 use crate::pg::SnapshotGate;
 
+/// A retained shape lost an input its replay needs and was durably retired. Readers must create
+/// a fresh subscription instead of retrying a handle that can never be brought up to date.
+#[derive(Debug, Clone)]
+pub struct ShapeReplayRetired {
+    pub shape: String,
+    pub stream: String,
+}
+
+impl std::fmt::Display for ShapeReplayRetired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape '{}' was retired after losing stream '{}'; recreate the subscription", self.shape, self.stream)
+    }
+}
+
+impl std::error::Error for ShapeReplayRetired {}
+
+/// Replay could not finish, but loss was not confirmed. The retained shape and its resume state
+/// stay available for another attempt.
+#[derive(Debug, Clone)]
+pub struct ReactivationUnavailable {
+    pub shape: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for ReactivationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "shape '{}' reactivation is unavailable; retry the read: {}", self.shape, self.cause)
+    }
+}
+
+impl std::error::Error for ReactivationUnavailable {}
+
+/// The one replay result shared by every concurrent touch. Terminal loss is distinct from a
+/// failed attempt whose retained stream and resume position are still usable.
+#[derive(Debug, Clone)]
+pub enum ReactivationOutcome {
+    Active,
+    Retired { stream: String },
+    Retry { cause: String },
+}
+
 /// Retention tuning, read from the environment once at engine construction.
 ///
 /// | Env var | Default | Meaning |
@@ -117,11 +158,11 @@ pub enum LifeState {
     /// resume segment: the segment is not deleted until the shape is reactivated or evicted.
     Dormant { since: Instant, resume: LogPosition, gate: SnapshotGate },
     /// A touch is replaying the change log to bring the shape back. Concurrent touches await
-    /// the same outcome (`Some(true)` = active again, `Some(false)` = reactivation failed).
+    /// the same outcome, including whether failure permanently retired the shape or is retryable.
     /// `resume` is the position the replay is running FROM: it keeps pinning its change-log segment
     /// for the whole replay, so the sweeper cannot delete the segment out from under a
     /// reactivation that outlives one sweep tick (ADR-0006).
-    Reactivating { done: tokio::sync::watch::Receiver<Option<bool>>, resume: LogPosition },
+    Reactivating { done: tokio::sync::watch::Receiver<Option<ReactivationOutcome>>, resume: LogPosition },
 }
 
 impl HeapSize for LifeState {

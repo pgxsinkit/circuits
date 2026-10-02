@@ -272,6 +272,9 @@ pub struct StreamState {
     pub appender: AsyncMutex<Appender>,
     pub shared: RwLock<Shared>,
     pub tail_tx: watch::Sender<Tail>,
+    /// Sticky terminal identity state, distinct from durable stream EOF. A
+    /// direct DELETE wakes waiting readers even when no tail bytes changed.
+    deleted_tx: watch::Sender<bool>,
     /// The sidecar's persisted `durable_tail` as read at BOOT (None for sidecars
     /// written by older servers). Consumed once by WAL recovery as this stream's
     /// truncation-proof seed; never updated afterwards (the live value lives in
@@ -302,6 +305,7 @@ pub struct StreamState {
     delete_gate: AsyncMutex<()>,
     retirement_lock: StdMutex<()>,
     hard_delete: AtomicBool,
+    wal_retired: AtomicBool,
     parent_released: AtomicBool,
     #[cfg(test)]
     delete_fault: std::sync::atomic::AtomicU8,
@@ -432,6 +436,22 @@ impl StreamState {
     pub(crate) fn hard_delete_pending(&self) -> bool {
         self.hard_delete.load(Ordering::Acquire)
     }
+
+    pub(crate) fn wal_retired(&self) -> bool {
+        self.wal_retired.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_wal_retired(&self) {
+        self.wal_retired.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn deletion_watch(&self) -> watch::Receiver<bool> {
+        self.deleted_tx.subscribe()
+    }
+
+    fn publish_deleted(&self) {
+        self.deleted_tx.send_replace(true);
+    }
     /// Record the just-appended wire chunk as the resident tail. `start` is the
     /// logical offset where `bytes` begins. Chunks larger than the tail-cache cap
     /// (or any append when the cache is disabled) are not cached (the entry is
@@ -528,6 +548,12 @@ pub struct Store {
     /// recovery must distinguish these streams from acknowledged deletions.
     quarantined_ids: RwLock<HashSet<u64>>,
     quarantine_unmapped: AtomicBool,
+    /// Same-path creators serialize outside the stream registry, so readers
+    /// never wait on a DashMap shard while another path fsyncs its metadata.
+    create_locks: [StdMutex<()>; 64],
+    failed_creates: StdMutex<HashSet<String>>,
+    #[cfg(test)]
+    create_fault: std::sync::atomic::AtomicU8,
 }
 
 pub enum CreateResult {
@@ -543,6 +569,7 @@ struct RetirementContext {
     tier_config: crate::tier::TierConfig,
     blobstore: Option<crate::blobstore::SharedBlobStore>,
     segments_dir: PathBuf,
+    wal: Option<Arc<crate::wal::walset::WalSet>>,
 }
 
 impl RetirementContext {
@@ -550,6 +577,9 @@ impl RetirementContext {
         remove_file_if_present(&meta_path(&st.file_path))?;
         remove_file_if_present(&st.file_path)?;
         fsync_parent_dir(&st.file_path)?;
+        if let Some(wal) = &self.wal {
+            wal.shard_for(st.id).forget_stream(st)?;
+        }
         // A failed unlink/fsync must retain remote evidence: a subsequent boot
         // can still recover the old active sidecar if deletion did not commit.
         Store::gc_remote_segments_owned(st, &self.tier_config, self.blobstore.clone(), self.segments_dir.clone());
@@ -604,6 +634,7 @@ impl RetirementContext {
             // ones. A cleanup worker therefore never waits for an async close.
             st.lifecycle.lock().unwrap().retiring = true;
             st.hard_delete.store(true, Ordering::Release);
+            st.publish_deleted();
             match context.finish_hard(&st) {
                 Ok(()) => context.release_parent(&st),
                 Err(e) => tracing::warn!(path = %st.path, error = %e, "stream cleanup failed; DELETE may retry"),
@@ -619,6 +650,7 @@ impl Store {
             tier_config: self.tier_config.clone(),
             blobstore: self.blobstore.clone(),
             segments_dir: self.segments_dir(),
+            wal: self.wal.get().cloned(),
         })
     }
     pub(crate) fn quarantined_stream_ids(&self) -> std::io::Result<HashSet<u64>> {
@@ -773,6 +805,10 @@ impl Store {
             meta_sweep: StdMutex::new(Vec::new()),
             quarantined_ids: RwLock::new(HashSet::new()),
             quarantine_unmapped: AtomicBool::new(false),
+            create_locks: std::array::from_fn(|_| StdMutex::new(())),
+            failed_creates: StdMutex::new(HashSet::new()),
+            #[cfg(test)]
+            create_fault: std::sync::atomic::AtomicU8::new(0),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -1013,6 +1049,7 @@ impl Store {
             }
         };
         let (tail_tx, _) = watch::channel(Tail { bytes: tail, closed: meta.closed });
+        let (deleted_tx, _) = watch::channel(meta.soft_deleted);
         let state = Arc::new(StreamState {
             id: meta.id,
             path: path.to_string(),
@@ -1038,6 +1075,7 @@ impl Store {
                 soft_deleted: meta.soft_deleted,
             }),
             tail_tx,
+            deleted_tx,
             meta_dirty: AtomicBool::new(false),
             // Epoch 0 < the shard's initial epoch (1), so the first append
             // registers this stream into the dirty set.
@@ -1049,6 +1087,7 @@ impl Store {
             delete_gate: AsyncMutex::new(()),
             retirement_lock: StdMutex::new(()),
             hard_delete: AtomicBool::new(false),
+            wal_retired: AtomicBool::new(false),
             parent_released: AtomicBool::new(false),
             #[cfg(test)]
             delete_fault: std::sync::atomic::AtomicU8::new(0),
@@ -1238,9 +1277,11 @@ impl Store {
                     let _ = write_meta_sync(&st2, true);
                 });
             }
+            st.publish_deleted();
         } else {
             st.hard_delete.store(true, Ordering::Release);
             st.shared.write().unwrap().soft_deleted = true;
+            st.publish_deleted();
             let context = self.retirement_context();
             // The map entry is dropped only once the removal has actually
             // happened, never before. Dropping it first meant a failed
@@ -1271,7 +1312,17 @@ impl Store {
         parent: Option<Arc<StreamState>>,
         base_offset: u64,
     ) -> std::io::Result<CreateResult> {
-        use dashmap::mapref::entry::Entry;
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in path.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+        let _create = self.create_locks[hash as usize % self.create_locks.len()].lock().unwrap();
+        if self.failed_creates.lock().unwrap().contains(path) {
+            return Err(std::io::Error::other(
+                "previous create rollback failed; repair storage and restart before retrying this path",
+            ));
+        }
         // Reserve the fork source through the durable reference update. DELETE
         // waits for this reservation before deciding hard vs soft removal.
         let _parent_operation = match parent.as_ref() {
@@ -1292,13 +1343,19 @@ impl Store {
                 CreateResult::Conflict
             });
         }
+        // Lazy expiry can still own a fenced entry while its physical cleanup
+        // is queued. Do not replace that identity before cleanup removes it.
+        if self.streams.contains_key(path) {
+            return Ok(CreateResult::Conflict);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let fname = format!("{}~{}", encode_path(path), id);
         let file_path = lane_dir(&self.data_dir, lane_of(&fname)).join(fname);
-        let file = Arc::new(OpenOptions::new().create(true).read(true).append(true).open(&file_path)?);
+        let file = Arc::new(OpenOptions::new().create_new(true).read(true).append(true).open(&file_path)?);
         let is_json = is_json_content_type(&config.content_type);
         let closed = config.create_closed;
         let (tail_tx, _) = watch::channel(Tail { bytes: base_offset, closed });
+        let (deleted_tx, _) = watch::channel(false);
         let state = Arc::new(StreamState {
             id,
             path: path.to_string(),
@@ -1325,6 +1382,7 @@ impl Store {
                 soft_deleted: false,
             }),
             tail_tx,
+            deleted_tx,
             meta_dirty: AtomicBool::new(false),
             // Epoch 0 < the shard's initial epoch (1), so the first append
             // registers this stream into the dirty set.
@@ -1336,6 +1394,7 @@ impl Store {
             delete_gate: AsyncMutex::new(()),
             retirement_lock: StdMutex::new(()),
             hard_delete: AtomicBool::new(false),
+            wal_retired: AtomicBool::new(false),
             parent_released: AtomicBool::new(false),
             #[cfg(test)]
             delete_fault: std::sync::atomic::AtomicU8::new(0),
@@ -1347,55 +1406,62 @@ impl Store {
             sse_subs: StdMutex::new(None),
             config,
         });
-        match self.streams.entry(path.to_string()) {
-            Entry::Occupied(e) => {
-                // Lost a race; compare against the winner.
-                let existing = e.get().clone();
-                let fp = state.file_path.clone();
-                let _ = std::fs::remove_file(fp);
-                if existing.shared.read().unwrap().soft_deleted {
-                    return Ok(CreateResult::Conflict);
-                }
-                Ok(if config_matches(&existing, &state.config) {
-                    CreateResult::Exists(existing)
-                } else {
-                    CreateResult::Conflict
-                })
+        let mut reserved = false;
+        let created = (|| -> std::io::Result<()> {
+            if let Some(p) = &parent {
+                p.shared.write().unwrap().ref_count += 1;
+                reserved = true;
+                write_meta_sync(p, true)?;
             }
-            Entry::Vacant(v) => {
-                v.insert(state.clone());
-                // Take the fork reference only once insertion has succeeded, so
-                // rejected/raced creates never leak a refcount on the source.
-                let created = (|| -> std::io::Result<()> {
-                    if let Some(p) = &parent {
-                        p.shared.write().unwrap().ref_count += 1;
-                        if let Err(e) = write_meta_sync(p, true) {
-                            p.shared.write().unwrap().ref_count -= 1;
-                            return Err(e);
-                        }
-                    }
-                    if let Err(e) = write_meta_sync(&state, true) {
-                        if let Some(p) = &parent {
-                            p.shared.write().unwrap().ref_count -= 1;
-                            let _ = write_meta_sync(p, true);
-                        }
-                        return Err(e);
-                    }
-                    Ok(())
-                })();
-                if let Err(e) = created {
-                    // UNDO the create: without a durable sidecar the stream must
-                    // not stay live — WAL mode would happily ack appends to it,
-                    // and the next boot would treat the sidecar-less data file as
-                    // an orphan and delete it (acked appends destroyed after a
-                    // create the client saw fail).
-                    self.streams.remove_if(&state.path, |_, cur| Arc::ptr_eq(cur, &state));
-                    let _ = std::fs::remove_file(&state.file_path);
-                    return Err(e);
-                }
-                Ok(CreateResult::Created(state))
+            self.prepare_create_meta(&state)
+        })();
+        if let Err(error) = created {
+            // The state is still private: neither POST nor an idempotent PUT
+            // can acknowledge it while preparation or compensation can fail.
+            if let Err(rollback) = self.compensate_create(&state, reserved) {
+                self.failed_creates.lock().unwrap().insert(path.to_string());
+                return Err(std::io::Error::new(rollback.kind(), format!("create failed ({error}); durable rollback failed ({rollback}); path blocked until storage is repaired and restarted")));
+            }
+            return Err(error);
+        }
+        self.streams.insert(path.to_string(), state.clone());
+        Ok(CreateResult::Created(state))
+    }
+
+    fn compensate_create(&self, state: &StreamState, reserved: bool) -> std::io::Result<()> {
+        // Remove even a successfully renamed child sidecar before releasing the
+        // parent pin. A failed directory fsync cannot leave a recoverable child
+        // whose parent's reference has already been durably compensated.
+        remove_file_if_present(&meta_path(&state.file_path).with_extension("meta.tmp"))?;
+        remove_file_if_present(&meta_path(&state.file_path))?;
+        remove_file_if_present(&state.file_path)?;
+        fsync_parent_dir(&state.file_path)?;
+        if reserved {
+            let parent = state.parent.as_ref().expect("a reserved create has a parent");
+            parent.shared.write().unwrap().ref_count -= 1;
+            if let Err(error) = write_meta_sync(parent, true) {
+                // Retain the conservative in-memory pin when persistence is
+                // uncertain. Never hide an incomplete compensation as success.
+                parent.shared.write().unwrap().ref_count += 1;
+                return Err(error);
             }
         }
+        Ok(())
+    }
+
+    fn prepare_create_meta(&self, state: &StreamState) -> std::io::Result<()> {
+        #[cfg(test)]
+        let fault = self.create_fault.swap(0, Ordering::AcqRel);
+        #[cfg(test)]
+        if fault == 1 {
+            return Err(std::io::Error::other("injected create metadata failure"));
+        }
+        write_meta_sync(state, true)?;
+        #[cfg(test)]
+        if fault == 2 {
+            return Err(std::io::Error::other("injected create failure after sidecar rename"));
+        }
+        Ok(())
     }
 }
 
@@ -2710,6 +2776,135 @@ mod meta_sweep_tests {
 
     fn disk_meta(st: &StreamState) -> Meta {
         serde_json::from_slice(&std::fs::read(meta_path(&st.file_path)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_create_is_unpublished_and_competing_create_waits_for_compensation() {
+        let _durability = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = temp_dir("create-publication-race");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locking_parent = parent.clone();
+        let writer = std::thread::spawn(move || {
+            let _guard = locking_parent.meta_lock.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        locked_rx.recv().unwrap();
+        store.create_fault.store(1, Ordering::Release);
+        let creating_store = store.clone();
+        let creating_parent = parent.clone();
+        let creating =
+            tokio::task::spawn_blocking(move || creating_store.create("child", octet_cfg(), Some(creating_parent), 0));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.shared.read().unwrap().ref_count == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let append = crate::handlers::handle(
+            store.clone(),
+            crate::api::Req {
+                method: crate::api::Method::Post,
+                path: "child".into(),
+                query: None,
+                headers: vec![("content-type".into(), "application/octet-stream".into())],
+                body: bytes::Bytes::from_static(b"must-not-be-acknowledged"),
+            },
+        )
+        .await;
+        let competing_store = store.clone();
+        let competing_parent = parent.clone();
+        let mut competing = tokio::task::spawn_blocking(move || {
+            competing_store.create("child", octet_cfg(), Some(competing_parent), 0)
+        });
+        let early = tokio::time::timeout(Duration::from_millis(100), &mut competing).await.ok();
+        let returned_early = early.is_some();
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let failed = creating.await.unwrap();
+        let winner = match early {
+            Some(result) => result.unwrap().unwrap(),
+            None => competing.await.unwrap().unwrap(),
+        };
+        assert!(failed.is_err());
+        assert_eq!(append.status, 404, "no append can acknowledge bytes on an unpublished create");
+        assert!(!returned_early, "same-path create must wait for failed preparation and durable compensation");
+        assert!(matches!(winner, CreateResult::Created(_)), "competing create prepares a fresh durable incarnation");
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        assert_eq!(disk_meta(&parent).ref_count, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_soft_delete_does_not_publish_terminal_reader_state() {
+        let _durability = crate::handlers::test_support::DurabilityGuard::memory();
+        let dir = temp_dir("failed-soft-delete-reader");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent");
+        let _child = store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap();
+        let reading_store = store.clone();
+        let mut read = tokio::spawn(crate::handlers::handle(
+            reading_store,
+            crate::api::Req {
+                method: crate::api::Method::Get,
+                path: "parent".into(),
+                query: Some("offset=now&live=long-poll".into()),
+                headers: vec![],
+                body: bytes::Bytes::new(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.tail_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        parent.delete_fault.store(1, Ordering::Release);
+        assert!(store.delete_durable(&parent).await.is_err());
+        assert!(!*parent.deletion_watch().borrow(), "rolled-back soft deletion cannot strand a terminal notification");
+        assert!(!read.is_finished(), "failed soft DELETE leaves the existing long poll waiting");
+        let appended = crate::handlers::handle(
+            store,
+            crate::api::Req {
+                method: crate::api::Method::Post,
+                path: "parent".into(),
+                query: None,
+                headers: vec![("content-type".into(), "application/octet-stream".into())],
+                body: bytes::Bytes::from_static(b"still-live"),
+            },
+        )
+        .await;
+        assert_eq!(appended.status, 204, "rollback restores append admission");
+        let response = tokio::time::timeout(Duration::from_secs(2), &mut read).await.unwrap().unwrap();
+        assert_eq!(response.status, 200, "waiter resumes on the subsequent live append");
+    }
+
+    #[test]
+    fn failed_create_after_sidecar_rename_is_durably_compensated() {
+        let dir = temp_dir("create-durable-compensation");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent");
+        store.create_fault.store(2, Ordering::Release);
+        assert!(store.create("failed", octet_cfg(), Some(parent.clone()), 0).is_err());
+        assert!(!store.streams.contains_key("failed"));
+        assert_eq!(disk_meta(&parent).ref_count, 0, "parent compensation is durable");
+        for entry in std::fs::read_dir(dir.path().join("streams")).unwrap() {
+            assert!(
+                !entry.unwrap().file_name().to_string_lossy().starts_with("failed~"),
+                "failed child artifacts must be unlinked"
+            );
+        }
+        drop(parent);
+        drop(store);
+        for _ in 0..3 {
+            let boot = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+            assert!(boot.get("failed").is_none(), "failed create cannot reappear after compensated restart");
+            assert_eq!(disk_meta(&boot.get("parent").unwrap()).ref_count, 0);
+        }
     }
 
     /// Marking is idempotent while a flush is pending (one sweep entry per

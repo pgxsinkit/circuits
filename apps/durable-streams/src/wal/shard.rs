@@ -149,6 +149,14 @@ struct WaiterReg {
     next_seq: u64,
 }
 
+/// A checkpoint's captured file and logical tail. Keep its stream incarnation
+/// until the tail merge so a concurrent durable removal can invalidate it.
+struct CheckpointStream {
+    stream: Arc<StreamState>,
+    tail: u64,
+    file: Arc<std::fs::File>,
+}
+
 /// Stage→committer signalling for the **dedicated-OS-thread committer** (Tier-2a).
 ///
 /// The committer no longer lives on the shared async runtime, so the wakeup can
@@ -325,12 +333,15 @@ pub struct Shard {
     /// racing the drain sees a stale stream epoch and re-registers into the next
     /// interval's collection — no touched stream is ever dropped.
     dirty_epoch: AtomicU64,
-    /// Resident copy of the CUMULATIVE per-stream durable-tail map persisted at
+    /// Resident copy of the per-stream durable-tail map persisted at
     /// `<shard_dir>/tails` (task 11b). `None` until the first checkpoint needs it
     /// (then seeded from disk once); afterwards `persist_durable_tails` merges and
     /// serializes from memory instead of re-reading + re-parsing the whole file
     /// every ~3 s (O(total streams per shard) — ~20 ms/tick at 400k streams).
-    /// Only the (serialized, per-shard) checkpoint path locks it.
+    /// Durable removal prunes this map under the same lock as checkpoint merges.
+    /// The lock covers persistence too, so a serialized checkpoint cannot write
+    /// an older map after a newer merge. Retirement is persisted at the next
+    /// successful checkpoint, including one with no touched streams.
     tails_cache: Mutex<Option<HashMap<u64, u64>>>,
     /// Per-shard batch-size + durability counters (spec §11). Updated once per
     /// successful committer `fdatasync` (`record_batch`) — cheap relaxed atomics,
@@ -351,6 +362,11 @@ pub struct Shard {
     /// (propagates a `Result::Err`) rather than panicking the process.
     #[cfg(test)]
     fail_next_write: std::sync::atomic::AtomicBool,
+    /// Pause a checkpoint after its captured-file barrier but before its tail
+    /// merge, to exercise a physical removal in that exact window.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    on_checkpoint_tails: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// Name of the per-shard checkpoint-lsn file: `<shard_dir>/checkpoint` (plain
@@ -390,14 +406,15 @@ pub fn checkpoint_wal_bytes() -> u64 {
 }
 
 /// Name of the per-shard durable-tail map: `<shard_dir>/tails` (task 11b). A
-/// CUMULATIVE `stream_id durable_tail` line map (plain decimal text, one stream
+/// Cumulative `stream_id durable_tail` line map (plain decimal text, one stream
 /// per line). At checkpoint, each touched stream's current logical `Shared.tail`
 /// (the file is durable up to it after the checkpoint `fdatasync`) is merged in
 /// and the whole map is written `tmp`+rename + fsync'd **before** segments are
 /// recycled — so recovery can truncate a stream's torn per-stream-file tail even
 /// when every WAL record for that stream has been recycled (its durable boundary
 /// is gone from the WAL). Cumulative: a stream touched in an earlier checkpoint
-/// but not this one keeps its last recorded durable tail.
+/// but not this one keeps its last recorded durable tail until durable physical
+/// retirement prunes it. Failed removals and unresolved identities retain proofs.
 const TAILS_FILE: &str = "tails";
 
 impl Shard {
@@ -498,6 +515,8 @@ impl Shard {
             on_stage: Mutex::new(None),
             #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            on_checkpoint_tails: Mutex::new(None),
         }))
     }
 
@@ -780,7 +799,11 @@ impl Shard {
             // still reports the residual transition-only contention (≈0).
             let mut g =
                 super::telemetry::timed_lock(|ns| self.stats.record_dirty_lock_wait(ns), || self.dirty.lock().unwrap());
-            g.push(st);
+            // A failed checkpoint may re-register its drained incarnations
+            // after DELETE completed. Retired streams no longer need a proof.
+            if !st.wal_retired() {
+                g.push(st);
+            }
         }
     }
 
@@ -883,11 +906,11 @@ impl Shard {
             // already in the file's cache, so the file is durable up to AT LEAST
             // this tail afterwards (a later concurrent append only extends past
             // it and lands in the next checkpoint). Conservative-safe.
-            let touched: Vec<(u64, u64, Arc<std::fs::File>)> = drained
+            let touched: Vec<CheckpointStream> = drained
                 .iter()
                 .map(|st| {
                     let s = st.shared.read().unwrap();
-                    (st.id, s.tail, Arc::clone(&s.file))
+                    CheckpointStream { stream: Arc::clone(st), tail: s.tail, file: Arc::clone(&s.file) }
                 })
                 .collect();
             let n_touched = touched.len();
@@ -912,9 +935,9 @@ impl Shard {
             //    Nothing acked is at risk at abort time: acks never gate on the
             //    checkpoint, and the WAL still holds every record.
             let barrier = if cfg!(target_os = "linux") && n_touched > 0 {
-                crate::store::syncfs_stream_lanes(&touched[0].2)
+                crate::store::syncfs_stream_lanes(&touched[0].file)
             } else {
-                touched.iter().try_for_each(|(_, _, f)| crate::store::barrier_fsync(f))
+                touched.iter().try_for_each(|entry| crate::store::barrier_fsync(&entry.file))
             };
             if let Err(e) = barrier {
                 eprintln!(
@@ -929,7 +952,7 @@ impl Shard {
             }
             let t_fsync = t_start.elapsed();
 
-            // 3a. Persist the CUMULATIVE per-stream durable-tail map (task 11b)
+            // 3a. Persist the per-stream durable-tail map (task 11b)
             //     AFTER the per-stream files are fsync'd, and BEFORE recycle —
             //     same hard ordering as `checkpoint_lsn`. Merge this checkpoint's
             //     touched tails into the resident map so a stream touched in an
@@ -938,8 +961,11 @@ impl Shard {
             //     so when recycle deletes the WAL records below the floor,
             //     recovery can still truncate a recycled stream's torn
             //     per-stream-file tail to its durable tail.
-            let tails: Vec<(u64, u64)> = touched.iter().map(|(id, tail, _)| (*id, *tail)).collect();
-            let n_tails = this.persist_durable_tails(&tails)?;
+            #[cfg(test)]
+            if let Some(hook) = this.on_checkpoint_tails.lock().unwrap().as_ref() {
+                hook();
+            }
+            let n_tails = this.persist_durable_tails(&touched)?;
             let t_tails = t_start.elapsed();
 
             // 3b. Persist checkpoint_lsn (durably) AFTER the per-stream files are
@@ -992,8 +1018,8 @@ impl Shard {
         }
     }
 
-    /// Merge `touched` `(stream_id, durable_tail)` pairs into the persisted
-    /// CUMULATIVE per-shard durable-tail map (`<shard_dir>/tails`) and rewrite it
+    /// Merge captured `touched` tails into the persisted per-shard durable-tail
+    /// map (`<shard_dir>/tails`) and rewrite it
     /// durably (`tmp` + rename + fsync the dir-synced file). Called from
     /// `checkpoint` AFTER the touched per-stream files are fdatasync'd and BEFORE
     /// the WAL is recycled, so a torn per-stream-file tail can always be truncated
@@ -1004,21 +1030,35 @@ impl Shard {
     /// newest durable tail (`max`, so a re-checkpointed earlier tail can never
     /// regress the recorded value), keep every untouched stream's last recorded
     /// tail. Serializing from memory avoids re-reading + re-parsing the whole
-    /// file every checkpoint (O(total streams per shard) each ~3 s).
+    /// file every checkpoint (O(live streams per shard) each ~3 s). Successfully
+    /// retired incarnations are skipped, and even an idle checkpoint persists
+    /// any resident pruning performed since the last checkpoint.
     /// Returns the number of entries in the persisted map (for `WAL_CKPT`).
-    fn persist_durable_tails(&self, touched: &[(u64, u64)]) -> io::Result<usize> {
-        if touched.is_empty() && !self.dir.join(TAILS_FILE).exists() {
-            // Nothing touched and no prior map: nothing to persist.
-            return Ok(0);
-        }
+    fn persist_durable_tails(&self, touched: &[CheckpointStream]) -> io::Result<usize> {
         let mut cache = self.tails_cache.lock().unwrap();
         if cache.is_none() {
+            if touched.is_empty() && !self.dir.join(TAILS_FILE).exists() {
+                // Nothing touched, retired, or previously recorded.
+                return Ok(0);
+            }
             *cache = Some(Self::read_durable_tails_at(&self.dir)?);
         }
         let map = cache.as_mut().unwrap();
-        for &(id, tail) in touched {
-            let slot = map.entry(id).or_insert(0);
-            *slot = (*slot).max(tail);
+        for entry in touched {
+            // Physical removal sets the stream-owned marker under this same
+            // lock. A checkpoint which captured this file before DELETE must
+            // therefore either merge before removal prunes it, or skip it here.
+            // Failed removals never set the marker and keep their proof.
+            if !entry.stream.wal_retired() {
+                let slot = map.entry(entry.stream.id).or_insert(0);
+                *slot = (*slot).max(entry.tail);
+            }
+        }
+        // HashMap::remove preserves capacity. Reclaim it geometrically at the
+        // checkpoint so a churn peak does not become a lifetime allocation,
+        // without rehashing all surviving streams on every individual DELETE.
+        if map.capacity() > map.len().saturating_mul(4) {
+            map.shrink_to(map.len().saturating_mul(2));
         }
         // Serialize as `stream_id durable_tail` lines (sorted for a deterministic,
         // diff-friendly file). Plain decimal text, matching the `checkpoint` file.
@@ -1032,10 +1072,9 @@ impl Shard {
                 let _ = writeln!(body, "{id} {tail}");
             }
         }
-        // The resident map is fully merged and serialized; release it before the
-        // file IO below (nothing else contends today, but don't hold a lock over
-        // a write+fsync+rename gratuitously).
-        drop(cache);
+        // Keep the map lock through persistence. Concurrent checkpoints must
+        // not publish a stale serialization after a newer proof/pruning merge.
+        // Appends do not acquire this lock; DELETE only does so after draining.
         let path = self.dir.join(TAILS_FILE);
         let tmp = self.dir.join(format!("{TAILS_FILE}.tmp"));
         std::fs::write(&tmp, &body)?;
@@ -1049,6 +1088,27 @@ impl Shard {
         // stale tails proof + WAL gone = recovery truncates acked bytes.
         crate::store::fsync_parent_dir(&path)?;
         Ok(n)
+    }
+
+    /// Forget the proof of a physically removed stream incarnation. The Store
+    /// calls this ONLY after both unlinks and the parent-directory fsync succeed;
+    /// a pending fence, soft deletion, or unresolved recovery identity is not
+    /// evidence of removal. The stream-owned marker excludes already captured
+    /// checkpoint work without retaining a growing set of retired IDs.
+    ///
+    /// Prune resident state now and persist it on the next successful checkpoint
+    /// (even if idle), avoiding an O(live streams) rewrite per DELETE. A crash
+    /// before that checkpoint leaves only an obsolete proof of an absent stream,
+    /// which recovery safely ignores. Any proof-read error is retained as an
+    /// error rather than replacing the map with an empty one.
+    pub(crate) fn forget_stream(&self, st: &Arc<StreamState>) -> io::Result<()> {
+        let mut cache = self.tails_cache.lock().unwrap();
+        if cache.is_none() {
+            *cache = Some(Self::read_durable_tails_at(&self.dir)?);
+        }
+        st.mark_wal_retired();
+        cache.as_mut().unwrap().remove(&st.id);
+        Ok(())
     }
 
     /// Read the persisted per-shard durable-tail map from `<dir>/tails`. Returns
@@ -2030,6 +2090,150 @@ mod tests {
         assert!(seg_path(dir.path(), 1).exists(), "WAL segment retained (not recycled)");
 
         h.stop();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_prunes_durably_removed_streams_under_churn() {
+        let dir = temp_dir("tails-churn");
+        let wal = super::super::walset::WalSet::open_with_segment_size(dir.path(), Some(1), 1, 4096).unwrap();
+        let sh = &wal.shards()[0];
+        let h = sh.spawn_committer();
+        let store = Arc::new(
+            crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        store.wal.set(wal.clone()).unwrap_or_else(|_| panic!("WAL already attached"));
+        let survivor = match store.create("survivor", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        write_checkpoint_test_record(sh, &survivor, b"survives").await;
+        sh.checkpoint().await.unwrap();
+
+        for round in 0..24 {
+            // Keep every incarnation alive until its next checkpoint: pruning
+            // must follow durable removal, rather than Arc lifetime or path reuse.
+            let mut removed = Vec::new();
+            for index in 0..8 {
+                let st = match store.create(&format!("churn/{round}/{index}"), ckpt_test_cfg(), None, 0).unwrap() {
+                    crate::store::CreateResult::Created(st) => st,
+                    _ => panic!("create failed"),
+                };
+                write_checkpoint_test_record(sh, &st, b"deleted").await;
+                removed.push(st);
+            }
+            sh.checkpoint().await.unwrap();
+            assert_eq!(sh.read_durable_tails().unwrap().len(), 9);
+            for st in &removed {
+                store.delete_durable(st).await.unwrap();
+                assert!(!st.file_path.exists());
+            }
+            // No new appends: an otherwise idle checkpoint must still persist
+            // retirement and reclaim the tail-map allocation under churn.
+            sh.checkpoint().await.unwrap();
+            assert_eq!(sh.read_durable_tails().unwrap(), HashMap::from([(survivor.id, 8)]));
+            let cache = sh.tails_cache.lock().unwrap();
+            assert_eq!(cache.as_ref().unwrap().len(), 1);
+            assert!(cache.as_ref().unwrap().capacity() <= 8, "allocation follows surviving streams");
+        }
+        assert_eq!(std::fs::read(&survivor.file_path).unwrap(), b"survives");
+        h.stop();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_cannot_restore_tail_captured_before_durable_removal() {
+        let dir = temp_dir("tails-remove-race");
+        let wal = super::super::walset::WalSet::open_with_segment_size(dir.path(), Some(1), 1, 4096).unwrap();
+        let sh = &wal.shards()[0];
+        let h = sh.spawn_committer();
+        let store = Arc::new(
+            crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        store.wal.set(wal.clone()).unwrap_or_else(|_| panic!("WAL already attached"));
+        let st = match store.create("removed-during-checkpoint", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        write_checkpoint_test_record(sh, &st, b"first").await;
+        sh.checkpoint().await.unwrap();
+        write_checkpoint_test_record(sh, &st, b"second").await;
+
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let captured_tx = Mutex::new(Some(captured_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        *sh.on_checkpoint_tails.lock().unwrap() = Some(Box::new(move || {
+            captured_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+            release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        }));
+        let checkpoint = tokio::spawn({
+            let sh = sh.clone();
+            async move { sh.checkpoint().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), captured_rx).await.unwrap().unwrap();
+
+        // The checkpoint holds the removed incarnation and its already-synced
+        // file. DELETE must complete independently, and that captured tail must
+        // not be merged after its resident proof was pruned.
+        store.delete_durable(&st).await.unwrap();
+        assert!(st.wal_retired());
+        assert!(!st.file_path.exists());
+        assert!(sh.tails_cache.lock().unwrap().as_ref().unwrap().is_empty());
+        // Pruning does not synchronously rewrite the file on DELETE's path.
+        assert_eq!(sh.read_durable_tails().unwrap(), HashMap::from([(st.id, 5)]));
+        release_tx.send(()).unwrap();
+        checkpoint.await.unwrap().unwrap();
+        *sh.on_checkpoint_tails.lock().unwrap() = None;
+        assert!(sh.read_durable_tails().unwrap().is_empty());
+        assert!(sh.tails_cache.lock().unwrap().as_ref().unwrap().is_empty());
+        h.stop();
+    }
+
+    #[tokio::test]
+    async fn idle_checkpoint_retries_retirement_persistence_without_erasing_unknown_proofs() {
+        let dir = temp_dir("tails-prune-retry");
+        let wal = super::super::walset::WalSet::open_with_segment_size(dir.path(), Some(1), 1, 4096).unwrap();
+        let sh = &wal.shards()[0];
+        let h = sh.spawn_committer();
+        let store = Arc::new(
+            crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        store.wal.set(wal.clone()).unwrap_or_else(|_| panic!("WAL already attached"));
+        let st = match store.create("removed", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        // Proofs of unknown/unresolved IDs are never inferred to be retired
+        // from their absence in the live Store. Only the physical callback may
+        // prune its own known incarnation.
+        let unknown = st.id + 1000;
+        std::fs::write(sh.dir.join(TAILS_FILE), format!("{unknown} 123\n")).unwrap();
+        write_checkpoint_test_record(sh, &st, b"removed").await;
+        sh.checkpoint().await.unwrap();
+        store.delete_durable(&st).await.unwrap();
+
+        // A checked write error over-retains the old disk proof; retirement in
+        // memory remains valid and the next idle checkpoint retries the rewrite.
+        let tmp = sh.dir.join(format!("{TAILS_FILE}.tmp"));
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(sh.checkpoint().await.is_err());
+        assert_eq!(sh.read_durable_tails().unwrap(), HashMap::from([(st.id, 7), (unknown, 123)]));
+        std::fs::remove_dir(&tmp).unwrap();
+        sh.checkpoint().await.unwrap();
+        assert_eq!(sh.read_durable_tails().unwrap(), HashMap::from([(unknown, 123)]));
+        h.stop();
+    }
+
+    async fn write_checkpoint_test_record(sh: &Arc<Shard>, st: &Arc<StreamState>, bytes: &[u8]) {
+        use std::io::Write;
+        let (file, offset) = {
+            let s = st.shared.read().unwrap();
+            (Arc::clone(&s.file), s.tail)
+        };
+        (&*file).write_all(bytes).unwrap();
+        st.shared.write().unwrap().tail = offset + bytes.len() as u64;
+        sh.register_dirty(st.id, Arc::clone(st));
+        let lsn = sh.reserve_and_stage(RecordKind::Append, st.id, offset, bytes).unwrap();
+        sh.wait_durable(lsn).await;
     }
 
     #[tokio::test]

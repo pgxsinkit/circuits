@@ -2,6 +2,7 @@
 //! (release/touch/dormancy/eviction/sweep).
 
 use super::*;
+use crate::retention::{ReactivationOutcome, ReactivationUnavailable, ShapeReplayRetired};
 
 /// How many times a create/join is redone after losing a race during its catalog durability wait
 /// (see [`Engine::recheck_after_durability`]). Three: the race needs an *external* retirement to
@@ -145,9 +146,14 @@ impl Engine {
         // handing back a handle (see `ensure_create_not_degraded`).
         self.ensure_not_degraded()?;
         let mut st = self.state.lock().await;
+        let mut dep_tables = vec![table.clone()];
+        if let Some(w) = &where_ {
+            dep_tables.extend(referenced_tables(w));
+        }
+        self.ensure_schema_resolved(&st, &dep_tables)?;
         let ts = match st.tables.get(table) {
             Some(ts) => ts.clone(),
-            None => bail!("unknown table '{table}'"),
+            None => return Err(crate::schema::RequestError::UnknownTable(table.to_string()).into()),
         };
         let col_names = columns.clone();
         let out_cols = resolve_columns(&ts, columns)?;
@@ -163,10 +169,6 @@ impl Engine {
         // The set is every table this create reads: the outer table plus every table a subquery
         // predicate references (empty for a plain predicate, so the plain path captures exactly
         // `[table]` as before).
-        let mut dep_tables = vec![table.clone()];
-        if let Some(w) = &where_ {
-            dep_tables.extend(referenced_tables(w));
-        }
         let gens = st.capture_gens(&dep_tables);
 
         // Shape sharing: an identical shape (subset feed, materialized, OR subquery) that already exists
@@ -244,6 +246,11 @@ impl Engine {
             if let Err(e) = self.ensure_active(&existing_id).await {
                 // Roll the failed join back so the dead subscription doesn't pin the shape.
                 joining.rollback().await;
+                if e.downcast_ref::<ShapeReplayRetired>().is_some() {
+                    // Retirement was durable before the replay task published its outcome. A
+                    // valid definition can now create a fresh shape with this subscription id.
+                    return Err(anyhow::Error::new(CreateRaced(format!("{e:#}"))));
+                }
                 return Err(e);
             }
             if let Err(e) = self.ensure_create_schema_unchanged(&gens).await {
@@ -285,7 +292,7 @@ impl Engine {
             tables.push(table.clone());
             for t in &tables {
                 if !st.tables.contains_key(t) {
-                    bail!("unknown table '{t}' referenced by subquery");
+                    return Err(crate::schema::RequestError::UnknownTable(t.to_string()).into());
                 }
             }
             self.ensure_schema_resolved(&st, &tables)?;
@@ -586,8 +593,12 @@ impl Engine {
         // rows whose membership it can no longer vouch for.
         self.ensure_not_degraded()?;
         let mut st = self.state.lock().await;
-        let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
         self.ensure_schema_resolved(&st, std::slice::from_ref(table))?;
+        let ts = st
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| crate::schema::RequestError::UnknownTable(table.to_string()))?;
         // Captured in the SAME critical section as `ts` — deliberately, not incidentally: the lock is
         // released below for the join path's storage `HEAD`, and `ts` is what `col_idx`, the signature
         // and the compiled predicate are all derived from (see `create_shape_once`'s capture site).
@@ -1125,7 +1136,7 @@ impl Engine {
             enum Step {
                 Done,
                 WaitDeactivate(tokio::sync::watch::Receiver<bool>),
-                WaitReactivate(tokio::sync::watch::Receiver<Option<bool>>),
+                WaitReactivate(tokio::sync::watch::Receiver<Option<ReactivationOutcome>>),
             }
             let step = {
                 let mut lives = self.lives.lock().unwrap();
@@ -1154,7 +1165,7 @@ impl Engine {
                                 let id = id.to_string();
                                 tokio::spawn(async move {
                                     let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
-                                    let err = match res {
+                                    let mut err = match res {
                                         Ok(()) => {
                                             let mut lives = engine.lives.lock().unwrap();
                                             if let Some(life) = lives.get_mut(&id) {
@@ -1162,67 +1173,38 @@ impl Engine {
                                                 life.last_read = std::time::Instant::now();
                                             }
                                             drop(lives);
-                                            let _ = tx.send(Some(true));
+                                            let _ = tx.send(Some(ReactivationOutcome::Active));
                                             return;
                                         }
                                         Err(e) => e,
                                     };
-                                    // A stream the replay needs is GONE, and which one decides the
-                                    // answer. Either way nothing can bring this shape up to date, so
-                                    // it is not parked back as dormant to fail the same way on every
-                                    // future touch; subscribers get 404 / `stream-closed` and recreate,
-                                    // which backfills them from Postgres.
-                                    let gone = crate::ds::stream_gone(&err).map(|g| g.path.clone());
-                                    match gone {
-                                        // The change-log resume SEGMENT (ADR-0006): the changes the
-                                        // shape is missing are not anywhere any more. Evicted through
-                                        // the retention path, like any shape pinning a deleted segment.
-                                        Some(path)
-                                            if path.split('/').next() == Some(crate::changelog::CHANGES_PREFIX) =>
-                                        {
-                                            tracing::error!(
-                                                "reactivating shape {id}: its change-log resume segment {path} is \
-                                                 gone ({err:#}); evicting the shape — it can never be brought up to \
-                                                 date"
-                                            );
-                                            // Put it back as dormant first: `evict_shape` only evicts a
-                                            // settled shape, and this one is still `Reactivating`.
-                                            if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
-                                                life.state = LifeState::Dormant {
-                                                    since: std::time::Instant::now(),
-                                                    resume: resume.clone(),
-                                                    gate: gate.clone(),
-                                                };
-                                            }
-                                            if let Err(e) =
-                                                engine.evict_shape(&id, EvictReason::ChangeLogRetention).await
-                                            {
-                                                tracing::warn!("evicting unresumable shape {id} failed: {e:#}");
-                                            }
-                                            let _ = tx.send(Some(false));
-                                            return;
+                                    // A GET's 404 can come from a proxy. HEAD must independently
+                                    // confirm loss before an acknowledged subscription is destroyed.
+                                    let gone = match engine.confirmed_replay_loss(&err).await {
+                                        Ok(path) => path,
+                                        Err(e) => {
+                                            err =
+                                                e.context(format!("confirming shape '{id}' replay failure ({err:#})"));
+                                            None
                                         }
-                                        // The shape's OWN retained stream: storage lost it while the
-                                        // shape was dormant — the runtime form of the boot's
-                                        // `stream_missing` (ADR-0009). Retired outright (`Dropped`,
-                                        // close-then-delete, deregister), exactly as a join or a live
-                                        // append retires a shape whose stream storage confirms gone:
-                                        // eviction would skip a shape that still has subscribers, and
-                                        // they are holding a handle whose every read is 404.
-                                        Some(path) => {
-                                            tracing::error!(
-                                                "reactivating shape {id}: its retained stream {path} is gone from \
-                                                 storage ({err:#}); retiring the shape so its subscribers re-subscribe"
-                                            );
-                                            if let Err(e) = engine.purge_shape(&id).await {
-                                                tracing::warn!(
-                                                    "retiring shape {id} after losing its stream failed: {e:#}"
-                                                );
+                                    };
+                                    if let Some(path) = gone {
+                                        tracing::error!(
+                                            "reactivating shape {id}: replay requires lost stream {path} ({err:#}); \
+                                             retiring the shape so its subscribers re-subscribe"
+                                        );
+                                        // Forced retirement bypasses retention eligibility: a join
+                                        // already took a provisional subscription, but that cannot
+                                        // repair missing history. The existing purge owns cleanup
+                                        // across cancellation and records Dropped durably before
+                                        // the result lets any joiner create its replacement.
+                                        match engine.purge_shape_durable(&id).await {
+                                            Ok(()) => {
+                                                let _ = tx.send(Some(ReactivationOutcome::Retired { stream: path }));
+                                                return;
                                             }
-                                            let _ = tx.send(Some(false));
-                                            return;
+                                            Err(e) => err = e.context(format!("retiring unresumable shape '{id}'")),
                                         }
-                                        None => {}
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
                                     // Restore the dormant resume state so a later touch retries.
@@ -1230,7 +1212,7 @@ impl Engine {
                                         life.state =
                                             LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
-                                    let _ = tx.send(Some(false));
+                                    let _ = tx.send(Some(ReactivationOutcome::Retry { cause: format!("{err:#}") }));
                                 });
                                 Step::WaitReactivate(rx)
                             }
@@ -1249,19 +1231,41 @@ impl Engine {
                     }
                 }
                 Step::WaitReactivate(mut rx) => loop {
-                    let outcome = *rx.borrow_and_update();
+                    let outcome = rx.borrow_and_update().clone();
                     match outcome {
-                        Some(true) => return Ok(()),
-                        Some(false) => bail!("shape '{id}' reactivation failed; retry the read"),
+                        Some(ReactivationOutcome::Active) => return Ok(()),
+                        Some(ReactivationOutcome::Retired { stream }) => {
+                            return Err(ShapeReplayRetired { shape: id.to_string(), stream }.into());
+                        }
+                        Some(ReactivationOutcome::Retry { cause }) => {
+                            return Err(ReactivationUnavailable { shape: id.to_string(), cause }.into());
+                        }
                         None => {
                             if rx.changed().await.is_err() {
-                                bail!("shape '{id}' reactivator died; retry the read");
+                                return Err(ReactivationUnavailable {
+                                    shape: id.to_string(),
+                                    cause: "reactivator stopped before completing".to_string(),
+                                }
+                                .into());
                             }
                         }
                     }
                 },
             }
         }
+    }
+
+    /// A closed change-log segment is still readable, whereas a closed shape stream cannot accept
+    /// replay appends. An unanswered check preserves the shape for retry instead of guessing loss.
+    async fn confirmed_replay_loss(&self, err: &anyhow::Error) -> Result<Option<String>> {
+        let Some(gone) = crate::ds::stream_gone(err) else { return Ok(None) };
+        let head = self.ds.head_retrying(&gone.path, JOIN_HEAD_ATTEMPTS).await?;
+        let is_segment = gone.path.split('/').next() == Some(crate::changelog::CHANGES_PREFIX);
+        let lost = match head {
+            None => true,
+            Some(head) => !is_segment && head.closed,
+        };
+        Ok(lost.then(|| gone.path.clone()))
     }
 
     /// The replay half of a reactivation: re-register the shape through the sequencer's two-phase
@@ -2106,10 +2110,10 @@ impl Engine {
     /// Evaluated under the engine-state lock, in the same critical section that registers the create.
     fn ensure_schema_resolved(&self, st: &EngineState, tables: &[TableRef]) -> Result<()> {
         if let Some(t) = st.first_unresolved(tables) {
-            bail!("schema of '{t}' is unresolved after a change; retry later");
+            return Err(crate::schema::SchemaUnavailable { table: t, resolving: false }.into());
         }
         if let Some(t) = tables.iter().find(|t| self.resolving.is_active(t)) {
-            bail!("schema of '{t}' is being resolved after a change; retry");
+            return Err(crate::schema::SchemaUnavailable { table: t.clone(), resolving: true }.into());
         }
         Ok(())
     }

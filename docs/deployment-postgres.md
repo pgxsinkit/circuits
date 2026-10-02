@@ -48,7 +48,8 @@ ALL TABLES` (superuser) — the replication slot and its publication, created on
 
 > **One slot per engine instance.** Replication-slot names are unique across the whole Postgres
 > instance. If you run more than one engine against the same database, give each a distinct
-> `CIRCUITS_PG_SLOT`.
+> `CIRCUITS_PG_SLOT` and an isolated durable catalog/change log. Different slot names alone do not
+> isolate engine state.
 
 ## Step 2 — Run the engine
 
@@ -63,9 +64,11 @@ export CIRCUITS_BIND="0.0.0.0:9000"
 ./circuits-engine
 ```
 
-On startup the engine sets `REPLICA IDENTITY FULL` on each table, introspects it, ensures the slot, starts
-the replication ingestor, and begins serving the control API on `CIRCUITS_BIND`. It prints
-`ENGINE_LISTENING <addr>` once ready.
+On startup the engine waits while another backend owns its replication slot, keeping `/ready` and
+shape admission at `503`. Once the slot is idle, it reads the current durable catalog, resolves table
+selectors, sets `REPLICA IDENTITY FULL`, introspects the tables, restores shapes, and starts the
+ingestor. It prints `ENGINE_LISTENING <addr>` once ready. The slot check is a startup guard; keep one
+replica per catalog and use `Recreate` as below.
 
 ### Configuration reference
 
@@ -123,21 +126,15 @@ kind: Deployment
 metadata:
   name: circuits-engine
 spec:
-  # ONE replica, and `Recreate` — never a rolling update. The engine binds a logical replication
-  # slot and Postgres allows exactly one walsender per slot, but a second engine does NOT wait on
-  # it: a busy slot is "wait for it", not an epoch break (ADR-0004), so the new pod restores the
-  # durable catalog, spawns its ingestor and answers `GET /ready` 200 straight away — only the
-  # ingestor's connect backs off until the slot is free. Two ready pods over one catalog both
-  # accept creates and both mint shape ids from the same restored counter, so the overlap a
-  # rolling update creates is two live writers colliding on the same `shape/sN`. `Recreate` stops
-  # the old pod before the new one starts. The cost is bounded: after a crash the dead walsender
-  # lingers for up to `wal_sender_timeout` (60 s by default), during which the new pod serves
-  # the restored catalog and its ingestor waits. Give each engine its OWN slot
-  # (`CIRCUITS_PG_SLOT`) if you genuinely want more than one — they are independent
-  # engines, not replicas of each other.
+  # ONE replica and `Recreate`. A successor waits on an occupied slot before reading the catalog,
+  # altering replica identity, initializing the change log or restoring shapes; it stays unready.
+  # Slot observation is a startup guard, not a distributed writer lease, so overlapping engines
+  # must still be prevented. `Recreate` stops the old process before the new one starts. After a
+  # crash the old walsender can linger for `wal_sender_timeout` (60 s by default), during which
+  # the successor waits. Independent engines need separate slots and isolated catalogs.
   replicas: 1
   strategy:
-    type: Recreate # required — a surge pod is a second live writer on the same catalog
+    type: Recreate # required — prevent overlapping processes over the same catalog
   selector:
     matchLabels: { app: circuits-engine }
   template:

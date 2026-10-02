@@ -477,16 +477,21 @@ impl ChangeLogWriter {
 /// read (a byte offset into a JSON stream is not item-aligned), so reading it back would mean
 /// streaming the whole thing. The pointer's *content* is `closed + 1` by construction, and a reader
 /// that is streaming the segment normally follows the real envelope.
+/// A missing successor remains a typed `StreamGone`: the live sequencer backs off, startup
+/// refuses the broken chain, and a dormant replay can confirm the loss and retire its shape.
 pub async fn next_segment_for_reader(ds: &DsClient, closed: u32) -> Result<u32> {
     let next = closed + 1;
-    if ds.head(&segment_path(next)).await?.is_none() {
-        bail!(
-            "change log: {} is closed but its successor {} does not exist — rotation always creates \
+    let next_path = segment_path(next);
+    if ds.head(&next_path).await?.is_none() {
+        return Err(anyhow::Error::new(crate::ds::StreamGone { path: next_path.clone(), status: 404 }).context(
+            format!(
+                "change log: {} is closed but its successor {} does not exist — rotation always creates \
              the successor before it closes the predecessor, so this storage state cannot have been \
              produced by the engine. Refusing to skip ahead.",
-            segment_path(closed),
-            segment_path(next)
-        );
+                segment_path(closed),
+                next_path
+            ),
+        ));
     }
     Ok(next)
 }

@@ -760,7 +760,7 @@ fn minted_seq(id: &str) -> Option<u64> {
 /// engine degraded must give every joiner the same typed [`Degraded`] refusal the creator returns
 /// (503), not a generic initialization failure (500) — identical requests from identical clients
 /// cannot be allowed to disagree about why the engine said no.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ShareOutcome {
     /// The creator's backfill/registration is still in flight.
     Pending,
@@ -771,6 +771,10 @@ pub(crate) enum ShareOutcome {
     /// The create overlapped a degradation and refused (see [`Engine::ensure_create_not_degraded`]).
     Degraded,
     Unsettled,
+    /// Every joiner receives the creator's deterministic request refusal.
+    Request(crate::schema::RequestError),
+    /// A schema recovery wait is retryable for joiners as well as the creator.
+    SchemaUnavailable(crate::schema::SchemaUnavailable),
     /// The creator's closing re-check after its catalog durability wait found the shape retired
     /// underneath it (see [`Engine::recheck_after_durability`]). Distinct from [`Self::Failed`]
     /// because the creator does not give up on that: it redoes the create. A joiner must reach the
@@ -782,7 +786,15 @@ pub(crate) enum ShareOutcome {
 
 impl ShareOutcome {
     fn from_error(error: &anyhow::Error) -> Self {
-        if error.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some() { Self::Unsettled } else { Self::Failed }
+        if error.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some() {
+            Self::Unsettled
+        } else if let Some(error) = error.downcast_ref::<crate::schema::RequestError>() {
+            Self::Request(error.clone())
+        } else if let Some(error) = error.downcast_ref::<crate::schema::SchemaUnavailable>() {
+            Self::SchemaUnavailable(error.clone())
+        } else {
+            Self::Failed
+        }
     }
 }
 
@@ -790,7 +802,7 @@ impl ShareOutcome {
 /// backfill lands would hand the caller a stream whose snapshot isn't readable yet.
 async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<ShareOutcome>, id: &str) -> Result<()> {
     loop {
-        let state = *rx.borrow();
+        let state = rx.borrow().clone();
         match state {
             ShareOutcome::Ready => return Ok(()),
             // The creator's own refusal, verbatim: the HTTP layer downcasts it to 503 exactly as
@@ -802,6 +814,8 @@ async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<ShareOutcome>, i
                     pending: Vec::new(),
                 }));
             }
+            ShareOutcome::Request(error) => return Err(anyhow::Error::new(error)),
+            ShareOutcome::SchemaUnavailable(error) => return Err(anyhow::Error::new(error)),
             // Likewise typed, so this joiner's attempt is redone exactly as the creator's is.
             ShareOutcome::Raced => {
                 return Err(anyhow::Error::new(CreateRaced(format!(
@@ -1357,6 +1371,30 @@ impl Engine {
         // Postgres connection established: leave `waiting`, enter `starting` (introspection + slot +
         // ingest spawn still ahead). `/ready` reports 503 until the ingest loop is running.
         self.health.store(HEALTH_STARTING, std::sync::atomic::Ordering::Relaxed);
+        // Read no durable state until the preceding slot owner has left: it may still be
+        // adding shapes, advancing checkpoints or rotating the change log while we wait.
+        // Recheck after the catalog read too; a slot acquired during that read requires a
+        // new fold after its owner leaves. This is a startup guard, not a distributed lease.
+        self.set_epoch_slot(slot);
+        let (fold, epoch_verdict) = loop {
+            self.wait_for_idle_slot_at_boot(&client, slot).await?;
+            let fold = self.fold_catalog().await.map_err(|e| {
+                if e.downcast_ref::<catalog::CatalogPredatesQualification>().is_some() {
+                    return e;
+                }
+                e.context(
+                    "durable catalog unreadable; refusing to decide the epoch (an unreadable catalog is \
+                         not an empty one — booting on would create a slot at the current WAL head and \
+                         silently orphan every shape already in the log). Fix durable-streams and restart.",
+                )
+            })?;
+            self.adopt_epoch_binding(fold.binding.clone());
+            let checked = self.verify_epoch_at_boot(&client, slot).await?;
+            if matches!(checked, epoch::Verdict::Busy { .. }) {
+                continue;
+            }
+            break (fold, checked);
+        };
         // An empty setting means `*`, i.e. `public.*`: every table with a PK in `public` — NOT every
         // schema (introspect-all sets REPLICA IDENTITY FULL, which is not ours to do to managed
         // system schemas). `schema.*` opts another schema in explicitly.
@@ -1414,37 +1452,13 @@ impl Engine {
         self.state.lock().await.tables = compiled.clone();
         self.subqueries.lock().await.set_schemas(Arc::new(compiled.clone()));
 
-        // --- The epoch (ADR-0004) ---
-        //
-        // Read the durable catalog and DECIDE before restoring anything: the epoch the catalog's
-        // shapes belong to is recorded in that same log, and no shape may be resumed until the slot
-        // it depends on has been vouched for. A slot the engine cannot vouch for is not recreated
-        // quietly — every shape over it is missing an unknown span of WAL.
-        self.set_epoch_slot(slot);
-        // A catalog the engine could not READ is not a catalog with no epoch in it. Booting past an
-        // unreadable one would take the `FirstBoot` branch — create a slot at the current WAL head,
-        // append a `SlotBound` on top of whatever is already in the log — and the next boot, with
-        // storage healthy again, would Resume-restore shapes that were never `Dropped` straight over
-        // the gap. So it is fatal, exactly like a catalog written before ADR-0002: nothing may claim
-        // an epoch unless the log was read and demonstrably contained none.
-        let fold = self.fold_catalog().await.map_err(|e| {
-            if e.downcast_ref::<catalog::CatalogPredatesQualification>().is_some() {
-                return e;
-            }
-            e.context(
-                "durable catalog unreadable; refusing to decide the epoch (an unreadable catalog is \
-                 not an empty one — booting on would create a slot at the current WAL head and \
-                 silently orphan every shape already in the log). Fix durable-streams and restart.",
-            )
-        })?;
-        self.adopt_epoch_binding(fold.binding.clone());
-        // The change log is segmented (ADR-0006), and which segment is CURRENT is folded out of the
-        // same catalog — so this necessarily comes after the read, not before it as the old
-        // unqualified `ensure_stream("changes")` did.
+        // The slot and catalog were vouched for before the startup writes above.
+        // Segmentation follows that same fresh fold, never one captured while an owner was active.
         self.init_change_log(fold.current_segment, fold.segment_starts.clone(), &fold.start_pos()).await?;
-        let restored = match self.verify_epoch_at_boot(&client, slot).await? {
+        let restored = match epoch_verdict {
             // Either the epoch is intact or this boot just started one. Restore as usual.
-            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } | epoch::Verdict::Busy { .. } => Some(fold),
+            epoch::Verdict::FirstBoot | epoch::Verdict::Ok { .. } => Some(fold),
+            epoch::Verdict::Busy { .. } => unreachable!("busy slots are waited out before startup writes"),
             epoch::Verdict::Break(reason) => {
                 // Park the records (see `RestoreMode::Park`): nothing is resumed, so no old-epoch
                 // shape is ever maintained, and the reset — now, or whenever the operator asks —

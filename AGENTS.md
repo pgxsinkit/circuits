@@ -466,5 +466,8 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
 
 ## Git Policy
 
+Work on `develop`. Keep only `main` and `develop` as local branches; do not create task-specific
+branches.
+
 Do not commit or push unless explicitly asked. History is one line: rebase, never merge. At
 handoff, report changed files, validation run, and suggested next commands.

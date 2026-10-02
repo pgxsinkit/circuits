@@ -15,6 +15,17 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 
 ## Items
 
+The remaining upstream-audit work is unscheduled. Urgency describes the current local surface;
+parked leads need evidence before they become defect repairs.
+
+| Entries    | Urgency                      | Reason                                                                                                                            |
+| ---------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| 0017, 0022 | Medium                       | Engine pending/replay and seed memory can grow with slow or large work; no OOM was reproduced.                                    |
+| 0018–0020  | Conditional medium           | Fork/TTL correctness concerns; the engine's ordinary read path does not use DS forks or depend on proactive TTL expiry.           |
+| 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
+| 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
+| 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                              |
+
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
 - [0002 — The harness client retries a dead subscription's renewal at its floor cadence, logging a non-JSON body](0002-harness-client-renewal-retry-storm.md) — candidate
 - [0003 — The log server image's default arguments do not start it](0003-log-server-image-default-arguments-do-not-start.md) — candidate
@@ -30,6 +41,19 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 - [0013 — The change-log "skips the envelopes a migration outran" test times out under load](0013-fail-closed-skip-test-times-out-under-load.md) — candidate
 - [0014 — The log server's second-server test failed once under heavy load](0014-log-server-lock-test-failed-once-under-load.md) — parked
 - [0015 — Two dbsp settings are read, logged and do nothing](0015-two-dbsp-settings-are-read-and-do-nothing.md) — candidate
+- [0016 — IndexedLabs upstream audit and resolution ledger](0016-indexedlabs-audit-resolution-ledger.md) — parked
+- [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — candidate
+- [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — candidate
+- [0019 — Fork reference counts need graph-aware crash recovery](0019-fork-graph-and-reference-recovery.md) — candidate
+- [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — candidate
+- [0021 — Direct DELETE terminal notification is not wired through SSE serving](0021-direct-delete-sse-terminal-notification.md) — candidate
+- [0022 — Subquery inner seeding still materializes the whole row vector](0022-subquery-inner-seed-materializes-all-rows.md) — candidate
+- [0023 — A restart resets the age used for dormant-shape TTL](0023-dormancy-age-restarts-at-boot.md) — parked
+- [0024 — Aggregate stream creation precedes catalog identity: unproven crash lead](0024-aggregate-stream-before-catalog-identity.md) — parked
+- [0025 — Failed log-server create compensation needs crash-image qualification](0025-failed-create-compensation-crash-recovery.md) — parked
+- [0026 — Qualify the log server's complete shutdown bound under stalled storage](0026-log-server-shutdown-drain-qualification.md) — parked
+- [0027 — Gate shutdown checkpointing on an actually completed read](0027-checkpoint-only-after-a-completed-read.md) — parked
+- [0028 — A slot-busy startup guard is not distributed writer ownership](0028-simultaneous-cold-start-writer-coordination.md) — parked
 
 ## Not carried over
 

@@ -261,6 +261,14 @@ climbs the schedule like any other failure — and cut short by an epoch rebind.
 cannot be READ at boot is fatal rather than treated as an empty one: deciding the epoch from a log the
 engine could not read is how a fresh slot at the WAL head gets created beside shapes nobody dropped.
 
+Startup waits on an occupied slot before folding the catalog, expanding table selectors, changing
+publication or replica identity, initializing the change log, or restoring shapes. Readiness and
+shape admission remain `503`. A slot which becomes busy during the catalog read causes another
+wait and a fresh fold, so changes made by the preceding owner are included. The wait is responsive
+to shutdown and applies even before the first catalog binding exists. This is a startup guard;
+deployment still requires one replica and `Recreate`, because slot observation is not a distributed
+catalog-writer lease.
+
 Unparseable values (e.g. `NaN` floats) still log errors when degraded to NULL.
 
 ---
@@ -500,6 +508,12 @@ means _the engine retired this shape; re-subscribe_. Clients **must** treat `str
 stream stays appendable for reactivation, a rolled-back create's stream was never handed to a
 subscriber, and a restart keeps restored shapes on their existing streams
 (`docs/adr/0007-retirement-closes-before-delete.md`).
+
+Dormant replay independently confirms an apparent missing input with a retrying `HEAD`. Confirmed
+loss of required history or the shape's retained stream forces durable retirement even when a join
+has a provisional subscription. The `Dropped` record reaches the catalog before that join retries
+with a fresh shape; direct reads receive terminal `404`. An unconfirmed loss or transient replay
+failure leaves the dormant resume state intact and answers retryable `503` with `Retry-After: 1`.
 
 ---
 

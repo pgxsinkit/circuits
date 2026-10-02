@@ -211,6 +211,11 @@ streams therefore destroys nothing a restart would have kept.
 | `POST /epoch/reset`                                                                | operator recovery from a broken epoch under `CIRCUITS_RESET_ON_SLOT_LOSS=false`: retire every shape, bind a new epoch, resume ingest (409 if the epoch is not broken)                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `GET /metrics` · `POST /metrics/reset` · `GET /memory` · `GET /metrics/prometheus` | counters/histograms, memory snapshot, OTel/Prometheus exposition                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
+Shape creation requests naming an unknown table or column in a resolved schema answer `400`. A table
+whose schema is resolving or unresolved after drift answers `503` with `Retry-After: 1` before column validation;
+the caller can retry once resolution succeeds. Boot and degraded admission checks also take
+precedence over invalid-input classification.
+
 **Creating a subquery shape** (`POST /shapes` with an `IN (SELECT …)` predicate) registers the
 shape's dependency edges before it reads Postgres, so a membership change can reach it mid-create:
 work aimed at the not-yet-installed shape is queued on the pending create, and work aimed at a
@@ -755,6 +760,11 @@ slot gauges keep reporting across a reset. A reset while a counts pipeline is ru
 restarted, for the same reason schema drift on a circuit-served table does: the circuit is seeded
 once at boot and has no runtime rebuild across the gap.
 
+At startup, an occupied slot keeps the engine unready and shape admission at `503` before catalog
+reads, selector expansion or schema/storage writes. After the owner releases it, startup folds the
+current catalog and verifies the slot again before proceeding. Shutdown interrupts the wait. Keep
+one replica with `Recreate`: this check is a startup guard, not a distributed writer lease.
+
 ## Shape retention lifecycle
 
 Shapes follow a three-tier lifecycle (`src/retention.rs`) instead of delete-on-last-unsubscribe,
@@ -769,9 +779,11 @@ and a retained shape is not kept actively maintained for ever:
   position (`(segment, offset)`, following rotation pointers across segments) — no Postgres
   backfill. A dormant shape **pins** its resume segment against deletion;
   one that would pin it for longer than `CIRCUITS_CHANGES_RETAIN_SECS` is evicted instead.
-  A reactivation that finds a stream it needs gone does not park the shape again: a gone resume
-  segment evicts it, and a gone **shape stream** (storage lost it while the shape slept) retires it
-  outright — subscribers or not — like any shape whose stream storage confirms gone.
+  A reactivation independently checks an apparent missing stream with `HEAD`. Confirmed loss of
+  required history or the retained shape stream retires the shape outright, including a provisional
+  joining subscription. Its `Dropped` record is durable before a joining create retries with a
+  fresh shape; existing readers receive terminal `404` and recreate. A transient failure or a
+  false `404` preserves the dormant resume state and answers `503` with `Retry-After: 1`.
 - **Evicted** — record deleted and the stream **retired**: closed, then deleted (see
   `docs/adr/0007-retirement-closes-before-delete.md`), so a client tailing it is released at once
   with `stream-closed` rather than blocking to the long-poll timeout. Clients **must** treat

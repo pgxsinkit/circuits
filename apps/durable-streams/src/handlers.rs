@@ -1798,6 +1798,10 @@ async fn handle_long_poll(
     client_cursor: Option<u64>,
     cache_hit: &mut bool,
 ) -> Resp {
+    let mut deleted = st.deletion_watch();
+    if *deleted.borrow_and_update() {
+        return gone();
+    }
     let t0 = st.tail();
     // A beyond-tail numeric offset is treated as caught-up at the tail (see
     // `resolve_start`), so it follows the normal wait path below.
@@ -1817,6 +1821,9 @@ async fn handle_long_poll(
     let mut rx = st.tail_tx.subscribe();
     let deadline = Instant::now() + long_poll_timeout_dur();
     loop {
+        if *deleted.borrow_and_update() {
+            return gone();
+        }
         let t = *rx.borrow_and_update();
         if t.bytes > from {
             // Caught-up consumer woken by new appends: freshly-written, hot.
@@ -1826,6 +1833,12 @@ async fn handle_long_poll(
             return long_poll_close(t.bytes, cursor);
         }
         tokio::select! {
+            biased;
+            r = deleted.changed() => {
+                if r.is_err() || *deleted.borrow_and_update() {
+                    return gone();
+                }
+            }
             r = rx.changed() => {
                 if r.is_err() {
                     let t = st.tail();
@@ -1836,6 +1849,9 @@ async fn handle_long_poll(
                 }
             }
             _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => {
+                if *deleted.borrow_and_update() {
+                    return gone();
+                }
                 // Deadline hit — but re-check the tail EXACTLY like the
                 // closed-channel arm above. Returning a timeout that advertises
                 // the fresh tail as `Stream-Next-Offset` while NOT delivering
@@ -2485,6 +2501,70 @@ mod memory_mode_tests {
             b"hello-memory",
             "per-stream file must hold the appended bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn direct_delete_wakes_caught_up_long_poll_as_gone() {
+        let _guard = test_support::DurabilityGuard::memory();
+        let dir = test_support::temp_dir("delete-long-poll-wake");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        assert_eq!(handle(store.clone(), put_req("s", "application/octet-stream")).await.status, 201);
+        let st = store.get("s").unwrap();
+        let mut read = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Get,
+                path: "s".into(),
+                query: Some("offset=now&live=long-poll".into()),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while st.tail_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            handle(
+                store,
+                Req { method: Method::Delete, path: "s".into(), query: None, headers: vec![], body: Bytes::new() }
+            )
+            .await
+            .status,
+            204
+        );
+        let woken = tokio::time::timeout(Duration::from_millis(200), &mut read).await;
+        if woken.is_err() {
+            read.abort();
+            let _ = read.await;
+        }
+        assert_eq!(
+            woken.ok().map(|result| result.unwrap().status),
+            Some(410),
+            "DELETE must promptly terminate the waiter as gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_delete_is_sticky_before_long_poll_subscribes() {
+        let _guard = test_support::DurabilityGuard::memory();
+        let dir = test_support::temp_dir("delete-long-poll-sticky");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        assert_eq!(handle(store.clone(), put_req("s", "application/octet-stream")).await.status, 201);
+        let st = store.get("s").unwrap();
+        store.delete_durable(&st).await.unwrap();
+        // The HTTP reader already resolved identity, then deletion beat its
+        // subscription. The retained Arc must observe the terminal state.
+        let mut cache_hit = false;
+        let response = tokio::time::timeout(
+            Duration::from_millis(200),
+            handle_long_poll(st, ParsedOffset::Now, None, &mut cache_hit),
+        )
+        .await;
+        assert_eq!(response.ok().map(|r| r.status), Some(410), "a late subscriber cannot miss deletion");
     }
 
     /// #4691: a memory-mode append must NOT flush the meta sidecar via a

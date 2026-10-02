@@ -1065,6 +1065,61 @@ async fn e2e_corrupt_fork_parent_preserves_descendant_wal() {
     restored.crash();
 }
 
+#[tokio::test]
+async fn e2e_retirement_forgets_tails_only_after_success_and_preserves_survivor() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("retirement-tail-pruning");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "retired", OCTET).await;
+    create_stream(&h.store, "survivor", OCTET).await;
+    append_acked(&h.store, "retired", OCTET, b"retired-bytes").await;
+    append_acked(&h.store, "survivor", OCTET, b"surviving-bytes").await;
+    let retired = h.store.get("retired").unwrap();
+    let shard = h.walset.shard_for(retired.id);
+    shard.checkpoint().await.unwrap();
+    let sidecar = crate::store::meta_path(&retired.file_path);
+    let saved = sidecar.with_extension("meta.saved");
+    std::fs::rename(&sidecar, &saved).unwrap();
+    std::fs::create_dir(&sidecar).unwrap();
+    assert!(h.store.delete_durable(&retired).await.is_err(), "real unlink refusal fails retirement");
+    assert!(h.store.streams.contains_key("retired"), "failed removal retains the retryable identity");
+    assert!(*retired.deletion_watch().borrow(), "failed hard deletion remains honestly terminal-fenced");
+    assert!(!retired.wal_retired(), "a pending fence cannot prune durability proof");
+    shard.checkpoint().await.unwrap();
+    assert_eq!(shard.read_durable_tails().unwrap().get(&retired.id), Some(&(b"retired-bytes".len() as u64)));
+    std::fs::remove_dir(&sidecar).unwrap();
+    std::fs::rename(saved, &sidecar).unwrap();
+    h.store.delete_durable(&retired).await.unwrap();
+    assert!(retired.wal_retired());
+    assert!(
+        shard.read_durable_tails().unwrap().contains_key(&retired.id),
+        "disk pruning may lag a successful DELETE until checkpoint"
+    );
+    h.crash();
+    // Crash before pruning: stale deleted-id proof is harmless, and the live
+    // stream's strengthened proof survives recovery and the WAL reset.
+    let h = Harness::boot(dir.path(), None, 1).unwrap();
+    assert!(h.store.get("retired").is_none());
+    assert_eq!(stream_file_bytes(&h.store, "survivor"), b"surviving-bytes");
+    create_stream(&h.store, "retired-again", OCTET).await;
+    append_acked(&h.store, "retired-again", OCTET, b"more").await;
+    append_acked(&h.store, "survivor", OCTET, b"-still-live").await;
+    let retired = h.store.get("retired-again").unwrap();
+    let survivor = h.store.get("survivor").unwrap();
+    let shard = h.walset.shard_for(retired.id);
+    shard.checkpoint().await.unwrap();
+    h.store.delete_durable(&retired).await.unwrap();
+    shard.checkpoint().await.unwrap();
+    let tails = shard.read_durable_tails().unwrap();
+    assert!(!tails.contains_key(&retired.id), "idle checkpoint persists deletion pruning");
+    assert_eq!(tails.get(&survivor.id), Some(&(b"surviving-bytes-still-live".len() as u64)));
+    h.crash();
+    let restored = Harness::boot(dir.path(), None, 1).unwrap();
+    assert_eq!(stream_file_bytes(&restored.store, "survivor"), b"surviving-bytes-still-live");
+    assert!(restored.store.get("retired-again").is_none());
+    restored.crash();
+}
+
 /// Recovery-hardening: on an initialized store, a stream lane whose dir is
 /// empty and unmarked (= its device mount is missing) must REFUSE to boot —
 /// continuing would drop the lane's streams and let the WAL reset destroy

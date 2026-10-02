@@ -423,10 +423,49 @@ impl Engine {
         Ok(binding)
     }
 
+    /// Wait before startup side effects while any backend holds the slot, even without a catalog
+    /// binding. The catalog must be folded after this returns: the owner may advance it while we wait.
+    pub(crate) async fn wait_for_idle_slot_at_boot(&self, client: &tokio_postgres::Client, slot: &str) -> Result<()> {
+        let mut logged = false;
+        loop {
+            let observed = tokio::select! {
+                biased;
+                _ = self.shutdown.wait() => anyhow::bail!("{}", super::sequencer::SHUTTING_DOWN),
+                observed = crate::pg::observe_slot(client, slot) => observed?,
+            };
+            if !observed.slot.as_ref().is_some_and(|s| s.active) {
+                self.health.store(super::HEALTH_STARTING, Ordering::Relaxed);
+                return Ok(());
+            }
+            self.set_waiting();
+            if !logged {
+                tracing::warn!(
+                    "slot '{slot}' is held by backend pid {:?}: another engine is on this slot. \
+                     Waiting before startup writes; the durable catalog will be read after it releases the slot.",
+                    observed.slot.as_ref().and_then(|s| s.active_pid),
+                );
+                logged = true;
+            }
+            tokio::select! {
+                biased;
+                _ = self.shutdown.wait() => anyhow::bail!("{}", super::sequencer::SHUTTING_DOWN),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
     /// Boot-time verification (ADR-0004 step B). Runs on the setup connection, before anything is
     /// restored, and — on the first-boot verdict — is what creates and records the slot.
     pub(crate) async fn verify_epoch_at_boot(&self, client: &tokio_postgres::Client, slot: &str) -> Result<Verdict> {
         let obs = crate::pg::observe_slot(client, slot).await?;
+        // Another owner may have connected since the early wait or during the catalog read.
+        // In particular, FirstBoot must not bind or recreate an active slot just because this
+        // process has not yet seen the owner's SlotBound event.
+        if let Some(s) = obs.slot.as_ref()
+            && s.active
+        {
+            return Ok(Verdict::Busy { active_pid: s.active_pid });
+        }
         let v = verdict(&obs, self.epoch_binding().as_ref());
         match &v {
             Verdict::FirstBoot => {

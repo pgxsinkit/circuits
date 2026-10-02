@@ -4,7 +4,7 @@
 //! typed, so the assertion has to be on the process the operator actually starts. `main()` exits
 //! before the runtime or the store is built, so the refusal cases cost a process spawn and no I/O.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
 
@@ -200,4 +200,56 @@ fn a_second_server_on_the_same_data_dir_is_refused() {
     );
     assert!(stderr.contains("already locked"), "the refusal must say the directory is locked; got: {stderr}");
     drop(owner);
+}
+
+#[test]
+fn direct_delete_terminates_a_waiting_long_poll_over_http() {
+    fn request(
+        port: u16,
+        method: &str,
+        path: &str,
+        written: Option<std::sync::mpsc::Sender<()>>,
+    ) -> std::io::Result<String> {
+        let mut socket = TcpStream::connect(("127.0.0.1", port))?;
+        socket.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        write!(
+            socket,
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+        )?;
+        if let Some(written) = written {
+            written.send(()).unwrap();
+        }
+        let mut response = String::new();
+        socket.read_to_string(&mut response)?;
+        Ok(response)
+    }
+    let dir = temp_data_dir("delete-long-poll");
+    let port = unused_local_port();
+    let server = ServerUnderTest {
+        child: server()
+            .args(["--durability", "memory", "--port"])
+            .arg(port.to_string())
+            .arg("--data-dir")
+            .arg(dir.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+        dir,
+    };
+    wait_until_listening(port);
+    assert!(request(port, "PUT", "/waiter", None).unwrap().starts_with("HTTP/1.1 201"));
+    let (written, ready) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || request(port, "GET", "/waiter?offset=now&live=long-poll", Some(written)));
+    ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(request(port, "DELETE", "/waiter", None).unwrap().starts_with("HTTP/1.1 204"));
+    let response = reader.join().unwrap().expect("DELETE must wake the wire reader before its socket timeout");
+    // The server can parse the already-written GET after DELETE and answer
+    // 404; an admitted waiter answers 410. Deterministic handler tests verify
+    // the waiter and late-subscription cases, while this covers wire delivery.
+    assert!(
+        response.starts_with("HTTP/1.1 410") || response.starts_with("HTTP/1.1 404"),
+        "reader must receive a terminal response: {response}"
+    );
+    drop(server);
 }

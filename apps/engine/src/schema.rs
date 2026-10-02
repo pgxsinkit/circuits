@@ -18,6 +18,44 @@ use crate::value::{Row, Value};
 /// (ADR-0005) — nobody keeps a private immutable copy.
 pub type SharedTables = Arc<std::sync::RwLock<HashMap<TableRef, TableSchema>>>;
 
+/// A request names something absent from the resolved schema. Keep this typed through
+/// compilation/context so the control plane can distinguish invalid input from server failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestError {
+    UnknownTable(String),
+    UnknownColumn(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTable(table) => write!(f, "unknown table '{table}'"),
+            Self::UnknownColumn(col) => write!(f, "unknown column '{col}'"),
+        }
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+/// Schema drift has not settled. A caller cannot validate its request against this table yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaUnavailable {
+    pub table: TableRef,
+    pub resolving: bool,
+}
+
+impl std::fmt::Display for SchemaUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.resolving {
+            write!(f, "schema of '{}' is being resolved after a change; retry", self.table)
+        } else {
+            write!(f, "schema of '{}' is unresolved after a change; retry later", self.table)
+        }
+    }
+}
+
+impl std::error::Error for SchemaUnavailable {}
+
 /// `pg_class.relreplident` for `REPLICA IDENTITY FULL` — the only value the engine can serve: an
 /// UPDATE/DELETE must carry the full old row for the delta algebra to retract it.
 pub const REPLICA_IDENTITY_FULL: u8 = b'f';
@@ -420,7 +458,7 @@ impl TableSchema {
     }
 
     pub fn column_index(&self, col: &str) -> Result<usize> {
-        self.index.get(col).copied().ok_or_else(|| anyhow::anyhow!("unknown column '{col}'"))
+        self.index.get(col).copied().ok_or_else(|| RequestError::UnknownColumn(col.to_owned()).into())
     }
 
     pub fn column_type(&self, idx: usize) -> ColumnType {

@@ -826,6 +826,8 @@ impl From<anyhow::Error> for AppError {
         // and will succeed once the engine is serving, which is what `Retry-After` says.
         if e.downcast_ref::<crate::engine::Booting>().is_some()
             || e.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some()
+            || e.downcast_ref::<crate::schema::SchemaUnavailable>().is_some()
+            || e.downcast_ref::<crate::retention::ReactivationUnavailable>().is_some()
         {
             return AppError { status: StatusCode::SERVICE_UNAVAILABLE, msg: format!("{e:#}"), retry_after: Some(1) };
         }
@@ -849,6 +851,10 @@ impl From<anyhow::Error> for AppError {
             || e.downcast_ref::<crate::engine::SchemaIsPostgres>().is_some()
         {
             StatusCode::CONFLICT
+        } else if e.downcast_ref::<crate::retention::ShapeReplayRetired>().is_some() {
+            StatusCode::NOT_FOUND
+        } else if e.downcast_ref::<crate::schema::RequestError>().is_some() {
+            StatusCode::BAD_REQUEST
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
         };
@@ -868,7 +874,7 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::health_json;
+    use super::{AppError, StatusCode, health_json};
 
     // A probe may string-compare the body, so byte-for-byte exactness (no whitespace) matters more
     // than JSON equivalence.
@@ -877,5 +883,56 @@ mod tests {
         assert_eq!(health_json("waiting"), r#"{"status":"waiting"}"#);
         assert_eq!(health_json("starting"), r#"{"status":"starting"}"#);
         assert_eq!(health_json("active"), r#"{"status":"active"}"#);
+    }
+
+    #[test]
+    fn schema_request_errors_survive_context_without_classifying_server_messages() {
+        let error = anyhow::Error::new(crate::schema::RequestError::UnknownColumn("missing".to_owned()))
+            .context("compiling projection");
+        let response = AppError::from(error);
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.msg.contains("unknown column 'missing'"));
+        assert_eq!(response.retry_after, None);
+        assert_eq!(
+            AppError::from(anyhow::anyhow!("unknown column 'missing' from a database failure")).status,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn unavailable_engine_takes_precedence_over_schema_request_errors() {
+        let request = || anyhow::Error::new(crate::schema::RequestError::UnknownTable("missing".to_owned()));
+        let booting = AppError::from(request().context(crate::engine::Booting));
+        assert_eq!(booting.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(booting.retry_after, Some(1));
+        assert_eq!(AppError::from(request().context(crate::engine::Degraded)).status, StatusCode::SERVICE_UNAVAILABLE);
+        let unavailable = AppError::from(request().context(crate::schema::SchemaUnavailable {
+            table: crate::table_ref::TableRef::parse("items").unwrap(),
+            resolving: false,
+        }));
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.retry_after, Some(1));
+    }
+
+    #[test]
+    fn replay_retirement_is_terminal_while_unconfirmed_loss_is_retryable() {
+        let retired = AppError::from(
+            anyhow::Error::new(crate::retention::ShapeReplayRetired {
+                shape: "s1".to_owned(),
+                stream: "changes/0".to_owned(),
+            })
+            .context("reading shape rows"),
+        );
+        assert_eq!(retired.status, StatusCode::NOT_FOUND);
+        assert_eq!(retired.retry_after, None);
+        let unavailable = AppError::from(
+            anyhow::Error::new(crate::retention::ReactivationUnavailable {
+                shape: "s1".to_owned(),
+                cause: "HEAD could not confirm stream loss".to_owned(),
+            })
+            .context("reading shape rows"),
+        );
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.retry_after, Some(1));
     }
 }

@@ -2734,13 +2734,19 @@ mod tests {
             serde_json::json!([{ "type": "public.users", "key": "1", "value": { "id": 1, "name": "a" }, "headers": { "operation": "insert" } }]),
         );
         let err = engine.ensure_active("s1").await.expect_err("there is nothing to reactivate onto");
-        assert!(format!("{err:#}").contains("reactivation failed"), "{err:#}");
+        let retired = err.downcast_ref::<crate::retention::ShapeReplayRetired>().expect("confirmed loss is terminal");
+        assert_eq!(retired.shape, "s1");
+        assert_eq!(retired.stream, "shape/s1");
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while engine.get_shape("s1").await.is_some() {
-            assert!(std::time::Instant::now() < deadline, "the shape was never retired");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // The terminal result promises durable Dropped; physical cleanup is process-owned.
+        // Wait until this healthy mock's cleanup has enqueued Retired before draining the writer.
+        let cleanup = engine.purge_barriers.lock().unwrap().get("s1").cloned();
+        if let Some(cleanup) = cleanup {
+            tokio::time::timeout(std::time::Duration::from_secs(20), cleanup.wait())
+                .await
+                .expect("retirement cleanup completes");
         }
+        assert!(engine.get_shape("s1").await.is_none());
         assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
         assert_eq!(kinds_for(&server, "s1"), ["dropped", "retired"], "retired, intent then completion");
     }
