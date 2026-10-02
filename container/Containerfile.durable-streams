@@ -10,7 +10,9 @@
 # ---- build stage: compile the release binary (glibc, matches the runtime) ----
 # Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
 # builds use (and rustup has nothing to download).
-FROM rust:1.99.0-bookworm AS build
+# Build and runtime stages both use Debian 13 (Trixie), keeping their glibc and libgcc compatible.
+# images.yml publishes amd64 only; use Docker's official per-architecture repository directly.
+FROM docker.io/amd64/rust:1.99.0-trixie AS build
 WORKDIR /repo
 # Cargo loads every workspace member's manifest, so both members are copied; only the log server
 # is built.
@@ -27,7 +29,7 @@ RUN mkdir -p /var/lib/durable-streams
 
 # ---- runtime stage: distroless (glibc cc), no shell / package manager ----
 # The `nonroot` variant: the server runs as uid 65532, never as root.
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
 COPY --from=build /repo/target/release-durable-streams/durable-streams-server /usr/local/bin/durable-streams-server
 # A data directory that user can write to. A volume mounted at this path for the first time takes
 # its ownership from here; a volume or host directory with an owner of its own has to be writable by

@@ -11,7 +11,9 @@
 
 # Pinned to rust-toolchain.toml's version, so the image builds with the toolchain CI and local
 # builds use (and rustup has nothing to download).
-FROM rust:1.99.0-bookworm AS build
+# Build and runtime stages both use Debian 13 (Trixie), keeping their glibc and libgcc compatible.
+# images.yml publishes amd64 only; use Docker's official per-architecture repository directly.
+FROM docker.io/amd64/rust:1.99.0-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 # Cargo loads every workspace member's manifest, so both members are copied; only the engine is
@@ -21,7 +23,7 @@ COPY apps/engine apps/engine
 COPY apps/durable-streams apps/durable-streams
 RUN cargo build --release --locked -p circuits-engine
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # The engine runs as its own user, never as root. It keeps nothing of its own on disk that outlives
 # the process: what it writes (a large transaction's spill, the membership circuit's spill) goes to
 # the temporary directory unless CIRCUITS_TXN_SPILL_DIR or CIRCUITS_SUBQ_STORAGE_DIR name another,
