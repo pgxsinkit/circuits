@@ -94,7 +94,7 @@ The scripts are check-default: a bare verb never changes a file.
 
 ```bash
 bun run validate                           # the pre-commit gate: format + typecheck + lint + test
-bun run validate:full                      # the pre-push gate, and what CI runs: validate + test:integration
+bun run validate:full                      # explicit full validation and CI: validate + test:integration
 
 bun run format                             # check: oxfmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
 bun run format:write                       # apply both
@@ -117,10 +117,11 @@ bun run test:fuzz                          # random-predicate fuzz vs oracle
 bun run loop [N]                           # fuzz until failure; replay with SEED=<n>
 ```
 
-**The gates run themselves.** `bun install` points git at `.githooks/` (the `prepare` script): the
-pre-commit hook runs `bun run validate`, the pre-push hook runs `bun run validate:full`, and CI
-(`.github/workflows/validate.yml`) runs the same scripts split across its jobs. The pre-push hook
-puts `/usr/lib/postgresql/18/bin` on `PATH` itself when it finds no `initdb` there.
+**Commit checks and CI run automatically.** `bun install` points git at `.githooks/` (the
+`prepare` script): the pre-commit hook runs `bun run validate`, and CI
+(`.github/workflows/validate.yml`) runs the full validation scripts split across its jobs. There
+is no local pre-push hook. Run `bun run validate:full` explicitly when full local verification is
+needed, with PostgreSQL 18's server binaries on `PATH` as described above.
 
 **vitest does not typecheck** — it runs through esbuild, which strips types without reading them.
 `bun run typecheck` is the gate (one root `tsconfig.json` over every TS package + the test files; CI

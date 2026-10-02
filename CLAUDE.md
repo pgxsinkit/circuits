@@ -19,13 +19,14 @@ Scripts are check-default: a bare verb never changes a file (`format:write` and 
 
 ```bash
 bun run validate                           # pre-commit gate (the hook runs it): format, typecheck, lint, test
-bun run validate:full                      # pre-push gate (the hook runs it) and CI: validate + test:integration
+bun run validate:full                      # explicit full validation and CI: validate + test:integration
 bun run test                               # unit only: both crates' Rust tests + the TypeScript unit project; no Postgres
 bun run test:integration                   # engine conformance harness (boots its own Postgres) + the protocol suite
 ```
 
 The integration suites need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
-(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu). `bun install` installs the hooks.
+(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu). `bun install` installs the pre-commit hook;
+there is no local pre-push hook. CI still runs full validation.
 
 **Finishing a task that touches the engine or the log server requires `bun run validate:full` green
 — see "Testing checklist before claiming done" in AGENTS.md, which also lists the focused scripts.**

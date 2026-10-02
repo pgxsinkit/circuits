@@ -73,14 +73,17 @@ integration suites boot their own ephemeral Postgres, so they need PostgreSQL 18
 
 ```bash
 mise install
-bun install                                # also installs the git hooks
+bun install                                # also installs the pre-commit hook
 
 bun run validate                           # before a commit (the pre-commit hook runs it): format, typecheck, lint, unit tests
-bun run validate:full                      # before a push (the pre-push hook and CI run it): validate + the integration suites
+bun run validate:full                      # explicit full validation and CI: validate + the integration suites
 bun run test                               # the unit tests: both crates' Rust tests and the TypeScript tests that boot nothing
 bun run test:integration                   # the engine conformance harness and the Durable Streams protocol suite
 bun run test:fuzz                          # random predicates against the oracle
 ```
+
+There is no local pre-push hook. CI runs full validation for pull requests, pushes to `develop`,
+and release tags, and image publication requires validation to pass.
 
 The conformance invariant, asserted through the real stack: for any shape and any stream of
 operations, the set a client materialises equals what `SELECT … WHERE <predicate>` returns from a
