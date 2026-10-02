@@ -892,9 +892,8 @@ impl SubqueryRegistry {
     /// compile the predicate (discovering/refcounting nodes — fresh ones start buffering),
     /// record edges, and register a pending shape that buffers its outer-table deltas from this
     /// moment on (no delta can fall between registration and the phase-B snapshot). Returns
-    /// what phase B needs, or `Err` **without side effects** if the predicate shares a node
-    /// another in-flight create is still seeding (caller retries — evaluating against a
-    /// half-seeded set would be unsound).
+    /// what phase B needs. The engine holds subquery initialization admission through phase C or
+    /// rollback: an existing node must already be seeded before a new create can reference it.
     pub fn begin_create(
         &mut self,
         shape_id: &str,
@@ -905,8 +904,7 @@ impl SubqueryRegistry {
         changes_only: bool,
     ) -> Result<BeginCreate> {
         let outer_ts = self.schemas.get(outer_table).cloned().context("subquery shape: unknown outer table")?;
-        // Conflict pre-check: compiling refs nodes; a referenced node mid-seed belongs to a
-        // concurrent create. Compile on a scratch collector first so a conflict has no effects.
+        // Compile on a scratch collector so any compile/invariant failure has no effects.
         self.staged_edges.clear();
         self.collect_log.clear();
         let pred = match CompiledPredicate::compile_with(where_json, &outer_ts, self) {
@@ -918,14 +916,14 @@ impl SubqueryRegistry {
             }
         };
         let log = std::mem::take(&mut self.collect_log);
-        // A shared (not fresh-this-create) node still seeding ⇒ conflict: roll back and retry.
+        // A shared node still seeding means initialization admission was released too early.
+        // Fail closed rather than evaluating against incomplete membership.
         let fresh: Vec<SubquerySig> = std::mem::take(&mut self.pending_seed);
         let conflicted =
             log.iter().any(|sig| !fresh.contains(sig) && self.nodes.get(sig).is_some_and(|n| n.seed_buffer.is_some()));
         if conflicted {
-            // Put fresh sigs back for the rollback's decref cascade bookkeeping.
             self.rollback_refs(log);
-            anyhow::bail!("subquery create conflict: shares a node another create is seeding");
+            anyhow::bail!("subquery initialization invariant: shared node is still seeding");
         }
         // Fresh nodes start buffering their inner-table deltas.
         let mut seeds = Vec::with_capacity(fresh.len());
@@ -1007,9 +1005,8 @@ impl SubqueryRegistry {
     /// it stay stale for the life of the shape. Deferring is the same answer
     /// [`queue_deferred`](Self::queue_deferred) gives for a not-yet-installed shape.
     ///
-    /// Exactly ONE create can own any seeding node: [`begin_create`](Self::begin_create) refuses a
-    /// create whose compile touches a node another create is still seeding (the "create conflict"
-    /// its caller retries on), so every seeding node is fresh for one in-flight create and that
+    /// Exactly ONE create can own any seeding node: engine admission serializes initialization,
+    /// so every seeding node is fresh for one in-flight create and that
     /// create's `finish_create` is the single place this queue is handed back — or, if the create
     /// dies, the node goes and the queue with it.
     ///

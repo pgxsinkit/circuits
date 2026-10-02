@@ -74,6 +74,18 @@ export interface CoreOptions {
   fetch?: typeof fetch;
 }
 
+/** Preserve native engine refusal status across the tRPC adapter. */
+export class EngineRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfter: string | null,
+  ) {
+    super(message);
+    this.name = "EngineRequestError";
+  }
+}
+
 export function createCore(opts: CoreOptions): CircuitsCore {
   const dsUrl = opts.dsUrl.replace(/\/$/, "");
   const engineUrl = opts.engineUrl.replace(/\/$/, "");
@@ -102,7 +114,12 @@ export function createCore(opts: CoreOptions): CircuitsCore {
       ...init,
       headers: { "content-type": "application/json", ...(init.headers ?? {}) },
     });
-    if (!res.ok) throw new Error(`engine ${path} -> ${res.status}: ${await res.text()}`);
+    if (!res.ok)
+      throw new EngineRequestError(
+        `engine ${path} -> ${res.status}: ${await res.text()}`,
+        res.status,
+        res.headers.get("retry-after"),
+      );
     return (await res.json()) as T;
   }
 

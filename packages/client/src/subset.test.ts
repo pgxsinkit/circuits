@@ -3,7 +3,7 @@
 // `docs/ARCHITECTURE.md` §7 (subset queries and client positioning).
 // Plus subscription lifecycle (one-shot close, feed cleanup on error) against a fake tRPC.
 
-import type { Row, Schema } from "@circuits/protocol";
+import type { Row, Schema, StreamEnvelope } from "@circuits/protocol";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -13,14 +13,39 @@ import {
   lsnToU64,
   makeCmp,
   mergeFeedDelta,
+  pageIncludes,
+  pageSupersedes,
+  parsePageSnapshot,
   startLeaseRenewal,
+  trackPageSnapshot,
+  xid32,
   type SubsetDeps,
   type SubsetView,
 } from "./subset.js";
 
-// The lifecycle tests never need a real durable stream; an empty tail is enough.
+const fakeFeed = vi.hoisted(() => ({ queue: [] as StreamEnvelope[], wake: undefined as (() => void) | undefined }));
+
+// Drive the collection's actual tail for page/live races; lifecycle tests leave it empty.
 vi.mock("@durable-streams/client", () => ({
-  stream: async () => ({ jsonStream: async function* () {} }),
+  stream: async ({ signal }: { signal: AbortSignal }) => ({
+    jsonStream: async function* () {
+      while (!signal.aborted) {
+        if (fakeFeed.queue.length === 0) {
+          await new Promise<void>((resolve) => {
+            const wake = () => {
+              signal.removeEventListener("abort", wake);
+              resolve();
+            };
+            fakeFeed.wake = wake;
+            signal.addEventListener("abort", wake, { once: true });
+          });
+        }
+        if (signal.aborted) break;
+        const env = fakeFeed.queue.shift();
+        if (env) yield env;
+      }
+    },
+  }),
 }));
 
 type Env = Parameters<typeof mergeFeedDelta>[1];
@@ -153,13 +178,13 @@ describe("mergeFeedDelta — LSN positioning", () => {
     expect(view.present.has("1")).toBe(false);
     // The watermark survives as a tombstone: absent + watermark w = "deleted at ≥ w".
     expect(view.applied.get("1")).toBe(D);
-    // The loadMore guard (`pageLsn < w` → skip) then drops a page snapshotted before the delete…
+    // The loadMore guard (`pageSupersedes`) then drops a page snapshotted before the delete…
     const stalePageLsn = lsnToU64("0/120")!;
-    const w = view.applied.get("1");
-    expect(w !== undefined && stalePageLsn < w).toBe(true); // row stays deleted
+    const w = view.applied.get("1")!;
+    expect(pageSupersedes(stalePageLsn, w, undefined)).toBe(false); // row stays deleted
     // …while a page at/after the delete (row genuinely re-created) is admitted.
     const freshPageLsn = lsnToU64("0/160")!;
-    expect(w !== undefined && freshPageLsn < w).toBe(false);
+    expect(pageSupersedes(freshPageLsn, w, undefined)).toBe(true);
   });
 
   it("records a tombstone for a delete of a never-seen pk (no write, but no ghost from a stale page)", () => {
@@ -189,6 +214,143 @@ describe("mergeFeedDelta — LSN positioning", () => {
     });
     expect(mergeFeedDelta(view, upsert(2, undefined))).toEqual({ type: "insert", value: { id: 2 } });
     expect(mergeFeedDelta(view, del(2, undefined))).toEqual({ type: "delete", key: "2" });
+  });
+});
+
+function txn(env: Env, txid: string): Env {
+  return { ...env, headers: { ...env.headers, txid } };
+}
+
+/**
+ * A view seeded from a page whose snapshot is `snapshot` (`xmin:xmax:xip`), read at LSN 0/100 with
+ * insert horizon 0/180 — the fields a newer engine returns with every page.
+ */
+function viewWithSnapshot(pageIds: number[], snapshot: string): SubsetView {
+  const snap = parsePageSnapshot("0/100", snapshot, "0/180")!;
+  const view: SubsetView = {
+    snapshotLsn: snap.lsn,
+    snapshot: snap,
+    present: new Set(pageIds.map(String)),
+    applied: new Map(pageIds.map((id) => [String(id), snap])),
+    appliedTxid: new Map(),
+    inView: () => true,
+  };
+  return view;
+}
+
+describe("page snapshot positioning (transaction visibility, not LSN order)", () => {
+  // T (xid 105) committed at 0/90 — BELOW the page LSN 0/100 — but was still invisible when the
+  // page snapshot was taken (a commit is flushed and decoded before it becomes visible), so it is in
+  // the snapshot's xip and missing from the page.
+  const S = "100:110:105";
+
+  it("applies an insert whose commit LSN is below the page LSN when its transaction was not visible", () => {
+    const view = viewWithSnapshot([], S);
+    expect(mergeFeedDelta(view, txn(upsert(1, "0/90"), "105"))).toEqual({ type: "insert", value: { id: 1 } });
+  });
+
+  it("applies an update to a loaded row when its transaction was not visible to the page", () => {
+    const view = viewWithSnapshot([1], S);
+    expect(mergeFeedDelta(view, txn(upsert(1, "0/90", { n: 10 }), "105"))).toEqual({
+      type: "update",
+      value: { id: 1, n: 10 },
+    });
+    // …and its version is now that change, so a re-delivery of an older change stays dropped.
+    expect(view.applied.get("1")).toBe(lsnToU64("0/90"));
+    expect(mergeFeedDelta(view, txn(upsert(1, "0/80", { n: 5 }), "104"))).toBeNull();
+  });
+
+  it("drops a change the page already reflects, whatever its LSN relative to the page LSN", () => {
+    const view = viewWithSnapshot([1], S);
+    // xid 104 was visible (in [xmin, xmax), not in xip) although it committed at 0/120 >= 0/100.
+    expect(mergeFeedDelta(view, txn(upsert(1, "0/120"), "104"))).toBeNull();
+    expect(mergeFeedDelta(view, txn(upsert(2, "0/120"), "104"))).toBeNull();
+    // started after the snapshot
+    expect(mergeFeedDelta(view, txn(upsert(1, "0/120", { n: 1 }), "110"))).toEqual({
+      type: "update",
+      value: { id: 1, n: 1 },
+    });
+  });
+
+  it("never treats a change at or past the horizon as already in the page, and stops consulting it", () => {
+    const view = viewWithSnapshot([1], S);
+    expect(pageIncludes(view.snapshot!, lsnToU64("0/17F"), "99")).toBe(true);
+    expect(pageIncludes(view.snapshot!, lsnToU64("0/180"), "99")).toBe(false);
+    expect(mergeFeedDelta(view, txn(upsert(3, "0/180"), "99"))).toEqual({ type: "insert", value: { id: 3 } });
+    expect(view.snapshot!.passed).toBe(true);
+  });
+
+  it("compares xids modulo 2^32 across an epoch boundary (xid8 values are masked like the envelope txid)", () => {
+    // xmin 2^32-6, xmax 2^32+4, in progress 2^32+3.
+    const snap = parsePageSnapshot("0/100", "4294967290:4294967300:4294967299", "0/180")!;
+    expect(pageIncludes(snap, lsnToU64("0/90"), "4294967294")).toBe(true);
+    expect(pageIncludes(snap, lsnToU64("0/90"), "2")).toBe(true); // 2^32+2
+    expect(pageIncludes(snap, lsnToU64("0/90"), "3")).toBe(false); // in progress
+    expect(pageIncludes(snap, lsnToU64("0/90"), "5")).toBe(false); // after the snapshot, not "before xmin"
+  });
+
+  it("falls back to LSN positioning for an engine without snapshot fields, and for a change without a txid", () => {
+    expect(parsePageSnapshot("0/100", undefined, undefined)).toBeNull();
+    expect(parsePageSnapshot("0/100", "1:2:", "garbage")).toBeNull();
+    const snap = parsePageSnapshot("0/100", S, "0/180")!;
+    expect(pageIncludes(snap, lsnToU64("0/90"), undefined)).toBe(true);
+    expect(pageIncludes(snap, lsnToU64("0/110"), undefined)).toBe(false);
+  });
+
+  it("lets a loadMore page replace a live change only if the page includes that change", () => {
+    const view = viewWithSnapshot([], S);
+    mergeFeedDelta(view, txn(upsert(1, "0/90", { n: 10 }), "105"));
+    const w = view.applied.get("1")!;
+    const txid = view.appliedTxid!.get("1");
+    // A page whose snapshot still had 105 in progress is older than the view's row.
+    expect(pageSupersedes(parsePageSnapshot("0/200", "100:120:105", "0/210")!, w, txid)).toBe(false);
+    // One that saw 105 committed may replace it.
+    expect(pageSupersedes(parsePageSnapshot("0/200", "106:120:", "0/210")!, w, txid)).toBe(true);
+  });
+});
+
+describe("xid parsing and per-change bookkeeping", () => {
+  it("parses decimal xids modulo 2^32 without regex or BigInt, exactly as the masked xid8 compare did", () => {
+    expect(xid32("0")).toBe(0);
+    expect(xid32("105")).toBe(105);
+    expect(xid32("4294967295")).toBe(4294967295);
+    expect(xid32("4294967296")).toBe(0);
+    expect(xid32("4294967300")).toBe(4);
+    // xid8 values of any epoch, up to the 20-digit maximum, reduce like `BigInt(text) & 0xffffffffn`.
+    for (const text of ["123456789012345", "1234567890123456", "98765432109876543", "18446744073709551615"]) {
+      expect(xid32(text)).toBe(Number(BigInt(text) & 0xffffffffn));
+    }
+    for (const bad of ["", " 1", "1 ", "+1", "-1", "1e3", "0x10", "12a"]) expect(xid32(bad)).toBeNull();
+  });
+
+  it("records a live change's transaction as a number", () => {
+    const view = viewWithSnapshot([], "100:110:105");
+    mergeFeedDelta(view, txn(upsert(1, "0/190"), "4294967401"));
+    expect(view.appliedTxid!.get("1")).toBe(105);
+    mergeFeedDelta(view, upsert(1, "0/1A0"));
+    expect(view.appliedTxid!.has("1"), "a change without a txid leaves none behind").toBe(false);
+  });
+
+  it("marks a loadMore page snapshot passed, and drops its xip, once the tail reaches its horizon", () => {
+    const view = viewWithSnapshot([1], "100:110:105");
+    view.pending = [];
+    // A loadMore page read later, with its own snapshot and a later horizon.
+    const later = parsePageSnapshot("0/200", "106:120:107,108,109", "0/280")!;
+    view.applied.set("2", later);
+    view.present.add("2");
+    trackPageSnapshot(view, later);
+    // Below the loadMore horizon: consulted (107 was in progress for that page, so it applies).
+    expect(mergeFeedDelta(view, txn(upsert(2, "0/220", { n: 1 }), "107"))).toEqual({
+      type: "update",
+      value: { id: 2, n: 1 },
+    });
+    expect(later.passed).toBeUndefined();
+    expect(view.snapshot!.passed, "the first page was passed on the way").toBe(true);
+    // At its horizon: retired for good.
+    mergeFeedDelta(view, txn(upsert(9, "0/280"), "130"));
+    expect(later.passed).toBe(true);
+    expect(later.xip.size).toBe(0);
+    expect(view.pending).toEqual([]);
   });
 });
 
@@ -250,6 +412,230 @@ describe("createSubset lifecycle", () => {
   });
 });
 
+describe("loadMore", () => {
+  it("retained updates replay in commit order and cannot overwrite a newer accepted page row", async () => {
+    let first = true;
+    let answer: ((page: unknown) => void) | undefined;
+    const trpc = {
+      subset: {
+        live: {
+          mutate: async () => ({
+            shapeId: "feed-order",
+            streamPath: "streams/feed-order",
+            streamUrl: "http://127.0.0.1:9/streams/feed-order",
+          }),
+        },
+        query: {
+          query: async () => {
+            if (first) {
+              first = false;
+              return { rows: [{ id: 1, title: "first" }], lsn: "0/1", snapshot: "100:100:", horizon: "0/2" };
+            }
+            return new Promise((resolve) => {
+              answer = resolve;
+            });
+          },
+        },
+      },
+      shapes: { delete: { mutate: async () => ({ ok: true }) } },
+    };
+    const sub = await createSubset(
+      { trpc: trpc as unknown as SubsetDeps["trpc"], schema: testSchema, resolveStreamUrl: (h) => h.streamUrl },
+      { table: "issues", limit: 1 },
+    );
+    try {
+      const loading = sub.loadMore(2);
+      await vi.waitFor(() => expect(answer).toBeDefined());
+      // Map insertion order is A,B; the newest A@10 must not make B@6 appear
+      // newer than a page that already contains a later B@7.
+      for (const [id, title, lsn, txid] of [
+        [2, "A5", "0/5", "101"],
+        [3, "B6", "0/6", "102"],
+        [2, "A10", "0/A", "104"],
+      ] as const) {
+        fakeFeed.queue.push({
+          type: "public.issues",
+          key: String(id),
+          value: { id, title },
+          headers: { operation: "upsert", lsn, txid },
+        });
+      }
+      fakeFeed.wake?.();
+      await vi.waitFor(() => expect(fakeFeed.queue).toHaveLength(0));
+      answer!({
+        rows: [
+          { id: 2, title: "A5" },
+          { id: 3, title: "B7" },
+        ],
+        lsn: "0/7",
+        snapshot: "104:104:",
+        horizon: "0/8",
+      });
+      await loading;
+      expect(
+        (sub.collection.toArray as unknown as Row[]).filter((r) => r.id !== 1).map(({ id, title }) => ({ id, title })),
+      ).toEqual([
+        { id: 2, title: "A10" },
+        { id: 3, title: "B7" },
+      ]);
+    } finally {
+      await sub.close();
+    }
+  });
+
+  it("retains an unseen live upsert while a stale page expands the loaded window", async () => {
+    let first = true;
+    let answer: ((page: unknown) => void) | undefined;
+    const fences = { lsn: "0/100", snapshot: "100:110:105", horizon: "0/200" };
+    const trpc = {
+      subset: {
+        live: {
+          mutate: async () => ({
+            shapeId: "feed-race",
+            streamPath: "streams/feed-race",
+            streamUrl: "http://127.0.0.1:9/streams/feed-race",
+          }),
+        },
+        query: {
+          query: async () => {
+            if (first) {
+              first = false;
+              return { rows: [{ id: 1, title: "first" }], ...fences };
+            }
+            return new Promise((resolve) => {
+              answer = resolve;
+            });
+          },
+        },
+      },
+      shapes: { delete: { mutate: async () => ({ ok: true }) } },
+    };
+    const deps: SubsetDeps = {
+      trpc: trpc as unknown as SubsetDeps["trpc"],
+      schema: testSchema,
+      resolveStreamUrl: (h) => h.streamUrl,
+    };
+    const sub = await createSubset(deps, { table: "issues", limit: 1 });
+    try {
+      const pending = sub.loadMore(2);
+      await vi.waitFor(() => expect(answer).toBeDefined());
+      fakeFeed.queue.push({
+        type: "public.issues",
+        key: "3",
+        value: { id: 3, title: "live" },
+        headers: { operation: "upsert", lsn: "0/F0", txid: "105" },
+      });
+      fakeFeed.wake?.();
+      await vi.waitFor(() => expect(fakeFeed.queue).toHaveLength(0));
+      // id3 is outside the current boundary. Its commit record predates the page LSN,
+      // but xid105 is invisible to that snapshot, so the page image remains stale.
+      answer!({
+        rows: [
+          { id: 2, title: "second" },
+          { id: 3, title: "stale" },
+        ],
+        ...fences,
+      });
+      await pending;
+      expect((sub.collection.toArray as unknown as Row[]).find((r) => r.id === 3)?.title).toBe("live");
+    } finally {
+      await sub.close();
+    }
+  });
+
+  it("overlapping calls whose responses return in reverse order never regress a row to the older page", async () => {
+    // Rows 1..4. Row 3 reads 'old' in a snapshot taken before transaction 101 and 'new' in one after.
+    type State = { snapshot: string; title3: string };
+    const before: State = { snapshot: "101:101:", title3: "old" };
+    const after: State = { snapshot: "102:102:", title3: "new" };
+    const page = (st: State, past: number, limit: number) => ({
+      rows: [1, 2, 3, 4]
+        .filter((id) => id > past)
+        .slice(0, limit)
+        .map((id) => ({ id, title: id === 3 ? st.title3 : `t${id}` })),
+      lsn: "0/100",
+      snapshot: st.snapshot,
+      horizon: "0/200",
+    });
+    // Every loadMore request is held until the test answers it with a snapshot of its choosing.
+    const requests: Array<{ past: number; answered: boolean; answer: (st: State) => void }> = [];
+    let first = true;
+    const trpc = {
+      subset: {
+        live: {
+          mutate: async () => ({
+            shapeId: "feed-1",
+            streamPath: "streams/feed-1",
+            streamUrl: "http://127.0.0.1:9/streams/feed-1",
+          }),
+        },
+        query: {
+          query: (input: { where?: { col?: string; op?: string; value?: unknown }; limit: number }) => {
+            if (first) {
+              first = false;
+              return Promise.resolve(page(before, 0, input.limit));
+            }
+            const past = Number(input.where?.value); // the keyset cursor: `id > boundary`
+            return new Promise((resolve) => {
+              const request = {
+                past,
+                answered: false,
+                answer: (st: State) => ((request.answered = true), resolve(page(st, past, input.limit))),
+              };
+              requests.push(request);
+            });
+          },
+        },
+      },
+      shapes: { delete: { mutate: async () => ({ ok: true as const }) } },
+    };
+    const deps: SubsetDeps = {
+      trpc: trpc as unknown as SubsetDeps["trpc"],
+      schema: testSchema,
+      resolveStreamUrl: (h) => h.streamUrl,
+    };
+    const sub = await createSubset(deps, { table: "issues", limit: 2 });
+    const flush = async () => {
+      for (let i = 0; i < 10; i++) await new Promise((r) => setTimeout(r, 0));
+    };
+    const title3 = () => (sub.collection.toArray as unknown as Row[]).find((r) => Number(r.id) === 3)?.title;
+    const shown: unknown[] = [];
+
+    const a = sub.loadMore();
+    const b = sub.loadMore();
+    await flush();
+    // Reversed: every request after the first is answered (newest first) from the later snapshot,
+    // before the first is answered from the earlier one; anything issued after that sees the later.
+    for (let i = requests.length - 1; i >= 1; i--) {
+      requests[i]!.answer(after);
+      await flush();
+      shown.push(title3());
+    }
+    requests[0]!.answer(before);
+    await flush();
+    shown.push(title3());
+    for (let i = 1; i < requests.length; i++) {
+      if (requests[i]!.answered) continue;
+      requests[i]!.answer(after);
+      await flush();
+      shown.push(title3());
+    }
+    await Promise.all([a, b]);
+
+    // Once the view has shown a row from a later snapshot, an earlier page never replaces it.
+    const firstNew = shown.indexOf("new");
+    expect(firstNew === -1 ? [] : shown.slice(firstNew), `row 3 as the view showed it: ${shown.join(" → ")}`).toEqual(
+      firstNew === -1 ? [] : shown.slice(firstNew).map(() => "new"),
+    );
+    // The calls ran one after the other: the second asked for the page after the first's.
+    expect(requests.map((r) => r.past)).toEqual([2, 4]);
+    expect((sub.collection.toArray as unknown as Row[]).map((r) => Number(r.id)).sort((a, b) => a - b)).toEqual([
+      1, 2, 3, 4,
+    ]);
+    await sub.close();
+  });
+});
+
 describe("deleteShapeWithRetry", () => {
   it('treats "not found" as success (shape already dropped) without retrying', async () => {
     let calls = 0;
@@ -289,11 +675,11 @@ describe("window ordering agrees with the engine, not with UTF-16", () => {
     // The reproduction: JavaScript's `<` compares UTF-16 code units, so the emoji's leading
     // surrogate (D83D) sorts before U+E000 — while PostgreSQL, the engine's evaluator and this
     // comparator all put U+1F600 after it.
-    const emoji = "\u{1F600}";
-    const privateUse = "\uE000";
+    const emoji = String.fromCodePoint(0x1f600);
+    const privateUse = String.fromCodePoint(0xe000);
     expect(emoji < privateUse).toBe(true);
-    expect(cmpCodePoints(privateUse, emoji)).toBeLessThan(0);
-    expect(cmpCodePoints(emoji, privateUse)).toBeGreaterThan(0);
+    expect(cmpCodePoints("\uE000", "\u{1F600}")).toBeLessThan(0);
+    expect(cmpCodePoints("\u{1F600}", "\uE000")).toBeGreaterThan(0);
   });
 
   it("is a total order: equality, prefixes, and the ordinary ASCII case", () => {

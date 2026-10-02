@@ -294,7 +294,10 @@ The fence is therefore **transaction visibility** (`pg::SnapshotGate`): the back
 captures `pg_current_snapshot()` (xmin / xmax / in-progress xids) in the same statement that
 establishes the snapshot, and the engine skips a replicated change **iff its xid was visible to that
 snapshot** (every xid seen on the slot is committed, so visibility is `xid < xmin`, or
-`xmin ≤ xid < xmax` and not in the in-progress list). Changes without a parseable xid (library mode)
+`xmin ≤ xid < xmax` and not in the in-progress list, using PostgreSQL's modular xid ordering).
+The same statement captures `pg_current_wal_insert_lsn()` as a horizon: a commit at or beyond it
+cannot be skipped, even if a long-lived gate encounters a reused xid after wraparound.
+Changes without a parseable xid (library mode)
 fall back to the strict-`<` LSN comparison. Every seeded structure — routed shapes, standalone shapes,
 aggregations, subquery nodes, subquery shapes — carries its own gate; `changes_only` feeds carry a
 passthrough gate (no backfill ⇒ forward everything).
@@ -305,9 +308,19 @@ text-mode tuples
 prints — rather than `to_jsonb`'s (which would make the same timestamp compare unequal between a
 backfilled row and its first live update).
 
-_Known residual:_ the **client-side subset seam** (§7) still positions by LSN watermarks; the same
-visibility window theoretically applies to a subset page's snapshot vs its live tail and would need
-the page query-back to also return the snapshot's xid list. Engine-maintained state is fully fenced.
+**Snapshots must also include work already sequenced before registration.** A commit can have
+reached the sequencer before `BeginShape` or the subset feed's captured HEAD while still being
+invisible to Postgres snapshots. No later pending buffer or live tail can recover that gap. The
+sequencer therefore records transaction IDs per touched table before fan-out. Each read captures
+that record before opening its snapshot, including every table referenced by its predicate.
+If the snapshot excludes a recorded transaction, it rolls back, releases its pooled connection,
+and waits for a shared visibility poller on a dedicated connection. It then takes one fresh
+snapshot. The live buffer covers changes sequenced after the original pairing point.
+
+The wait and request admission are bounded. The record uses sparse xid bitmaps; overflow retains
+per-table refusal fences until visibility is safe, rather than silently forgetting required work.
+Unsettled reads return a retryable 503, preserved through the tRPC API. Subset pages carry the
+snapshot and WAL horizon to the client, which uses the same visibility rule (§7).
 
 ---
 
@@ -574,6 +587,13 @@ sequencer feeds every table's deltas into:
   the registry across every await of the install, so a client disconnect anywhere in phase C —
   including after some node seeds have reached the membership circuit — leaves a pending entry the
   detached rollback unwinds exactly, retracting the partial seed with it.
+  Explicit error cleanup uses the same detached task ownership: cancelling a request while it is
+  awaiting rollback cannot abandon the remaining cleanup. A failed join releases its provisional
+  subscription through an owned task for the same reason.
+- **Initialization admission** — one subquery initializer owns an admission guard through phase C
+  or completed rollback. Other creates wait without holding the registry lock, so replication and
+  flip propagation continue while a slow seed finishes. Cancellation transfers the admission guard
+  to cleanup; the next initializer cannot reuse a partially retracted inner node.
 
 ---
 
@@ -675,16 +695,20 @@ natively by Postgres) + a **shared** `changes_only` live feed for the base predi
 _only_ here — they are never live-tailed, so a change is matched against one base predicate, never
 split across ranges. `orderBy`/`limit` are subset knobs, not shape knobs.
 
-The client (`packages/client/src/subset.ts`) merges the page(s) and the live tail by **per-pk LSN
-watermarks**: the page's snapshot LSN, and each applied delta's commit LSN. Engine output envelopes
-carry their commit LSN for exactly this. Key invariants (all regression-tested):
+The client (`packages/client/src/subset.ts`) merges pages and the live tail using **snapshot
+visibility and per-key live versions**. Each page carries `snapshot`, `horizon`, and `lsn`;
+live envelopes carry transaction IDs and commit LSNs. The LSN-only comparison remains the fallback
+when transaction visibility is unavailable. Key invariants:
 
-- The feed is created and its head offset captured **before** the page snapshot, so no delta can fall
-  in the gap; overlap reconciles idempotently by pk (`delta lsn ≥ snapshot lsn` applies; the engine's
-  backfill-visible side is strictly below).
+- The feed is created and its head offset captured **before** the settled page snapshot. A live
+  change is skipped only when the relevant page already sees it; an invisible transaction applies
+  even when its commit LSN precedes the page's WAL position.
 - **Deletes leave tombstone watermarks** (including for pks never seen): a `loadMore` page whose
   snapshot predates a delete must not resurrect the row / insert a ghost. Tombstones prune when no
   page is in flight.
+- An unseen row updated outside the loaded window still retains its live version while a page is
+  in flight, preventing that page from installing an older value. `loadMore()` calls are serialized
+  so each uses the preceding page's cursor and an older response cannot replace a newer snapshot.
 - Close is one-shot; the feed is deleted with retries; a failed page query-back deletes the
   just-created feed before rethrowing (no refcount pinning).
 

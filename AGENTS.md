@@ -173,6 +173,11 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   visible to that snapshot. `commit_lsn < seed_lsn` is only the fallback for changes without an xid.
   If you add a read path, use the gate. (Why: a commit's WAL record exists before it becomes
   snapshot-visible; LSN comparison drops rows in that window and duplicates at the boundary.)
+  Use modular xid comparison and the snapshot's WAL insertion horizon to handle xid wrap.
+  Open reads through the settled-snapshot path: capture the sequenced-xid record for every
+  dependent table before opening the snapshot, release pooled connections while waiting for
+  visibility, and retain retryable refusal on record overflow. The gate alone cannot recover a
+  transaction already sequenced before a shape's registration or a subset feed's captured HEAD.
 - **Ingest is at-least-once; consumers restore exactly-once effect.** The ingestor stamps
   `(commit lsn, xid, seq)`; the sequencer de-duplicates by `(lsn, seq)`. Aggregates and subquery contributor
   weights are NOT idempotent under duplicates — never bypass the highwater.
@@ -336,6 +341,10 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
   refcounts/edges, stream) rolls back and the error propagates — including to joiners waiting on the
   share's ready-watch. Never leave a signature pointing at a dead stream.
+  Explicit rollback must transfer cleanup to an owned task before disarming its guard: cancelling
+  the caller during cleanup must not abandon it. This also applies to provisional join claims.
+  A subquery initializer holds its admission guard through phase C or completed rollback, without
+  holding the registry lock across the seed; cancelled cleanup owns the guard until it finishes.
 - **Sharing lifecycle:** equal shapes share one id+stream, held by a SET of named subscriptions; N
   joiners each release exactly once. The final release does NOT delete anything: the shape stays
   active/warm and is retired by the retention lifecycle (idle → dormant → evicted;

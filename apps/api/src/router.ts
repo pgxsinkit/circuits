@@ -3,13 +3,40 @@
 import { initTRPC, TRPCError } from "@trpc/server";
 import { z } from "zod";
 
-import type { CircuitsCore } from "./core.js";
+import { type CircuitsCore, EngineRequestError } from "./core.js";
 
 export interface Context {
   core: CircuitsCore;
 }
 
-const t = initTRPC.context<Context>().create();
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        retryAfter: error.cause instanceof EngineRequestError ? error.cause.retryAfter : null,
+      },
+    };
+  },
+});
+
+const procedure = t.procedure.use(async ({ next }) => {
+  const result = await next();
+  if (!result.ok && result.error.cause instanceof EngineRequestError) {
+    const cause = result.error.cause;
+    const code =
+      cause.status === 503
+        ? "SERVICE_UNAVAILABLE"
+        : cause.status === 400
+          ? "BAD_REQUEST"
+          : cause.status === 409
+            ? "CONFLICT"
+            : "INTERNAL_SERVER_ERROR";
+    throw new TRPCError({ code, message: cause.message, cause });
+  }
+  return result;
+});
 
 const valueSchema = z.union([z.number(), z.string(), z.boolean(), z.null()]);
 const rowSchema = z.record(z.string(), valueSchema);
@@ -44,14 +71,14 @@ const predicateSchema: z.ZodType = z.lazy(() =>
 
 export const appRouter = t.router({
   schema: t.router({
-    define: t.procedure.input(z.object({ schema: schemaSchema })).mutation(async ({ input, ctx }) => {
+    define: procedure.input(z.object({ schema: schemaSchema })).mutation(async ({ input, ctx }) => {
       await ctx.core.defineSchema(input.schema as Parameters<CircuitsCore["defineSchema"]>[0]);
       return { ok: true as const };
     }),
   }),
 
   ingest: t.router({
-    write: t.procedure
+    write: procedure
       .input(
         z.object({
           table: z.string(),
@@ -68,7 +95,7 @@ export const appRouter = t.router({
     // `subscription` names the caller's claim (ADR-0008). Repeating a create with the same id
     // renews it and returns the same handle, so a create is safe to retry after an ambiguous
     // failure; a delete carrying it releases exactly that claim, so a delete is too.
-    create: t.procedure
+    create: procedure
       .input(
         z.object({
           table: z.string(),
@@ -84,13 +111,13 @@ export const appRouter = t.router({
         ),
       ),
 
-    get: t.procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
+    get: procedure.input(z.object({ id: z.string() })).query(async ({ input, ctx }) => {
       const handle = await ctx.core.getShape(input.id);
       if (!handle) throw new TRPCError({ code: "NOT_FOUND", message: `shape ${input.id} not found` });
       return handle;
     }),
 
-    delete: t.procedure
+    delete: procedure
       .input(z.object({ id: z.string(), subscription: z.string().min(1).max(128).optional() }))
       .mutation(async ({ input, ctx }) => {
         await ctx.core.dropShape(input.id, input.subscription);
@@ -103,7 +130,7 @@ export const appRouter = t.router({
   // `live` opens a changes-only tail feed on the base predicate that the client follows to keep a
   // loaded page live (re-checking view membership client-side) — a single predicate, no range fanout.
   subset: t.router({
-    query: t.procedure
+    query: procedure
       .input(
         z.object({
           table: z.string(),
@@ -125,7 +152,7 @@ export const appRouter = t.router({
         }),
       ),
 
-    live: t.procedure
+    live: procedure
       .input(
         z.object({
           table: z.string(),
@@ -145,7 +172,7 @@ export const appRouter = t.router({
   // Scalar aggregations (COUNT/SUM/AVG/MIN/MAX) over a filter — a Circuits extension, maintained
   // incrementally by the engine and streamed as a single live value.
   aggregate: t.router({
-    create: t.procedure
+    create: procedure
       .input(
         z.object({
           table: z.string(),

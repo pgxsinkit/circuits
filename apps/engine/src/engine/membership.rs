@@ -64,11 +64,19 @@ pub(crate) async fn query_rows_by_col(
     value: &Value,
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
-    let client = crate::pg::pool_for(url).get().await?;
+    let mut client = crate::pg::pool_for(url).get().await?;
     let where_sql = value_eq_sql(&ts.columns[col].0, value, ts.pg_types.get(col).and_then(|o| o.as_deref()));
     // `collect`, deliberately: a query-back's RESULT is the candidate set — there is no stream to
     // append it to, and it is one key's worth of rows, not a table's.
-    let (rows, fences) = crate::pg::backfill_where_reader(&client, ts, Some(where_sql)).await?.collect().await?;
+    let (rows, fences) = crate::pg::backfill_where_reader(
+        &mut client,
+        ts,
+        Some(where_sql),
+        &crate::pg::SettleScope::internal(&ts.table),
+    )
+    .await?
+    .collect()
+    .await?;
     Ok((rows, fences.gate))
 }
 
@@ -79,9 +87,13 @@ pub(crate) async fn query_rows_all(
     ts: &TableSchema,
 ) -> Result<(Vec<Row>, crate::pg::SnapshotGate)> {
     let url = pg_url.as_deref().context("membership query-back requires postgres")?;
-    let client = crate::pg::pool_for(url).get().await?;
+    let mut client = crate::pg::pool_for(url).get().await?;
     // `collect`: a full re-derive's result IS the in-memory candidate set (see `query_rows_by_col`).
-    let (rows, fences) = crate::pg::backfill_where_reader(&client, ts, None).await?.collect().await?;
+    let (rows, fences) =
+        crate::pg::backfill_where_reader(&mut client, ts, None, &crate::pg::SettleScope::internal(&ts.table))
+            .await?
+            .collect()
+            .await?;
     Ok((rows, fences.gate))
 }
 

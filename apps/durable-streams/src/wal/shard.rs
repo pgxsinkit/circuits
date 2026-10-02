@@ -1012,7 +1012,10 @@ impl Shard {
             return Ok(0);
         }
         let mut cache = self.tails_cache.lock().unwrap();
-        let map = cache.get_or_insert_with(|| Self::read_durable_tails_at(&self.dir));
+        if cache.is_none() {
+            *cache = Some(Self::read_durable_tails_at(&self.dir)?);
+        }
+        let map = cache.as_mut().unwrap();
         for &(id, tail) in touched {
             let slot = map.entry(id).or_insert(0);
             *slot = (*slot).max(tail);
@@ -1050,28 +1053,43 @@ impl Shard {
 
     /// Read the persisted per-shard durable-tail map from `<dir>/tails`. Returns
     /// an empty map when the file is absent (no checkpoint recorded tails yet).
-    /// Malformed lines are skipped (defensive; the file is only written by
-    /// `persist_durable_tails`).
-    fn read_durable_tails_at(dir: &Path) -> HashMap<u64, u64> {
+    /// Every other read/parse failure is fatal: discarding a durability proof
+    /// can truncate acknowledged bytes whose WAL records were recycled.
+    fn read_durable_tails_at(dir: &Path) -> io::Result<HashMap<u64, u64>> {
         let mut map = HashMap::new();
-        if let Ok(s) = std::fs::read_to_string(dir.join(TAILS_FILE)) {
-            for line in s.lines() {
-                let mut it = line.split_whitespace();
-                if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                    if let (Ok(id), Ok(tail)) = (a.parse::<u64>(), b.parse::<u64>()) {
-                        map.insert(id, tail);
-                    }
-                }
+        let path = dir.join(TAILS_FILE);
+        let s = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(map),
+            Err(e) => {
+                return Err(io::Error::new(e.kind(), format!("cannot read durable tails {}: {e}", path.display())))
+            }
+        };
+        let malformed = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt durable tails {} (WAL left intact)", path.display()),
+            )
+        };
+        if !s.is_empty() && !s.ends_with('\n') {
+            return Err(malformed());
+        }
+        for line in s.lines() {
+            let mut it = line.split_whitespace();
+            let id: u64 = it.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
+            let tail: u64 = it.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
+            if it.next().is_some() || map.insert(id, tail).is_some() {
+                return Err(malformed());
             }
         }
-        map
+        Ok(map)
     }
 
     /// Public reader for recovery: the persisted per-stream durable-tail map for
     /// this shard (task 11b). Empty when no checkpoint has recorded tails. Recovery
     /// seeds each stream's frontier from this map so a stream whose WAL records were
     /// all recycled still has its torn per-stream-file tail truncated.
-    pub fn read_durable_tails(&self) -> HashMap<u64, u64> {
+    pub fn read_durable_tails(&self) -> io::Result<HashMap<u64, u64>> {
         Self::read_durable_tails_at(&self.dir)
     }
 

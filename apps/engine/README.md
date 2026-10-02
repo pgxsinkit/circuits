@@ -33,6 +33,37 @@ The engine prints two discovery lines to **stdout** (logs go to stderr), in this
 
 ## Environment
 
+Log-server HTTP attempts have finite deadlines, including response-body reads. The settings below
+accept positive whole seconds; zero or an invalid value keeps the default. Set the live-read
+deadline above the log server's configured long-poll wait.
+
+| Variable                             | Default | Meaning                                                                                                                                |
+| ------------------------------------ | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `CIRCUITS_DS_CONNECT_TIMEOUT_SECS`   | `10`    | Connection establishment deadline.                                                                                                     |
+| `CIRCUITS_DS_READ_TIMEOUT_SECS`      | `30`    | Maximum wait for progress on an ordinary response.                                                                                     |
+| `CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS` | `45`    | Maximum wait for progress on a live long-poll response.                                                                                |
+| `CIRCUITS_DS_REQUEST_TIMEOUT_SECS`   | `60`    | Whole ordinary request deadline, including the body. Live requests use the greater of this and the live-read deadline plus 15 seconds. |
+
+Timeouts remain retryable transport failures. These deadlines do not impose a response-size cap;
+an indivisible JSON value remains readable even when it exceeds the log server's page target.
+
+Snapshots settle against transaction IDs the sequencer already delivered, scoped to every table
+the read depends on. Waiting requests release their pooled connection; a dedicated Postgres
+connection polls visibility. These settings bound the wait and tracking memory:
+
+| Variable                               | Default    | Meaning                                                                                                                                                                                                                              |
+| -------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `CIRCUITS_SNAPSHOT_SETTLE_TIMEOUT_MS`  | `10000`    | Visibility wait and pool reacquisition budget. `0` refuses an unsettled snapshot without waiting.                                                                                                                                    |
+| `CIRCUITS_SNAPSHOT_SETTLE_MAX_WAITERS` | `0`        | Concurrent request-driven waits per pool. `0` selects one quarter of the pool, at least one. Internal reads remain time-bounded but bypass request admission.                                                                        |
+| `CIRCUITS_SNAPSHOT_SETTLE_MAX_XIDS`    | `16777216` | Sparse bitmap capacity in dense-xid units, enforced on 1024-xid chunks; roughly 2 MiB of bitmap payload at the default plus bookkeeping. Range: `1048576`–`1073741824`. Overflow fences affected tables until visibility catches up. |
+| `CIRCUITS_SNAPSHOT_SETTLE_POLL_MS`     | `100`      | Poll interval while tracking transactions without waiters. Active waits poll faster. Must be positive.                                                                                                                               |
+
+An unsettled snapshot answers 503 with `Retry-After`; the tRPC adapter preserves it as retryable.
+`GET /replication/lsn` reports the record and wait counters in `settle`.
+Successful `POST /query` responses include `snapshot` (Postgres transaction visibility) and
+`horizon` (WAL insertion position) alongside `rows` and `lsn`. Subset clients use these to merge
+pages with the live feed, including commits that were invisible when a page was read.
+
 | Var                                      | Default                                                        | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ---------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `CIRCUITS_DS_URL`                        | _(required)_                                                   | Durable-streams server base URL (the change log)                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -188,6 +219,12 @@ a node, walked on down the graph) the moment the seed and the shape are in. The 
 state stays registry-owned across the whole install, so a client disconnect at any point — a
 partly-installed membership seed included — is unwound exactly and the same shape is immediately
 creatable again.
+
+Subquery initialization is admitted one create at a time, through installation or completed
+rollback. Waiting creates leave the registry available to replication instead of exhausting a
+short conflict-retry loop during a slow seed. Both explicit rollback and client-disconnect cleanup
+run in engine-owned tasks, including the release of a failed join's provisional subscription.
+Cancelling the request waiting for cleanup does not cancel that cleanup.
 
 ## Operating
 
@@ -363,6 +400,8 @@ budget is **30 s** (`DsClient::RESTORE_APPEND_BUDGET`): long enough to ride out 
 a failover, short enough that a boot does not hang on a dependency that is not coming back. At
 restore an exhausted budget fails the whole restore and the boot backs off and retries it (see
 _Boot: catalog restore_ below) — the aggregate is kept, not retired.
+The retry budget is checked between attempts; a bounded append and its reconciliation `HEAD`
+already in progress can extend the total wait beyond that budget.
 
 ### Boot: fatal vs retryable
 

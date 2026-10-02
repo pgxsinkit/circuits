@@ -336,14 +336,19 @@ impl Engine {
             }
             // Release the engine-state lock before the registry work. Creation is three-phase:
             // begin (brief registry lock: nodes/edges/pending buffer registered) → Postgres
-            // seeding + backfill with NO lock held (concurrent creates parallelize on the
-            // shared pool) → finish (brief lock: install seeds, gated replay of buffered
-            // deltas, register the shape). Replay flips propagate through the worker pool.
+            // seeding + backfill with NO registry lock held → finish (brief lock: install seeds,
+            // gated replay of buffered deltas, register the shape). Replay flips propagate
+            // through the worker pool.
             drop(st);
             let mut creating = CreateGuard::new(self, &id, table, &stream_path, Registration::Registry);
             let res = async {
                 self.ds.ensure_stream(&stream_path).await?;
-                self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only).await
+                creating.admit_subquery().await?;
+                self.create_subquery_three_phase(&id, table, &stream_path, &where_json, out_cols, changes_only).await?;
+                // All seeds are installed. The catalog wait and closing checks need no admission;
+                // a failure before here transfers the permit to cleanup until retractions finish.
+                creating.admission = None;
+                Ok(())
             }
             .await;
             match res {
@@ -394,7 +399,7 @@ impl Engine {
                     }
                     // Registration failed: wake any joiners with the failure, then undo everything
                     // this create registered so later identical creates don't join a dead stream.
-                    let _ = ready_tx.send(ShareOutcome::Failed);
+                    let _ = ready_tx.send(ShareOutcome::from_error(&e));
                     creating.rollback().await;
                     return Err(e);
                 }
@@ -526,9 +531,9 @@ impl Engine {
                 }
                 // Backfill/registration failed: wake any joiners, then undo the whole registration
                 // (no zombie shape a later identical create would join) and surface the error.
-                let _ = share_tx.send(ShareOutcome::Failed);
+                let _ = share_tx.send(ShareOutcome::from_error(&e));
                 creating.rollback().await;
-                bail!("shape '{id}' creation failed: {e:#}")
+                Err(e.context(format!("shape '{id}' creation failed")))
             }
         }
     }
@@ -753,9 +758,9 @@ impl Engine {
                             creating.rollback().await;
                             return Err(raced);
                         }
-                        let _ = share_tx.send(ShareOutcome::Failed);
+                        let _ = share_tx.send(ShareOutcome::from_error(&e));
                         creating.rollback().await;
-                        bail!("aggregate '{id}' creation failed: {e:#}")
+                        Err(e.context(format!("aggregate '{id}' creation failed")))
                     }
                 };
             }
@@ -862,9 +867,9 @@ impl Engine {
                     creating.rollback().await;
                     return Err(raced);
                 }
-                let _ = share_tx.send(ShareOutcome::Failed);
+                let _ = share_tx.send(ShareOutcome::from_error(&e));
                 creating.rollback().await;
-                bail!("aggregate '{id}' creation failed: {e:#}")
+                Err(e.context(format!("aggregate '{id}' creation failed")))
             }
         }
     }
@@ -1733,11 +1738,8 @@ impl Engine {
 }
 
 impl Engine {
-    /// Orchestrate the registry's three-phase subquery-shape creation (see
-    /// `SubqueryRegistry::begin_create`): the Postgres seeding queries and the outer backfill
-    /// run WITHOUT the registry lock, so concurrent creates parallelize on the shared pool
-    /// (`CIRCUITS_PG_POOL_SIZE`) instead of serializing behind one create's round-trips.
-    /// A begin-conflict (sharing a node another create is still seeding) retries briefly.
+    /// Initialize one subquery shape while its CreateGuard owns admission. Postgres I/O runs
+    /// outside the registry lock so replication and already-live shapes continue to advance.
     async fn create_subquery_three_phase(
         &self,
         id: &str,
@@ -1747,28 +1749,15 @@ impl Engine {
         out_cols: Option<Arc<Vec<usize>>>,
         changes_only: bool,
     ) -> Result<()> {
-        // Phase A (brief lock), with conflict retry.
-        let begin = {
-            let mut attempt = 0u32;
-            loop {
-                let res = self.subqueries.lock().await.begin_create(
-                    id,
-                    table,
-                    stream_path,
-                    where_json,
-                    out_cols.clone(),
-                    changes_only,
-                );
-                match res {
-                    Ok(b) => break b,
-                    Err(e) if e.to_string().contains("subquery create conflict") && attempt < 100 => {
-                        attempt += 1;
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-        };
+        // Phase A (brief lock). Admission prevents another create observing a half-seeded node.
+        let begin = self.subqueries.lock().await.begin_create(
+            id,
+            table,
+            stream_path,
+            where_json,
+            out_cols.clone(),
+            changes_only,
+        )?;
         // Phase B (no registry lock): seed fresh nodes + backfill the shape, all from pooled PG.
         let phase_b = async {
             let mut node_seeds = Vec::with_capacity(begin.seeds.len());
@@ -1780,13 +1769,17 @@ impl Engine {
                     .with_context(|| format!("seed: unknown inner table '{inner_table}'"))?;
                 let wsql =
                     inner_where.as_ref().map(|w| crate::sql::predicate_json_to_sql(w, 1, &begin.schemas, inner_table));
-                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                    .get()
-                    .await?;
+                let mut client =
+                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                        .get()
+                        .await?;
                 // `collect`: an inner-set node's seed IS engine state — the set it will maintain
                 // — so there is nothing to stream it to. It is read through the same streamed
                 // reader as every other backfill, so the transport (and the fences) are identical.
-                let (rows, fences) = crate::pg::backfill_where_reader(&client, &ts, wsql).await?.collect().await?;
+                let scope = crate::pg::SettleScope::request(inner_table)
+                    .with(inner_where.as_ref().map(referenced_tables).unwrap_or_default().iter());
+                let (rows, fences) =
+                    crate::pg::backfill_where_reader(&mut client, &ts, wsql, &scope).await?.collect().await?;
                 node_seeds.push((sig.clone(), rows, fences.gate));
             }
             let outer_ts =
@@ -1795,14 +1788,17 @@ impl Engine {
                 (crate::pg::SnapshotGate::passthrough(), 0u64, HashSet::new())
             } else {
                 let (wsql, params) = crate::sql::predicate_json_to_sql(where_json, 1, &begin.schemas, table);
-                let client = crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
-                    .get()
-                    .await?;
+                let mut client =
+                    crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
+                        .get()
+                        .await?;
                 // The OUTER shape's backfill is streamed: each chunk is appended to the (not yet
                 // installed) shape stream and dropped, so a wide subquery shape costs one chunk of
                 // memory, not a table's worth. Only the pk SET is kept — it is what
                 // `finish_create`'s gated replay is fenced against, and keys are small.
-                let mut reader = crate::pg::backfill_where_reader(&client, &outer_ts, Some((wsql, params))).await?;
+                let scope = crate::pg::SettleScope::request(table).with(referenced_tables(where_json).iter());
+                let mut reader =
+                    crate::pg::backfill_where_reader(&mut client, &outer_ts, Some((wsql, params)), &scope).await?;
                 let mut seeded_pks: HashSet<String> = HashSet::new();
                 let mut seeded = 0u64;
                 let mut appends = 0u64;
@@ -1930,13 +1926,25 @@ impl JoinGuard {
         self.armed = false;
     }
 
-    /// The join failed and its caller is still there to be told: give the claim back in place, so
-    /// the error it returns is already true of the engine's state.
-    async fn rollback(&mut self) {
+    /// Transfer this claim to process-owned cleanup before awaiting the state lock. Explicit
+    /// rollback and Drop share this path, so cancellation cannot abandon a disarmed guard.
+    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         if !std::mem::take(&mut self.armed) {
-            return;
+            return None;
         }
-        self.engine.release_subscription(&self.shape_id, Some(&self.subscription)).await;
+        let (engine, shape_id, subscription) = (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
+        Some(tokio::spawn(async move {
+            engine.release_subscription(&shape_id, Some(&subscription)).await;
+        }))
+    }
+
+    /// Explicit failure waits until the claim is released; a cancelled wait detaches cleanup.
+    async fn rollback(&mut self) {
+        if let Some(cleanup) = self.start_cleanup()
+            && let Err(error) = cleanup.await
+        {
+            tracing::error!(shape_id = self.shape_id, %error, "join rollback task failed");
+        }
     }
 }
 
@@ -1954,10 +1962,7 @@ impl Drop for JoinGuard {
             self.shape_id,
             self.subscription
         );
-        let (engine, shape_id, subscription) = (self.engine.clone(), self.shape_id.clone(), self.subscription.clone());
-        tokio::spawn(async move {
-            engine.release_subscription(&shape_id, Some(&subscription)).await;
-        });
+        self.start_cleanup();
     }
 }
 
@@ -1974,7 +1979,7 @@ enum Registration {
 /// create never reaches its own end.
 ///
 /// The create's future is awaited straight from the HTTP handler, so a client that disconnects
-/// takes it away mid-flight — during the backfill, a stream append, the subquery conflict retry, or
+/// takes it away mid-flight — during the backfill, a stream append, subquery admission, or
 /// phase C. Without this, the half-made shape stays in `feed_by_sig` forever: every later identical
 /// create joins it and waits on a creator that no longer exists (and bumps its refcount, so
 /// retention never evicts it either), while its sequencer/registry entry keeps buffering deltas for
@@ -1985,6 +1990,7 @@ struct CreateGuard {
     table: TableRef,
     stream_path: String,
     registration: Registration,
+    admission: Option<tokio::sync::OwnedMutexGuard<()>>,
     armed: bool,
 }
 
@@ -1996,8 +2002,20 @@ impl CreateGuard {
             table: table.clone(),
             stream_path: stream_path.to_string(),
             registration,
+            admission: None,
             armed: true,
         }
+    }
+
+    /// Queue without holding engine state or the registry. Shutdown wakes every waiter, and
+    /// cancellation drops only this acquisition; it cannot release another create's permit.
+    async fn admit_subquery(&mut self) -> Result<()> {
+        self.admission = Some(tokio::select! {
+            biased;
+            _ = self.engine.shutdown.wait() => bail!(crate::engine::sequencer::SHUTTING_DOWN),
+            permit = self.engine.subquery_init.clone().lock_owned() => permit,
+        });
+        Ok(())
     }
 
     /// The create reached its end: everything it registered stays.
@@ -2005,32 +2023,47 @@ impl CreateGuard {
         self.armed = false;
     }
 
-    /// The create failed and its caller is still there to be told: roll back in place, so the error
-    /// the caller returns is already true of the engine's state.
-    async fn rollback(&mut self) {
-        self.armed = false;
-        self.engine.rollback_create(&self.shape_id, &self.table, &self.stream_path, self.registration).await;
-    }
-}
-
-impl Drop for CreateGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
+    /// Transfer compensation and admission to one task before the first await. Cancelling an
+    /// explicit rollback detaches that same task instead of abandoning half a rollback.
+    fn start_cleanup(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        if !std::mem::take(&mut self.armed) {
+            return None;
         }
-        // Cancelled. The rollback needs the async engine/registry locks, which `drop` cannot await,
-        // so it runs DETACHED — the same shape as the reactivation path, and for the same reason.
-        tracing::warn!("create of shape '{}' was cancelled; rolling back", self.shape_id);
-        let (engine, shape_id, table, stream_path, registration) = (
+        let (engine, shape_id, table, stream_path, registration, admission) = (
             self.engine.clone(),
             self.shape_id.clone(),
             self.table.clone(),
             self.stream_path.clone(),
             self.registration,
+            self.admission.take(),
         );
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             engine.rollback_create(&shape_id, &table, &stream_path, registration).await;
-        });
+            // Cleanup includes circuit retractions; release only once they have landed.
+            drop(admission);
+        }))
+    }
+
+    /// Explicit failure waits until its error is true of the engine's state.
+    async fn rollback(&mut self) {
+        if let Some(cleanup) = self.start_cleanup()
+            && let Err(error) = cleanup.await
+        {
+            tracing::error!(shape_id = self.shape_id, %error, "create rollback task failed");
+        }
+    }
+}
+
+impl Drop for CreateGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            tracing::warn!(
+                shape_id = self.shape_id,
+                held_admission = self.admission.is_some(),
+                "shape create cancelled; rolling back"
+            );
+            self.start_cleanup();
+        }
     }
 }
 
@@ -2437,14 +2470,17 @@ mod cancellation_tests {
 
     /// The detached rollback must leave nothing a later identical create could join or conflict with.
     async fn assert_rolled_back(engine: &Engine, id: &str) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while engine.get_shape(id).await.is_some() || engine.subqueries.lock().await.touches(&"outer_t".into()) {
-            assert!(std::time::Instant::now() < deadline, "the cancelled create was never rolled back");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        // Admission is the cleanup barrier: public state is removed before circuit retractions,
+        // so seeing the shape disappear alone cannot prove a later initializer is safe to start.
+        let _admission = tokio::time::timeout(std::time::Duration::from_secs(5), engine.subquery_init.lock())
+            .await
+            .expect("the cancelled create never finished cleanup");
+        assert!(engine.get_shape(id).await.is_none(), "the cancelled registration survived cleanup");
+        assert!(!engine.subqueries.lock().await.touches(&"outer_t".into()));
         let st = engine.state.lock().await;
         assert!(st.feed_by_sig.is_empty(), "the share signature must not outlive the create");
         assert!(st.feed_shares.is_empty());
+        assert!(st.subscription_owner("sub-a").is_none(), "the create's subscription must be reusable");
         assert!(engine.lives.lock().unwrap().is_empty(), "the retention entry must go too");
         assert!(engine.subquery_stats().await.is_empty(), "no registry node may survive");
     }
@@ -2514,7 +2550,8 @@ mod cancellation_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_before_install_unwinds_the_pending_registry_state() {
         let (engine, where_json) = engine_with_subquery_tables().await;
-        let guard = register(&engine, "s1", &where_json).await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        guard.admit_subquery().await.unwrap();
         let begin = engine
             .subqueries
             .lock()
@@ -2533,7 +2570,8 @@ mod cancellation_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_after_install_drops_the_registered_shape() {
         let (engine, where_json) = engine_with_subquery_tables().await;
-        let guard = register(&engine, "s1", &where_json).await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        guard.admit_subquery().await.unwrap();
         let begin = engine
             .subqueries
             .lock()
@@ -2567,7 +2605,8 @@ mod cancellation_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn cancelled_mid_phase_c_unwinds_the_partly_seeded_node() {
         let (engine, where_json) = engine_with_subquery_tables().await;
-        let guard = register(&engine, "s1", &where_json).await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        guard.admit_subquery().await.unwrap();
         let node_id = {
             let mut reg = engine.subqueries.lock().await;
             let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
@@ -2585,6 +2624,93 @@ mod cancellation_tests {
             0,
             "the partial seed was retracted with the node it belonged to"
         );
+    }
+
+    /// The error-response path can itself be cancelled while registry cleanup is blocked. Its
+    /// circuit retractions still have to complete after the caller disappears.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_explicit_rollback_still_retracts_the_partial_seed() {
+        cancel_while_cleanup_is_blocked(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_a_creator_holds_admission_until_the_partial_seed_is_retracted() {
+        cancel_while_cleanup_is_blocked(false).await;
+    }
+
+    async fn cancel_while_cleanup_is_blocked(explicit: bool) {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        guard.admit_subquery().await.unwrap();
+        let mut registry = engine.subqueries.lock().await;
+        let begin = registry.begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false).unwrap();
+        let sig = &begin.seeds[0].0;
+        registry.assert_seed_row_for_test(sig, "1", Value::Int(7)).await;
+        let node_id = registry.nodes[sig].node_id;
+        assert_eq!(registry.circuit_distinct(node_id), 1);
+
+        if explicit {
+            let rollback = guard.rollback();
+            tokio::pin!(rollback);
+            tokio::select! {
+                _ = &mut rollback => panic!("rollback passed a held registry lock"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while engine.get_shape("s1").await.is_some() {
+                        tokio::task::yield_now().await;
+                    }
+                }) => result.expect("rollback never reached the registry lock"),
+            }
+        }
+        drop(guard);
+        assert!(engine.subquery_init.try_lock().is_err(), "cleanup must retain admission while blocked");
+        drop(registry);
+        assert_rolled_back(&engine, "s1").await;
+        assert_eq!(engine.subqueries.lock().await.circuit_distinct(node_id), 0);
+        let mut next = register(&engine, "s2", &where_json).await;
+        next.admit_subquery().await.unwrap();
+        let begin = engine
+            .subqueries
+            .lock()
+            .await
+            .begin_create("s2", &"outer_t".into(), "shape/s2", &where_json, None, false)
+            .expect("an overlapping create must start after cleanup");
+        assert_eq!(begin.seeds.len(), 1, "the abandoned node must be seeded anew");
+        next.rollback().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiter_does_not_release_the_initializers_permit() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let owner = engine.subquery_init.clone().lock_owned().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        {
+            let waiting = guard.admit_subquery();
+            tokio::pin!(waiting);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+        }
+        guard.rollback().await;
+        assert!(engine.subquery_init.try_lock().is_err(), "a cancelled waiter released the owner");
+        drop(owner);
+        assert_rolled_back(&engine, "s1").await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_wakes_queued_initializers_without_waiting_for_the_owner() {
+        let (engine, where_json) = engine_with_subquery_tables().await;
+        let _owner = engine.subquery_init.clone().lock_owned().await;
+        let mut guard = register(&engine, "s1", &where_json).await;
+        {
+            let waiting = guard.admit_subquery();
+            tokio::pin!(waiting);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(waiting.as_mut().poll(cx).is_pending())).await);
+            engine.shutdown.begin();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .expect("shutdown left the create queued")
+                .unwrap_err();
+            assert_eq!(error.to_string(), crate::engine::sequencer::SHUTTING_DOWN);
+        }
+        guard.rollback().await;
     }
 
     // --- the sharing rendezvous carries the creator's REASON ------------------------------------
@@ -2930,6 +3056,31 @@ mod subscription_tests {
             vec!["held".to_string()],
             "the other subscriber is untouched"
         );
+    }
+
+    /// An explicit failed-join rollback must keep ownership even if cancellation lands before
+    /// the engine-state lock can be acquired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancelling_explicit_join_rollback_releases_its_own_subscription() {
+        let engine = engine_with_share("s1", &[("held", 10), ("joining", 10)]).await;
+        let mut guard = JoinGuard::new(&engine, "s1", "joining", true);
+        let state = engine.state.lock().await;
+        {
+            let rollback = guard.rollback();
+            tokio::pin!(rollback);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(rollback.as_mut().poll(cx).is_pending())).await);
+        }
+        drop(guard);
+        drop(state);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while refcount(&engine, "s1").await > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancelled explicit rollback never released its claim");
+        assert_eq!(engine.state.lock().await.subscription_owner("joining"), None);
+        assert_eq!(engine.state.lock().await.subscription_owner("held").map(String::as_str), Some("s1"));
     }
 
     /// A cancelled RENEWAL compensates for nothing: the subscription existed before the request and

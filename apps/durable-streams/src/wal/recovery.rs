@@ -66,6 +66,28 @@ pub(crate) static RECOVERY_FSYNCS: std::sync::atomic::AtomicU64 = std::sync::ato
 /// a no-op for streams not present in the sidecar-recovered set (deleted streams)
 /// and for records below a stream's `file_base` (compacted prefix).
 pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
+    // Validate ALL shard proofs and unresolved identities before launching any
+    // replay thread. A refused boot must preserve every stream and WAL file,
+    // including healthy streams on shards inspected before the faulty one.
+    let quarantined = store.quarantined_stream_ids()?;
+    let mut durable_tails = Vec::with_capacity(wal.shards().len());
+    for shard in wal.shards() {
+        let tails = shard.read_durable_tails()?;
+        let mut unresolved = quarantined.iter().find(|id| tails.contains_key(id)).copied();
+        if unresolved.is_none() && !quarantined.is_empty() {
+            shard.replay_from_checkpoint(0, |kind, id, _, _| {
+                if kind == RecordKind::Append && quarantined.contains(&id) {
+                    unresolved = Some(id);
+                }
+            })?;
+        }
+        if let Some(id) = unresolved {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                "WAL recovery refused: unresolved stream id {id} owns retained WAL or checkpoint durability evidence; repair its sidecar or fork ancestry before startup (WAL left intact)"
+            )));
+        }
+        durable_tails.push(tails);
+    }
     // Build the id → StreamState index once from the sidecar-recovered streams.
     // Streams are keyed by NAME in the store; recovery routes by `stream_id`, so
     // we re-key on the stable id. Shared across shards read-only.
@@ -100,16 +122,21 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     // Per-shard passes are independent (disjoint stream sets). Spawn one blocking
     // task per shard and join — the replay is synchronous file I/O.
     let mut handles = Vec::with_capacity(wal.shards().len());
-    for (shard, seed) in wal.shards().iter().zip(seeds) {
+    for ((shard, seed), tails) in wal.shards().iter().zip(seeds).zip(durable_tails) {
         let shard = Arc::clone(shard);
         let index = Arc::clone(&index);
-        handles.push(std::thread::spawn(move || recover_shard(&shard, &index, seed)));
+        handles.push(std::thread::spawn(move || recover_shard(&shard, &index, seed, tails)));
     }
+    let mut error = None;
     for h in handles {
-        // A panicked recovery thread is a bug (poisoned state); surface it.
-        h.join().expect("WAL recovery shard thread panicked")?;
+        // Join every shard even on failure: no recovery writer may outlive the
+        // failed startup and race an operator's subsequent repair attempt.
+        let result = h.join().unwrap_or_else(|_| Err(io::Error::other("WAL recovery shard thread panicked")));
+        if let Err(e) = result {
+            error.get_or_insert(e);
+        }
     }
-    Ok(())
+    error.map_or(Ok(()), Err)
 }
 
 /// Replay one shard and reconcile the tails of the streams it touched.
@@ -120,6 +147,7 @@ fn recover_shard(
     shard: &crate::wal::shard::Shard,
     index: &HashMap<u64, Arc<StreamState>>,
     seed: HashMap<u64, u64>,
+    mut frontier: HashMap<u64, u64>,
 ) -> io::Result<()> {
     // `checkpoint_lsn` is a WRITE-SKIP optimization ONLY — NOT the boundary for
     // which streams get reconciled. We replay from the OLDEST RETAINED record so
@@ -159,7 +187,6 @@ fn recover_shard(
     // but no retained WAL record still gets reconciled), then raised by the replay
     // below. Only streams with EITHER a persisted tail OR an in-range Append are
     // inserted, so we reconcile exactly the streams the WAL touched.
-    let mut frontier: HashMap<u64, u64> = shard.read_durable_tails();
     // Fold in the per-stream sidecar proof (every stream of this shard gets an
     // entry; max keeps the strongest proof).
     for (id, proof) in seed {
@@ -414,6 +441,107 @@ mod tests {
     /// and append its framed bytes to `buf`.
     fn append_record(buf: &mut Vec<u8>, lsn: u64, stream_id: u64, stream_offset: u64, payload: &[u8]) {
         encode_into(buf, &Record { lsn, kind: RecordKind::Append, stream_id, stream_offset, payload });
+    }
+
+    #[test]
+    fn quarantined_identity_preserves_wal_and_data_across_repeated_boots() {
+        let dir = temp_dir("quarantine-repeated-boots");
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = match store.create("quarantined", cfg(), None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let data_path = st.file_path.clone();
+        let meta_path = crate::store::meta_path(&data_path);
+        let original_meta = std::fs::read(&meta_path).unwrap();
+        let id = st.id;
+        let payload = b"acknowledged-in-wal";
+        let mut records = Vec::new();
+        append_record(&mut records, 1, id, 0, payload);
+        let segment = seg_path(wal.shards()[0].dir(), 1);
+        std::fs::write(&segment, &records).unwrap();
+        // Inject the crash image: WAL survived, the data write and sidecar did not.
+        std::fs::write(&data_path, []).unwrap();
+        std::fs::write(&meta_path, b"{torn").unwrap();
+        drop(st);
+        drop(store);
+        drop(wal);
+        for _ in 0..3 {
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+            let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+            assert!(recover(&store, &wal).is_err(), "quarantine must refuse WAL reset");
+            assert_eq!(std::fs::read(&segment).unwrap(), records, "WAL proof kept intact");
+            assert_eq!(std::fs::read(&data_path).unwrap(), b"", "paired data kept intact");
+            assert!(meta_path.with_extension("meta.corrupt").exists());
+        }
+        // An operator repairs identity, after which ordinary recovery restores bytes.
+        std::fs::rename(meta_path.with_extension("meta.corrupt"), &meta_path).unwrap();
+        std::fs::write(&meta_path, original_meta).unwrap();
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        recover(&store, &wal).unwrap();
+        assert_eq!(std::fs::read(data_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn malformed_checkpoint_tails_refuses_before_mutating_any_stream() {
+        let dir = temp_dir("malformed-checkpoint-tails");
+        let wal = WalSet::open(dir.path(), Some(2), 1).unwrap();
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = match store.create("healthy", cfg(), None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let data_path = st.file_path.clone();
+        std::fs::write(&data_path, b"unreconciled-tail").unwrap();
+        drop(st);
+        drop(store);
+        std::fs::write(wal.shards()[1].dir().join("tails"), "123 not-a-tail\n").unwrap();
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        assert!(recover(&store, &wal).is_err(), "damaged durability proof must fail closed");
+        assert_eq!(std::fs::read(data_path).unwrap(), b"unreconciled-tail");
+        assert_eq!(std::fs::read(wal.shards()[1].dir().join("tails")).unwrap(), b"123 not-a-tail\n");
+    }
+
+    #[test]
+    fn quarantined_checkpoint_proof_and_missing_data_survive_repeated_boots() {
+        let dir = temp_dir("quarantine-checkpoint-proof");
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let streams = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let id = crate::store::MAX_SAFE_INT - 2;
+        let data = dir.path().join("streams").join(format!("lost~{id}"));
+        let meta = crate::store::meta_path(&data);
+        std::fs::write(&meta, b"{torn").unwrap();
+        let tails = format!("{id} 19\n");
+        std::fs::write(wal.shards()[0].dir().join("tails"), &tails).unwrap();
+        drop(streams);
+        for _ in 0..3 {
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+            assert!(recover(&store, &wal).is_err());
+            assert!(meta.with_extension("meta.corrupt").exists(), "quarantine retained without paired data");
+            assert_eq!(std::fs::read_to_string(wal.shards()[0].dir().join("tails")).unwrap(), tails);
+            let st = match store.create("new", cfg(), None, 0).unwrap() {
+                CreateResult::Created(st) | CreateResult::Exists(st) => st,
+                _ => panic!("create failed"),
+            };
+            assert!(st.id > id, "quarantined id reserved despite absent data");
+        }
+    }
+
+    #[test]
+    fn unreadable_checkpoint_tails_and_unmapped_quarantine_refuse_boot() {
+        let dir = temp_dir("unreadable-durability-evidence");
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        std::fs::create_dir(wal.shards()[0].dir().join("tails")).unwrap();
+        assert!(recover(&store, &wal).is_err(), "unreadable tails cannot stand in for empty evidence");
+        std::fs::remove_dir(wal.shards()[0].dir().join("tails")).unwrap();
+        std::fs::write(dir.path().join("streams/unmapped.meta.corrupt"), b"{torn").unwrap();
+        drop(store);
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        assert!(recover(&store, &wal).is_err(), "unknown quarantine id cannot license a WAL reset");
+        assert!(dir.path().join("streams/unmapped.meta.corrupt").exists());
     }
 
     #[tokio::test]
@@ -889,7 +1017,7 @@ mod tests {
         assert_eq!(ckpt1, l2, "checkpoint #1 floor covers both of X's records");
         // The durable-tail map now holds X.
         assert_eq!(
-            shard.read_durable_tails().get(&x_id).copied(),
+            shard.read_durable_tails().unwrap().get(&x_id).copied(),
             Some(x_durable_len as u64),
             "checkpoint recorded X's durable tail"
         );
@@ -1022,7 +1150,7 @@ mod tests {
         let l2 = shard.reserve_and_stage(RecordKind::Append, x_id, r1.len() as u64, r2).unwrap();
         shard.wait_durable(l2).await;
         shard.checkpoint().await.unwrap();
-        assert_eq!(shard.read_durable_tails().get(&x_id).copied(), Some(after_r2));
+        assert_eq!(shard.read_durable_tails().unwrap().get(&x_id).copied(), Some(after_r2));
 
         // r3 appended AFTER the checkpoint: durable in the WAL (RETAINED — its
         // segment is the active one, not recycled) and written to the file.

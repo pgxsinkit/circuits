@@ -875,11 +875,194 @@ async fn e2e_corrupt_sidecar_quarantines_instead_of_deleting() {
     // Tear the sidecar (simulates a crash-torn rename target).
     std::fs::write(&meta_path, b"{ this is not json").unwrap();
 
-    let h2 = Harness::boot(dir.path(), None, 1).unwrap();
-    assert!(h2.store.get("q").is_none(), "stream is skipped this boot");
-    assert!(data_path.exists(), "data file must NOT be deleted");
-    assert!(meta_path.with_extension("meta.corrupt").exists(), "sidecar parked as .meta.corrupt for repair");
-    h2.crash();
+    for _ in 0..3 {
+        assert!(Harness::boot(dir.path(), None, 1).is_err(), "unresolved WAL identity refuses boot");
+        assert!(data_path.exists(), "data file must NOT be deleted");
+        assert!(meta_path.with_extension("meta.corrupt").exists(), "sidecar parked as .meta.corrupt for repair");
+        assert_eq!(std::fs::read(&data_path).unwrap(), b"precious|", "repeated boots preserve data");
+    }
+}
+
+#[tokio::test]
+async fn e2e_delete_drains_append_durability_and_fences_new_appends() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("delete-in-flight-append");
+    let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+    let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+    store.wal.set(wal.clone()).ok();
+    create_stream(&store, "s", OCTET).await;
+    let st = store.get("s").unwrap();
+    let append = tokio::spawn(handlers::handle(store.clone(), post_req("s", OCTET, b"pending")));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while st.shared.read().unwrap().tail == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(st.appender.try_lock().is_ok(), "WAL wait happens off the appender mutex");
+    let delete = tokio::spawn(handlers::handle(
+        store.clone(),
+        Req { method: Method::Delete, path: "s".into(), query: None, headers: vec![], body: Bytes::new() },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !st.is_retiring() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!delete.is_finished(), "DELETE must wait for the admitted append's durability and publication");
+    assert!(st.file_path.exists(), "pending append still owns its file");
+    let rejected = handlers::handle(store.clone(), post_req("s", OCTET, b"late")).await;
+    assert_eq!(rejected.status, 410, "retirement fence rejects new writes");
+    let committer = wal.shards()[0].spawn_committer();
+    assert_eq!(append.await.unwrap().status, 204);
+    assert_eq!(delete.await.unwrap().status, 204);
+    committer.stop();
+    assert!(!st.file_path.exists());
+    assert_eq!(st.tail().bytes, b"pending".len() as u64, "admitted append published before deletion");
+    drop(store);
+    drop(wal);
+    let boot = Harness::boot(dir.path(), None, 1).unwrap();
+    assert!(boot.store.get("s").is_none(), "WAL recovery never resurrects acknowledged deletion");
+    boot.crash();
+}
+
+#[tokio::test]
+async fn e2e_failed_delete_partial_unlink_retries_and_stays_gone() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("delete-partial-unlink");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "s", OCTET).await;
+    append_acked(&h.store, "s", OCTET, b"owned-by-stream").await;
+    let st = h.store.get("s").unwrap();
+    let sidecar = crate::store::meta_path(&st.file_path);
+    let saved_data = st.file_path.with_extension("saved");
+    std::fs::rename(&st.file_path, &saved_data).unwrap();
+    std::fs::create_dir(&st.file_path).unwrap();
+    let delete_req =
+        || Req { method: Method::Delete, path: "s".into(), query: None, headers: vec![], body: Bytes::new() };
+    assert_eq!(
+        handlers::handle(h.store.clone(), delete_req()).await.status,
+        500,
+        "real data unlink failure must fail DELETE"
+    );
+    assert!(!sidecar.exists(), "failure followed a successful sidecar unlink");
+    assert!(h.store.streams.contains_key("s"), "partially removed identity retained for retry");
+    assert_eq!(handlers::handle(h.store.clone(), post_req("s", OCTET, b"late")).await.status, 410);
+    assert_eq!(handlers::handle(h.store.clone(), put_req("s", OCTET, b"", &[])).await.status, 409);
+    crate::store::write_meta_sync(&st, true).unwrap();
+    assert!(!sidecar.exists(), "delayed sidecar writes are fenced during failed deletion");
+    std::fs::remove_dir(&st.file_path).unwrap();
+    std::fs::rename(saved_data, &st.file_path).unwrap();
+    assert_eq!(
+        handlers::handle(h.store.clone(), delete_req()).await.status,
+        204,
+        "retry tolerates already missing sidecar"
+    );
+    h.crash();
+    for _ in 0..3 {
+        let boot = Harness::boot(dir.path(), None, 1).unwrap();
+        assert!(boot.store.get("s").is_none(), "successful retry survives every restart");
+        boot.crash();
+    }
+}
+
+#[test]
+fn e2e_delete_does_not_starve_close_with_one_blocking_worker() {
+    let _guard = DurabilityGuard::wal();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = temp_dir("delete-close-one-worker");
+        let wal = WalSet::open(dir.path(), Some(1), 1).unwrap();
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        store.wal.set(wal.clone()).ok();
+        create_stream(&store, "s", OCTET).await;
+        let st = store.get("s").unwrap();
+        let mut request = post_req("s", OCTET, b"final-data");
+        request.headers.push(("stream-closed".into(), "true".into()));
+        let mut close = tokio::spawn(handlers::handle(store.clone(), request));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !st.shared.read().unwrap().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut delete = tokio::spawn(handlers::handle(
+            store.clone(),
+            Req { method: Method::Delete, path: "s".into(), query: None, headers: vec![], body: Bytes::new() },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !st.is_retiring() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let committer = wal.shards()[0].spawn_committer();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            assert_eq!((&mut close).await.unwrap().status, 204);
+            assert_eq!((&mut delete).await.unwrap().status, 204);
+        })
+        .await;
+        if completed.is_err() {
+            // Drop the admitted close guard even on regression, so the runtime
+            // itself can shut down instead of hanging its blocking workers.
+            close.abort();
+            delete.abort();
+            let _ = close.await;
+            let _ = delete.await;
+        }
+        committer.stop();
+        assert!(completed.is_ok(), "DELETE must leave a blocking worker available for close metadata");
+    });
+}
+
+#[tokio::test]
+async fn e2e_corrupt_fork_parent_preserves_descendant_wal() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("quarantine-fork-descendant");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", OCTET).await;
+    append_acked(&h.store, "parent", OCTET, b"parent-prefix").await;
+    h.crash();
+    // Reboot removes the parent's WAL/checkpoint evidence after persisting its
+    // durable tail; only the subsequently created child's WAL remains.
+    let h = Harness::boot(dir.path(), None, 1).unwrap();
+    let parent = h.store.get("parent").unwrap();
+    let parent_meta = crate::store::meta_path(&parent.file_path);
+    let offset = crate::store::format_offset(parent.tail().bytes);
+    let response = handlers::handle(
+        h.store.clone(),
+        put_req("child", OCTET, b"", &[("stream-forked-from", "parent"), ("stream-fork-offset", &offset)]),
+    )
+    .await;
+    assert_eq!(response.status, 201);
+    append_acked(&h.store, "child", OCTET, b"child-owned-data").await;
+    let repaired_meta = std::fs::read(&parent_meta).unwrap();
+    let child_file = h.store.get("child").unwrap().file_path.clone();
+    h.crash();
+    std::fs::write(&parent_meta, b"{torn").unwrap();
+    let wal_path = dir.path().join("wal/0/1.wal");
+    let retained_wal = std::fs::read(&wal_path).unwrap();
+    for _ in 0..3 {
+        assert!(Harness::boot(dir.path(), None, 1).is_err(), "unresolved ancestry cannot license descendant WAL reset");
+        assert_eq!(std::fs::read(&wal_path).unwrap(), retained_wal);
+        assert_eq!(std::fs::read(&child_file).unwrap(), b"child-owned-data");
+    }
+    std::fs::rename(parent_meta.with_extension("meta.corrupt"), &parent_meta).unwrap();
+    std::fs::write(parent_meta, repaired_meta).unwrap();
+    let restored = Harness::boot(dir.path(), None, 1).unwrap();
+    assert!(restored.store.get("child").is_some());
+    assert_eq!(std::fs::read(child_file).unwrap(), b"child-owned-data");
+    restored.crash();
 }
 
 /// Recovery-hardening: on an initialized store, a stream lane whose dir is

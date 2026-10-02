@@ -21,7 +21,7 @@ Architecture: [docs/ARCHITECTURE.md](../../docs/ARCHITECTURE.md).
 | `ingest.write`                 | mutation         | apply one change: `{ table, op, pk, row?, txid? }`                                                                    |
 | `shapes.create`                | mutation         | register a materialized, live shape (`table`, `where?`, `columns?`) — identical creates share one stream, ref-counted |
 | `shapes.get` / `shapes.delete` | query / mutation | look up / drop (decrement) a shape or feed                                                                            |
-| `subset.query`                 | query            | one-shot `SELECT … ORDER BY … LIMIT/OFFSET` page + snapshot LSN (ephemeral, nothing stored)                           |
+| `subset.query`                 | query            | one-shot `SELECT … ORDER BY … LIMIT/OFFSET` page + snapshot visibility and WAL fences (ephemeral, nothing stored)     |
 | `subset.live`                  | mutation         | open a changes-only live tail feed on a base predicate (no backfill)                                                  |
 | `aggregate.create`             | mutation         | live scalar COUNT/SUM/AVG/MIN/MAX (`fn`, optional `col`) over a filter                                                |
 

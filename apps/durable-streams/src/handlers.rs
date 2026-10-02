@@ -631,6 +631,9 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             b.body(empty())
         }
         CreateResult::Created(st) => {
+            let Some(_operation) = st.begin_operation() else {
+                return gone();
+            };
             if let Some(wire) = wire {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
@@ -968,6 +971,9 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     if st.shared.read().unwrap().soft_deleted {
         ret!(gone(), Conflict);
     }
+    let Some(_operation) = st.begin_operation() else {
+        ret!(gone(), Conflict);
+    };
     let producer = match parse_producer_headers(&req) {
         Ok(p) => p,
         Err(m) => ret!(text_response(400, m), Conflict),
@@ -2276,17 +2282,15 @@ async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
-    if st.shared.read().unwrap().soft_deleted {
+    if st.shared.read().unwrap().soft_deleted && !st.hard_delete_pending() {
         return gone();
     }
     // The 204 is a durability promise: once acked, a crash must never
     // resurrect the stream. Await the on-disk removal (unlinks + parent-dir
     // fsync, or the soft-delete meta flag) before responding — a detached
     // removal task can be lost to a crash after the ack.
-    let store2 = Arc::clone(&store);
-    let st2 = Arc::clone(&st);
-    match tokio::task::spawn_blocking(move || store2.delete_or_soft_delete_durable(&st2)).await {
-        Ok(Ok(())) => ResponseBuilder::new(204).body(empty()),
+    match store.delete_durable(&st).await {
+        Ok(()) => ResponseBuilder::new(204).body(empty()),
         _ => text_response(500, "delete not durable"),
     }
 }

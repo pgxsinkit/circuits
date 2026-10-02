@@ -193,6 +193,7 @@ pub(crate) fn spawn_sequencer(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     // No Postgres behind the engine: writes arrive on the change log through the native write API
     // and carry no replication old-image, so the sequencer keeps the current row per key itself
     // (see `TableExec::library_rows`).
@@ -227,6 +228,7 @@ pub(crate) fn spawn_sequencer(
         trace_tx,
         arr,
         arr_gates,
+        sequenced,
         library_mode,
         hold_reads,
         fail_closed,
@@ -425,6 +427,7 @@ pub(crate) async fn sequencer_loop(
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
     arr: Option<crate::arrangements::Arrangements>,
     arr_gates: HashMap<TableRef, crate::pg::SnapshotGate>,
+    sequenced: Option<Arc<crate::pg::SequencedXids>>,
     library_mode: bool,
     hold_reads: bool,
     fail_closed: FailClosed,
@@ -840,6 +843,11 @@ pub(crate) async fn sequencer_loop(
                         let mut j = i + 1;
                         while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
                             j += 1;
+                        }
+                        // Note BEFORE fan-out: any snapshot paired with an already-produced feed
+                        // offset must include this transaction, even while its backend is invisible.
+                        if let (Some(seen), Some(xid)) = (&sequenced, txid.as_deref().and_then(|t| t.parse::<u64>().ok())) {
+                            seen.note(xid, envs[i..j].iter().map(|e| e.type_.as_str()));
                         }
                         // Stage this transaction's counts deltas for the dbsp pipelines, to be applied
                         // once every envelope has fanned out — the circuit must never absorb a prefix
@@ -1747,8 +1755,9 @@ async fn stream_backfill(
     let Some(url) = pg_url.as_deref() else {
         return Ok((crate::pg::SnapshotGate::passthrough(), aggregate.map(|_| AggSeed::default()), 0));
     };
-    let client = crate::pg::pool_for(url).get().await?;
-    let mut reader = crate::pg::backfill_reader(&client, ts, Some(pred.as_ref())).await?;
+    let mut client = crate::pg::pool_for(url).get().await?;
+    let scope = crate::pg::SettleScope::request(&ts.table);
+    let mut reader = crate::pg::backfill_reader(&mut client, ts, Some(pred.as_ref()), &scope).await?;
 
     let mut agg_seed = aggregate.map(|_| AggSeed::default());
     let mut rows_total = 0u64;

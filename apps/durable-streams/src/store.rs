@@ -12,11 +12,11 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
 
@@ -294,6 +294,17 @@ pub struct StreamState {
     /// flush clobber a durable manifest flip. Held across capture+write+rename so
     /// the last writer persists the freshest captured state.
     pub meta_lock: StdMutex<()>,
+    /// Admission spans the entire append, including WAL wait and publication.
+    /// DELETE fences new operations, drains admitted ones, then removes files.
+    lifecycle: StdMutex<StreamLifecycle>,
+    lifecycle_idle: Condvar,
+    lifecycle_notify: Notify,
+    delete_gate: AsyncMutex<()>,
+    retirement_lock: StdMutex<()>,
+    hard_delete: AtomicBool,
+    parent_released: AtomicBool,
+    #[cfg(test)]
+    delete_fault: std::sync::atomic::AtomicU8,
     /// Most recently appended wire chunk, kept resident so caught-up live
     /// readers (SSE / long-poll) and immediate catch-up reads are served from
     /// memory — one read+encode shared across all subscribers — instead of a
@@ -319,6 +330,25 @@ pub struct StreamState {
     /// are attached. See sse_reactor.rs.
     #[cfg(target_os = "linux")]
     pub sse_subs: StdMutex<Option<Box<StreamSubs>>>,
+}
+
+#[derive(Default)]
+struct StreamLifecycle {
+    retiring: bool,
+    in_flight: usize,
+}
+
+pub(crate) struct StreamOperationGuard<'a>(&'a StreamState);
+
+impl Drop for StreamOperationGuard<'_> {
+    fn drop(&mut self) {
+        let mut lifecycle = self.0.lifecycle.lock().unwrap();
+        lifecycle.in_flight -= 1;
+        if lifecycle.in_flight == 0 {
+            self.0.lifecycle_idle.notify_all();
+            self.0.lifecycle_notify.notify_waiters();
+        }
+    }
 }
 
 /// Reactor subscriber list for one stream — populated only while subscribers are
@@ -385,6 +415,23 @@ pub fn tail_cache_bytes() -> usize {
 }
 
 impl StreamState {
+    pub(crate) fn begin_operation(&self) -> Option<StreamOperationGuard<'_>> {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        if lifecycle.retiring || self.shared.read().unwrap().soft_deleted {
+            return None;
+        }
+        lifecycle.in_flight += 1;
+        Some(StreamOperationGuard(self))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_retiring(&self) -> bool {
+        self.lifecycle.lock().unwrap().retiring
+    }
+
+    pub(crate) fn hard_delete_pending(&self) -> bool {
+        self.hard_delete.load(Ordering::Acquire)
+    }
     /// Record the just-appended wire chunk as the resident tail. `start` is the
     /// logical offset where `bytes` begins. Chunks larger than the tail-cache cap
     /// (or any append when the cache is disabled) are not cached (the entry is
@@ -456,7 +503,7 @@ impl StreamState {
 }
 
 pub struct Store {
-    pub streams: DashMap<String, Arc<StreamState>>,
+    pub streams: Arc<DashMap<String, Arc<StreamState>>>,
     pub data_dir: PathBuf,
     next_id: AtomicU64,
     /// Hot/cold tiering config (Off by default → fully inert).
@@ -477,6 +524,10 @@ pub struct Store {
     /// (`sweep_meta_once`). The `meta_dirty` CAS in `mark_meta_dirty` keeps
     /// each stream in here at most once per sweep cycle (#4691).
     pub meta_sweep: StdMutex<Vec<Arc<StreamState>>>,
+    /// Unresolved sidecars keep their identity reserved across boots. WAL
+    /// recovery must distinguish these streams from acknowledged deletions.
+    quarantined_ids: RwLock<HashSet<u64>>,
+    quarantine_unmapped: AtomicBool,
 }
 
 pub enum CreateResult {
@@ -485,7 +536,115 @@ pub enum CreateResult {
     Conflict,
 }
 
+/// Owned context for a retirement which outlives the requesting operation.
+/// It retains only the registry and tier-GC configuration, not the whole store.
+struct RetirementContext {
+    streams: Arc<DashMap<String, Arc<StreamState>>>,
+    tier_config: crate::tier::TierConfig,
+    blobstore: Option<crate::blobstore::SharedBlobStore>,
+    segments_dir: PathBuf,
+}
+
+impl RetirementContext {
+    fn finish_hard(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
+        remove_file_if_present(&meta_path(&st.file_path))?;
+        remove_file_if_present(&st.file_path)?;
+        fsync_parent_dir(&st.file_path)?;
+        // A failed unlink/fsync must retain remote evidence: a subsequent boot
+        // can still recover the old active sidecar if deletion did not commit.
+        Store::gc_remote_segments_owned(st, &self.tier_config, self.blobstore.clone(), self.segments_dir.clone());
+        self.streams.remove_if(&st.path, |_, current| Arc::ptr_eq(current, st));
+        Ok(())
+    }
+
+    fn release_parent(self: &Arc<Self>, child: &Arc<StreamState>) {
+        let Some(parent) = child.parent.clone() else {
+            return;
+        };
+        if child.parent_released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let gone = {
+            let mut s = parent.shared.write().unwrap();
+            s.ref_count = s.ref_count.saturating_sub(1);
+            s.soft_deleted && s.ref_count == 0
+        };
+        if gone {
+            self.schedule(parent);
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let _ = write_meta_sync(&parent, true);
+            });
+        }
+    }
+
+    fn schedule(self: &Arc<Self>, st: Arc<StreamState>) {
+        let context = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _retirement = st.retirement_lock.lock().unwrap();
+            let _metadata = st.meta_lock.lock().unwrap();
+            if !context.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), &st)) {
+                return;
+            }
+            let eligible = {
+                let s = st.shared.read().unwrap();
+                s.soft_deleted && s.ref_count == 0
+            };
+            // A queued candidate may have seen an in-progress soft deletion
+            // which then failed and rolled back. Revalidate behind both writer
+            // barriers before fencing, collecting segments, or releasing pins.
+            if !eligible {
+                if let Err(e) = write_meta_locked(&st, true) {
+                    tracing::warn!(path = %st.path, error = %e, "fork refcount persistence failed");
+                }
+                return;
+            }
+            // Eligibility follows a completed soft delete or a lazy hard
+            // fence, both of which drained admitted operations and reject new
+            // ones. A cleanup worker therefore never waits for an async close.
+            st.lifecycle.lock().unwrap().retiring = true;
+            st.hard_delete.store(true, Ordering::Release);
+            match context.finish_hard(&st) {
+                Ok(()) => context.release_parent(&st),
+                Err(e) => tracing::warn!(path = %st.path, error = %e, "stream cleanup failed; DELETE may retry"),
+            }
+        });
+    }
+}
+
 impl Store {
+    fn retirement_context(&self) -> Arc<RetirementContext> {
+        Arc::new(RetirementContext {
+            streams: self.streams.clone(),
+            tier_config: self.tier_config.clone(),
+            blobstore: self.blobstore.clone(),
+            segments_dir: self.segments_dir(),
+        })
+    }
+    pub(crate) fn quarantined_stream_ids(&self) -> std::io::Result<HashSet<u64>> {
+        if self.quarantine_unmapped.load(Ordering::Acquire) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL recovery refused: a .meta.corrupt marker has no recoverable stream id; repair its identity before startup (WAL left intact)",
+            ));
+        }
+        Ok(self.quarantined_ids.read().unwrap().clone())
+    }
+
+    fn record_quarantine(&self, data_path: &std::path::Path) -> Option<u64> {
+        let id = data_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.rsplit_once('~'))
+            .and_then(|(_, id)| id.parse::<u64>().ok())
+            .filter(|id| *id <= MAX_SAFE_INT);
+        if let Some(id) = id {
+            self.quarantined_ids.write().unwrap().insert(id);
+        } else {
+            self.quarantine_unmapped.store(true, Ordering::Release);
+        }
+        id
+    }
     /// Build a Store with an explicit tiering configuration. When
     /// `tier.kind == Off` (the default) this is identical to `new`: no
     /// blobstore, no sealing, single contiguous file per stream.
@@ -605,13 +764,15 @@ impl Store {
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0);
         let blobstore = build_blobstore(&tier_config, &data_dir)?;
         let store = Store {
-            streams: DashMap::new(),
+            streams: Arc::new(DashMap::new()),
             data_dir,
             next_id: AtomicU64::new(seed & MAX_SAFE_INT),
             tier_config,
             blobstore,
             wal: std::sync::OnceLock::new(),
             meta_sweep: StdMutex::new(Vec::new()),
+            quarantined_ids: RwLock::new(HashSet::new()),
+            quarantine_unmapped: AtomicBool::new(false),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -633,6 +794,7 @@ impl Store {
         let mut metas: HashMap<String, (Meta, PathBuf)> = HashMap::new();
         let mut data_files: Vec<PathBuf> = Vec::new();
         let mut quarantined: Vec<PathBuf> = Vec::new();
+        let mut max_id = 0u64;
         let mut entries: Vec<PathBuf> = Vec::new();
         for lane in 0..stream_lanes() {
             for entry in std::fs::read_dir(lane_dir(&self.data_dir, lane))? {
@@ -653,13 +815,28 @@ impl Store {
                 // durable residual for a pending intent, else removed there). Do
                 // NOT treat it as an orphan data file — that would delete the
                 // durable residual before recovery can promote it.
+            } else if name.ends_with(".meta.corrupt") {
+                // A previous boot parked this identity. Keep both marker and
+                // paired data, even if that data is absent: its WAL may be the
+                // only surviving acknowledged copy.
+                let data_path = PathBuf::from(p.to_str().unwrap().trim_end_matches(".meta.corrupt"));
+                if let Some(id) = self.record_quarantine(&data_path) {
+                    max_id = max_id.max(id);
+                }
+                quarantined.push(data_path);
             } else if name.ends_with(".meta") {
                 let data_path = PathBuf::from(p.as_os_str().to_str().unwrap().trim_end_matches(".meta"));
-                if data_path.exists() {
+                {
                     match std::fs::read(&p) {
                         Ok(bytes) => {
                             if let Ok(meta) = serde_json::from_slice::<Meta>(&bytes) {
-                                metas.insert(meta.path.clone(), (meta, data_path));
+                                if data_path.exists() {
+                                    metas.insert(meta.path.clone(), (meta, data_path));
+                                } else {
+                                    // A valid sidecar without a data file is a
+                                    // stale partially completed deletion.
+                                    std::fs::remove_file(&p)?;
+                                }
                             } else {
                                 // QUARANTINE, never delete: an unparsable sidecar
                                 // next to a data file is far more likely a torn
@@ -673,7 +850,11 @@ impl Store {
                                      (stream skipped this boot; data file kept)",
                                     p.display()
                                 );
-                                let _ = std::fs::rename(&p, p.with_extension("meta.corrupt"));
+                                std::fs::rename(&p, p.with_extension("meta.corrupt"))?;
+                                fsync_parent_dir(&p)?;
+                                if let Some(id) = self.record_quarantine(&data_path) {
+                                    max_id = max_id.max(id);
+                                }
                                 quarantined.push(data_path);
                             }
                         }
@@ -689,8 +870,6 @@ impl Store {
                     }
                     continue;
                 }
-                // Sidecar with NO data file: stale leftover, safe to remove.
-                let _ = std::fs::remove_file(&p);
             } else {
                 data_files.push(p);
             }
@@ -702,7 +881,6 @@ impl Store {
                 let _ = std::fs::remove_file(&p);
             }
         }
-        let mut max_id = 0u64;
         let paths: Vec<String> = metas.keys().cloned().collect();
         // `visiting` tracks the active recursion stack to break cyclic
         // forked_from chains in corrupt sidecars (would otherwise overflow the
@@ -713,6 +891,12 @@ impl Store {
         }
         for (m, _) in metas.values() {
             max_id = max_id.max(m.id);
+            if !self.streams.contains_key(&m.path) {
+                // A usable sidecar can still have unresolved ancestry. Keep
+                // that identity's WAL proof too, rather than treating a skipped
+                // child as an acknowledged deletion when its parent is corrupt.
+                self.quarantined_ids.write().unwrap().insert(m.id);
+            }
         }
         // Keep ids unique across restarts (they feed ETags).
         let cur = self.next_id.load(Ordering::Relaxed);
@@ -859,6 +1043,15 @@ impl Store {
             // registers this stream into the dirty set.
             dirty_epoch: AtomicU64::new(0),
             meta_lock: StdMutex::new(()),
+            lifecycle: StdMutex::new(StreamLifecycle::default()),
+            lifecycle_idle: Condvar::new(),
+            lifecycle_notify: Notify::new(),
+            delete_gate: AsyncMutex::new(()),
+            retirement_lock: StdMutex::new(()),
+            hard_delete: AtomicBool::new(false),
+            parent_released: AtomicBool::new(false),
+            #[cfg(test)]
+            delete_fault: std::sync::atomic::AtomicU8::new(0),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::from_meta(&meta.segments, meta.sealed_offset, &self.segments_dir()),
             blobstore: self.blobstore.clone(),
@@ -939,7 +1132,73 @@ impl Store {
         self.delete_impl(st, true)
     }
 
+    /// Drain async operations before occupying a blocking worker. In particular
+    /// a close may itself need that pool to persist its metadata: waiting for it
+    /// from a DELETE worker can exhaust the pool and deadlock both operations.
+    pub async fn delete_durable(self: &Arc<Self>, st: &Arc<StreamState>) -> std::io::Result<()> {
+        let store = Arc::clone(self);
+        let st = Arc::clone(st);
+        // Once admitted, deletion owns its cleanup independently of the HTTP
+        // future. Dropping the caller while drain waits must not strand a fence.
+        tokio::spawn(async move {
+            let _delete = st.delete_gate.lock().await;
+            st.lifecycle.lock().unwrap().retiring = true;
+            loop {
+                let idle = st.lifecycle_notify.notified();
+                tokio::pin!(idle);
+                idle.as_mut().enable();
+                if st.lifecycle.lock().unwrap().in_flight == 0 {
+                    break;
+                }
+                idle.await;
+            }
+            let deleting = Arc::clone(&st);
+            tokio::task::spawn_blocking(move || store.delete_or_soft_delete_durable(&deleting))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
+
     fn delete_impl(&self, st: &Arc<StreamState>, durable: bool) -> std::io::Result<()> {
+        // A retry owns the same incarnation, including after a partial unlink.
+        // Serialize retries so the fork-parent release runs only once.
+        let _retirement = if durable {
+            st.retirement_lock.lock().unwrap()
+        } else {
+            st.retirement_lock.try_lock().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream retirement already in progress")
+            })?
+        };
+        if !self.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), st)) {
+            return Ok(());
+        }
+        // A lazy attempt must acquire every potentially contended barrier
+        // before latching its fence. Otherwise a harmless checkpoint flush can
+        // leave the stream permanently fenced without starting deletion.
+        let lazy_metadata = if durable {
+            None
+        } else {
+            Some(st.meta_lock.try_lock().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream metadata write in progress")
+            })?)
+        };
+        {
+            let mut lifecycle = st.lifecycle.lock().unwrap();
+            // Lazy expiry runs on a request thread; it must never wait for an
+            // append which may require that same async worker to finish.
+            if !durable && lifecycle.in_flight > 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream operations still in flight"));
+            }
+            lifecycle.retiring = true;
+            while lifecycle.in_flight > 0 {
+                lifecycle = st.lifecycle_idle.wait(lifecycle).unwrap();
+            }
+        }
+        // Exclude any sidecar writer which already captured this stream. The
+        // hard-delete flag below also excludes writers arriving after unlink.
+        let _metadata = lazy_metadata.unwrap_or_else(|| st.meta_lock.lock().unwrap());
         let soft = {
             let mut s = st.shared.write().unwrap();
             if s.ref_count > 0 {
@@ -954,13 +1213,13 @@ impl Store {
                 // Test-only: stand an I/O error in for the sidecar write, so
                 // that the rollback below is what the test actually exercises.
                 #[cfg(test)]
-                let written = if DELETE_FAULT.load(Ordering::Relaxed) == 1 {
+                let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
                     Err(std::io::Error::other("injected soft-delete metadata failure"))
                 } else {
-                    write_meta_sync(st, true)
+                    write_meta_locked(st, true)
                 };
                 #[cfg(not(test))]
-                let written = write_meta_sync(st, true);
+                let written = write_meta_locked(st, true);
 
                 // The `soft_deleted = true` above is already in memory. If the
                 // sidecar write fails the client gets a 500, so that in-memory
@@ -970,6 +1229,7 @@ impl Store {
                 // the stream it is trying to delete.
                 if let Err(error) = written {
                     st.shared.write().unwrap().soft_deleted = false;
+                    st.lifecycle.lock().unwrap().retiring = false;
                     return Err(error);
                 }
             } else {
@@ -979,11 +1239,9 @@ impl Store {
                 });
             }
         } else {
-            // Reclaim this stream's offloaded segments (remote objects + any
-            // staged local chunk files) — safe only here, on a true hard delete
-            // with no remaining fork references.
-            self.gc_remote_segments(st);
-            let fp = st.file_path.clone();
+            st.hard_delete.store(true, Ordering::Release);
+            st.shared.write().unwrap().soft_deleted = true;
+            let context = self.retirement_context();
             // The map entry is dropped only once the removal has actually
             // happened, never before. Dropping it first meant a failed
             // `fsync_parent_dir` returned 500 to the client with the stream
@@ -992,54 +1250,18 @@ impl Store {
             // the path while the old files were still being unlinked.
             if durable {
                 #[cfg(test)]
-                if DELETE_FAULT.load(Ordering::Relaxed) == 2 {
+                if st.delete_fault.load(Ordering::Relaxed) == 2 {
                     return Err(std::io::Error::other("injected hard-delete durability failure"));
                 }
                 // Both unlinks live in the same directory; one dir fsync makes
                 // them crash-durable together.
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(&fp);
-                fsync_parent_dir(&fp)?;
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
+                context.finish_hard(st)?;
+                context.release_parent(st);
             } else {
-                tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_file(meta_path(&fp));
-                    let _ = std::fs::remove_file(fp);
-                });
-                self.streams.remove_if(&st.path, |_, v| Arc::ptr_eq(v, st));
+                context.schedule(st.clone());
             }
-            self.release_parent(st);
         }
         Ok(())
-    }
-
-    /// Decrement the parent's fork refcount; cascade-collect soft-deleted parents
-    /// whose last fork just went away.
-    pub fn release_parent(&self, st: &Arc<StreamState>) {
-        let mut cur = st.parent.clone();
-        while let Some(parent) = cur {
-            let gone = {
-                let mut s = parent.shared.write().unwrap();
-                s.ref_count = s.ref_count.saturating_sub(1);
-                s.soft_deleted && s.ref_count == 0
-            };
-            if !gone {
-                // Persist the decremented refcount.
-                let p2 = parent.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&p2, true);
-                });
-                break;
-            }
-            self.streams.remove_if(&parent.path, |_, v| Arc::ptr_eq(v, &parent));
-            self.gc_remote_segments(&parent);
-            let fp = parent.file_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let _ = std::fs::remove_file(meta_path(&fp));
-                let _ = std::fs::remove_file(fp);
-            });
-            cur = parent.parent.clone();
-        }
     }
 
     pub fn create(
@@ -1050,6 +1272,15 @@ impl Store {
         base_offset: u64,
     ) -> std::io::Result<CreateResult> {
         use dashmap::mapref::entry::Entry;
+        // Reserve the fork source through the durable reference update. DELETE
+        // waits for this reservation before deciding hard vs soft removal.
+        let _parent_operation = match parent.as_ref() {
+            Some(parent) => match parent.begin_operation() {
+                Some(operation) => Some(operation),
+                None => return Ok(CreateResult::Conflict),
+            },
+            None => None,
+        };
         // Fast path: existing stream → config comparison.
         if let Some(existing) = self.get(path) {
             if existing.shared.read().unwrap().soft_deleted {
@@ -1099,6 +1330,15 @@ impl Store {
             // registers this stream into the dirty set.
             dirty_epoch: AtomicU64::new(0),
             meta_lock: StdMutex::new(()),
+            lifecycle: StdMutex::new(StreamLifecycle::default()),
+            lifecycle_idle: Condvar::new(),
+            lifecycle_notify: Notify::new(),
+            delete_gate: AsyncMutex::new(()),
+            retirement_lock: StdMutex::new(()),
+            hard_delete: AtomicBool::new(false),
+            parent_released: AtomicBool::new(false),
+            #[cfg(test)]
+            delete_fault: std::sync::atomic::AtomicU8::new(0),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::default(),
             blobstore: self.blobstore.clone(),
@@ -1159,11 +1399,13 @@ impl Store {
     }
 }
 
-/// Test-only DELETE fault injection: 1 = fail the soft-delete sidecar write,
-/// 2 = fail the hard-delete durability step. The failure modes being pinned are
-/// I/O errors that cannot be provoked from a unit test any other way.
-#[cfg(test)]
-static DELETE_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+fn remove_file_if_present(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 fn config_matches(existing: &StreamState, requested: &StreamConfig) -> bool {
     let ex = &existing.config;
@@ -1414,6 +1656,15 @@ pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
     // Serialize per stream so concurrent writers don't race on the temp file or
     // reorder renames (a stale flush must not clobber a durable manifest flip).
     let _g = st.meta_lock.lock().unwrap_or_else(|e| e.into_inner());
+    // DELETE owns this same barrier before unlinking. A delayed checkpoint,
+    // close or TTL flush may still hold an Arc, but cannot recreate a sidecar.
+    if st.hard_delete.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    write_meta_locked(st, durable)
+}
+
+fn write_meta_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
     let meta = Meta::capture(st);
     let bytes = serde_json::to_vec(&meta).expect("meta serializes");
     let tmp = meta_path(&st.file_path).with_extension("meta.tmp");
@@ -2368,6 +2619,32 @@ mod tier_tests {
         assert_eq!(count_files(&dir.path().join("segments")), 0, "leaked local chunk files after hard delete");
     }
 
+    #[tokio::test]
+    async fn failed_delete_preserves_offloaded_segments_for_recovery() {
+        let dir = temp_dir("gc-after-delete-commit");
+        let cfg = local_tier(dir.path(), 64 * 1024);
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg.clone()).unwrap());
+        let st = match store.create("s/retained", octet_cfg(), None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        for chunk in payload.chunks(8 * 1024) {
+            append_wire(&st, chunk).await;
+        }
+        store.maybe_seal(&st).await;
+        assert!(!st.tier.manifest.lock().unwrap().segments.is_empty());
+        st.delete_fault.store(2, Ordering::Relaxed);
+        assert!(store.delete_or_soft_delete_durable(&st).is_err());
+        assert!(!st.tier.manifest.lock().unwrap().deleted, "refused deletion cannot admit remote GC");
+        assert_eq!(read_logical(&st, 0, payload.len() as u64).await, payload);
+        drop(st);
+        drop(store);
+        let restored = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), cfg).unwrap());
+        let st = restored.get("s/retained").unwrap();
+        assert_eq!(read_logical(&st, 0, payload.len() as u64).await, payload, "restart still reads offloaded bytes");
+    }
+
     /// Once a stream is hard-deleted (`deleted` set), a seal pass must bail
     /// without staging new chunk files or manifest entries — otherwise it would
     /// race the GC reclaim and leak. (On the pre-fix code, with no `deleted`
@@ -2473,6 +2750,134 @@ mod meta_sweep_tests {
         assert!(!meta_path(&st.file_path).exists(), "sweep must not resurrect a deleted stream's sidecar");
     }
 
+    #[test]
+    fn hard_delete_unlink_failure_is_reported_and_retry_keeps_identity() {
+        let dir = temp_dir("delete-unlink-failure");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = create(&store, "s");
+        let sidecar = meta_path(&st.file_path);
+        std::fs::remove_file(&sidecar).unwrap();
+        // A directory at the unlink target produces a real filesystem failure
+        // even when tests run with permission to bypass directory mode bits.
+        std::fs::create_dir(&sidecar).unwrap();
+        assert!(store.delete_or_soft_delete_durable(&st).is_err(), "failed unlink must never acknowledge DELETE");
+        assert!(store.streams.contains_key("s"), "identity retained for DELETE retry");
+        assert!(st.file_path.exists(), "data must be retained when sidecar removal failed");
+        std::fs::remove_dir(&sidecar).unwrap();
+        store.delete_or_soft_delete_durable(&st).unwrap();
+        assert!(!store.streams.contains_key("s"));
+        assert!(!st.file_path.exists());
+        write_meta_sync(&st, true).unwrap();
+        assert!(!sidecar.exists(), "a stale sidecar writer cannot resurrect hard-deleted metadata");
+    }
+
+    #[test]
+    fn lazy_retirement_metadata_contention_does_not_latch_a_fence() {
+        let dir = temp_dir("lazy-delete-contention");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = create(&store, "s");
+        let writer = st.meta_lock.lock().unwrap();
+        assert_eq!(store.delete_impl(&st, false).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!st.is_retiring(), "a deferred expiry must not poison operation admission");
+        assert!(st.begin_operation().is_some());
+        drop(writer);
+        store.delete_or_soft_delete_durable(&st).unwrap();
+    }
+
+    #[tokio::test]
+    async fn soft_parent_cleanup_waits_for_contended_metadata() {
+        let dir = temp_dir("soft-parent-cleanup-contention");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent");
+        let child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        store.delete_durable(&parent).await.unwrap();
+        let writer = parent.meta_lock.lock().unwrap();
+        store.delete_or_soft_delete_durable(&child).unwrap();
+        assert!(store.streams.contains_key("parent"), "busy parent retained until its cleanup completes");
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.streams.contains_key("parent") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!parent.file_path.exists());
+        assert!(!meta_path(&parent.file_path).exists());
+        write_meta_sync(&parent, true).unwrap();
+        assert!(!meta_path(&parent.file_path).exists());
+    }
+
+    #[tokio::test]
+    async fn queued_parent_cleanup_revalidates_rollback_before_releasing_ancestor() {
+        let dir = temp_dir("soft-parent-cleanup-rollback");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let grandparent = create(&store, "grandparent");
+        let parent = match store.create("parent", octet_cfg(), Some(grandparent.clone()), 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create parent failed"),
+        };
+        let child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create child failed"),
+        };
+        // Stand in for a soft DELETE whose tentative flag is visible while its
+        // metadata commit owns the retirement barrier, then fails and rolls back.
+        let committing = parent.retirement_lock.lock().unwrap();
+        parent.shared.write().unwrap().soft_deleted = true;
+        store.delete_or_soft_delete_durable(&child).unwrap();
+        assert_eq!(grandparent.shared.read().unwrap().ref_count, 1, "queued cleanup cannot release ancestor early");
+        parent.shared.write().unwrap().soft_deleted = false;
+        drop(committing);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while disk_meta(&parent).ref_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(store.streams.contains_key("parent"), "rolled-back soft deletion remains live");
+        assert!(parent.file_path.exists());
+        assert!(parent.begin_operation().is_some());
+        assert!(!parent.tier.manifest.lock().unwrap().deleted);
+        assert_eq!(grandparent.shared.read().unwrap().ref_count, 1);
+        assert!(!parent.parent_released.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancelled_delete_finishes_owned_cleanup_after_operations_drain() {
+        let dir = temp_dir("delete-cancelled-drain");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let st = create(&store, "s");
+        let operation = st.begin_operation().unwrap();
+        let deleting_store = store.clone();
+        let deleting_stream = st.clone();
+        let deletion = tokio::spawn(async move { deleting_store.delete_durable(&deleting_stream).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !st.is_retiring() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        deletion.abort();
+        assert!(deletion.await.unwrap_err().is_cancelled());
+        assert!(st.file_path.exists(), "owned deletion still waits for the admitted operation");
+        drop(operation);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.streams.contains_key("s") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!st.file_path.exists());
+        assert!(!meta_path(&st.file_path).exists());
+    }
+
     /// A DELETE that fails is not a DELETE. Neither failure path may leave the
     /// store in a state the client's retry cannot recover from: the soft path
     /// must not leave the stream marked deleted in memory after returning an
@@ -2487,15 +2892,15 @@ mod meta_sweep_tests {
         // Soft delete: a live fork reference forces the soft path.
         let soft = create(&store, "soft");
         soft.shared.write().unwrap().ref_count = 1;
-        DELETE_FAULT.store(1, Ordering::Relaxed);
+        soft.delete_fault.store(1, Ordering::Relaxed);
         assert!(store.delete_or_soft_delete_durable(&soft).is_err(), "the injected sidecar failure must surface");
-        DELETE_FAULT.store(0, Ordering::Relaxed);
+        soft.delete_fault.store(0, Ordering::Relaxed);
         assert!(!soft.shared.read().unwrap().soft_deleted, "a failed soft delete must roll the in-memory mark back");
         assert!(store.streams.contains_key("soft"), "the stream must still be reachable");
 
         // Hard delete: no references, so the unlink path runs.
         let hard = create(&store, "hard");
-        DELETE_FAULT.store(2, Ordering::Relaxed);
+        hard.delete_fault.store(2, Ordering::Relaxed);
         assert!(store.delete_or_soft_delete_durable(&hard).is_err(), "the injected durability failure must surface");
         assert!(
             store.streams.contains_key("hard"),
@@ -2503,7 +2908,7 @@ mod meta_sweep_tests {
         );
 
         // The retry, with the fault cleared, completes it.
-        DELETE_FAULT.store(0, Ordering::Relaxed);
+        hard.delete_fault.store(0, Ordering::Relaxed);
         store.delete_or_soft_delete_durable(&hard).unwrap();
         assert!(!store.streams.contains_key("hard"), "a durable hard delete removes the stream");
     }

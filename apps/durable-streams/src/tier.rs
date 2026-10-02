@@ -376,6 +376,9 @@ impl Store {
         if !self.tier_config.enabled() {
             return;
         }
+        let Some(_operation) = st.begin_operation() else {
+            return;
+        };
         // Only one sealing pass per stream at a time, and never after a hard
         // delete (the GC pass owns the segments now).
         {
@@ -691,8 +694,13 @@ impl Store {
 
     /// Delete every remote object backing a hard-deleted stream's sealed
     /// segments. Called only on hard delete (ref_count == 0).
-    pub fn gc_remote_segments(&self, st: &Arc<StreamState>) {
-        if !self.tier_config.enabled() {
+    pub(crate) fn gc_remote_segments_owned(
+        st: &Arc<StreamState>,
+        config: &TierConfig,
+        bs: Option<crate::blobstore::SharedBlobStore>,
+        seg_dir: PathBuf,
+    ) {
+        if !config.enabled() {
             return;
         }
         // Mark the stream deleted FIRST (synchronously, before serving stops
@@ -701,9 +709,7 @@ impl Store {
         // is final and we never race a concurrent stage/upload.
         st.tier.manifest.lock().unwrap().deleted = true;
 
-        let bs = self.blobstore.clone();
-        let prefix = self.tier_config.key_prefix.clone();
-        let seg_dir = self.segments_dir();
+        let prefix = config.key_prefix.clone();
         // Deterministic on-disk prefix for this stream's chunk files
         // (`<fname>.seg.<start>`), used as a GC backstop for chunks staged on disk
         // but not yet in the manifest snapshot.

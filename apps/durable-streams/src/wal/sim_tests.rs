@@ -718,7 +718,7 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                 let si = sim.rng.below(sim.shards_n as u64) as usize;
                 let shard = Arc::clone(&walset.shards()[si]);
                 shard.checkpoint().await.unwrap_or_else(|e| sim.fail(format!("checkpoint shard {si} failed: {e}")));
-                let tails = shard.read_durable_tails();
+                let tails = shard.read_durable_tails().unwrap();
                 for m in &mut sim.models {
                     if let Some(&t) = tails.get(&m.id) {
                         if t > m.floor {

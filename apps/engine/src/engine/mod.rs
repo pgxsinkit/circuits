@@ -194,6 +194,14 @@ impl DegradeState {
     }
 }
 
+/// A subset page and the exact visibility fences of its settled Postgres snapshot.
+pub struct SubsetPage {
+    pub rows: Vec<serde_json::Value>,
+    pub lsn: String,
+    pub snapshot: String,
+    pub horizon: String,
+}
+
 #[derive(Clone)]
 pub struct Engine {
     ds: DsClient,
@@ -219,6 +227,8 @@ pub struct Engine {
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
     subqueries: Arc<Mutex<SubqueryRegistry>>,
+    /// Serializes subquery initialization through completion or owned rollback.
+    subquery_init: Arc<Mutex<()>>,
     /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
     /// and only when someone is subscribed; slow subscribers lag and drop.
     trace_tx: tokio::sync::broadcast::Sender<Arc<String>>,
@@ -760,6 +770,7 @@ pub(crate) enum ShareOutcome {
     Failed,
     /// The create overlapped a degradation and refused (see [`Engine::ensure_create_not_degraded`]).
     Degraded,
+    Unsettled,
     /// The creator's closing re-check after its catalog durability wait found the shape retired
     /// underneath it (see [`Engine::recheck_after_durability`]). Distinct from [`Self::Failed`]
     /// because the creator does not give up on that: it redoes the create. A joiner must reach the
@@ -767,6 +778,12 @@ pub(crate) enum ShareOutcome {
     /// too. Reported as `Failed` it would answer 500 while the creator quietly succeeded on its
     /// next attempt, which is two identical requests disagreeing about the same outcome.
     Raced,
+}
+
+impl ShareOutcome {
+    fn from_error(error: &anyhow::Error) -> Self {
+        if error.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some() { Self::Unsettled } else { Self::Failed }
+    }
 }
 
 /// Wait until a shared shape's creator reports the shape live (or failed). Joining before the
@@ -779,6 +796,12 @@ async fn await_share_ready(mut rx: tokio::sync::watch::Receiver<ShareOutcome>, i
             // The creator's own refusal, verbatim: the HTTP layer downcasts it to 503 exactly as
             // it does for the creator's error.
             ShareOutcome::Degraded => return Err(anyhow::Error::new(Degraded)),
+            ShareOutcome::Unsettled => {
+                return Err(anyhow::Error::new(crate::pg::SnapshotUnsettled {
+                    cause: crate::pg::UnsettledCause::Shared,
+                    pending: Vec::new(),
+                }));
+            }
             // Likewise typed, so this joiner's attempt is redone exactly as the creator's is.
             ShareOutcome::Raced => {
                 return Err(anyhow::Error::new(CreateRaced(format!(
@@ -940,6 +963,7 @@ impl Engine {
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             subqueries,
+            subquery_init: Arc::new(Mutex::new(())),
             trace_tx,
             flip_tx,
             pending_flips,
@@ -1041,11 +1065,11 @@ impl Engine {
         // every boot; the seed's SnapshotGate fences change-log replay exactly like a shape
         // backfill.
         let url = self.pg_url.clone().context("counts pipelines need a pg_url to seed")?;
-        let client = crate::pg::pool_for(&url).get().await?;
+        let mut client = crate::pg::pool_for(&url).get().await?;
         let mut gates = HashMap::new();
         for spec in &counts {
             let ts = schemas.get(&spec.table).expect("resolved above");
-            let (groups, gate) = crate::pg::backfill_group_counts(&client, ts, &spec.group_cols).await?;
+            let (groups, gate) = crate::pg::backfill_group_counts(&mut client, ts, &spec.group_cols).await?;
             let total = groups.len();
             arr.seed_groups(&spec.table, groups).await?;
             gates.insert(spec.table.clone(), gate);
@@ -1224,6 +1248,7 @@ impl Engine {
             self.trace_tx.clone(),
             self.arrangements.lock().unwrap().clone(),
             self.arr_gates.read().unwrap().clone(),
+            self.pg_url.as_deref().map(|url| crate::pg::pool_for(url).sequenced()),
             self.pg_url.is_none(),
             hold_reads,
             // Two std-locked handles, not an `Engine`: see `FailClosed`.
@@ -1625,7 +1650,7 @@ impl Engine {
         order_by: Option<(String, bool)>,
         limit: Option<i64>,
         offset: Option<i64>,
-    ) -> Result<(Vec<serde_json::Value>, String)> {
+    ) -> Result<SubsetPage> {
         let (ts, schemas) = {
             let st = self.state.lock().await;
             let ts = st.tables.get(table).cloned().ok_or_else(|| anyhow::anyhow!("unknown table '{table}'"))?;
@@ -1651,11 +1676,13 @@ impl Engine {
             None => None,
         };
         let url = self.pg_url.clone().context("query_subset requires postgres mode")?;
-        let client = crate::pg::pool_for(&url).get().await?;
-        let sq = crate::pg::query_subset_where(&client, &ts, where_sql, order, limit, offset).await?;
+        let scope = crate::pg::SettleScope::request(table)
+            .with(where_.as_ref().map(crate::subquery::referenced_tables).unwrap_or_default().iter());
+        let mut client = crate::pg::pool_for(&url).get().await?;
+        let sq = crate::pg::query_subset_where(&mut client, &ts, where_sql, &scope, order, limit, offset).await?;
         let proj = out_cols.as_deref().map(Vec::as_slice);
         let rows = sq.rows.iter().map(|r| ts.row_to_json_cols(r, proj)).collect();
-        Ok((rows, sq.lsn))
+        Ok(SubsetPage { rows, lsn: sq.lsn, snapshot: sq.snapshot, horizon: sq.horizon })
     }
 
     /// The column list + primary key of a replicated table, for the visualizer's add-row form. Reads the

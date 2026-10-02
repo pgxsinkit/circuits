@@ -35,8 +35,9 @@ pub struct EnvelopeHeaders {
     // The server stamps an `offset` onto each item; accept it on read, never send it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<String>,
-    /// Postgres commit LSN of the change (set by the replication ingestor). Used to skip changes a
-    /// shape/family already reflects from its backfill snapshot (`lsn <= seed_lsn`).
+    /// Postgres commit LSN of the change (set by the replication ingestor). SnapshotGate skips
+    /// changes by xid visibility within its WAL horizon; `lsn < seed_lsn` is the fallback only
+    /// when a change has no xid. Commit WAL can precede snapshot visibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lsn: Option<String>,
     /// Position of this change within its transaction (set by the ingestor). `(lsn, seq)` uniquely
@@ -354,6 +355,55 @@ trait DurableStreamStore: Send + Sync {
 struct HttpDurableStreamsStore {
     base: String,
     http: reqwest::Client,
+    live_http: reqwest::Client,
+}
+
+/// Each HTTP attempt is finite, including a server that sends headers but never finishes its
+/// body. Idle long-polls need longer deadlines than ordinary requests: the log server's default
+/// long-poll window is 30 seconds, and deployments may configure a longer one.
+#[derive(Clone, Copy)]
+struct DsTimeouts {
+    connect: std::time::Duration,
+    read: std::time::Duration,
+    live_read: std::time::Duration,
+    request: std::time::Duration,
+}
+
+impl Default for DsTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: std::time::Duration::from_secs(10),
+            read: std::time::Duration::from_secs(30),
+            live_read: std::time::Duration::from_secs(45),
+            request: std::time::Duration::from_secs(60),
+        }
+    }
+}
+
+impl DsTimeouts {
+    fn from_env() -> Self {
+        let secs = |name: &str, default: std::time::Duration| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|v| *v > 0)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(default)
+        };
+        let defaults = Self::default();
+        Self {
+            connect: secs("CIRCUITS_DS_CONNECT_TIMEOUT_SECS", defaults.connect),
+            read: secs("CIRCUITS_DS_READ_TIMEOUT_SECS", defaults.read),
+            live_read: secs("CIRCUITS_DS_LIVE_READ_TIMEOUT_SECS", defaults.live_read),
+            request: secs("CIRCUITS_DS_REQUEST_TIMEOUT_SECS", defaults.request),
+        }
+    }
+
+    fn live_request(self) -> std::time::Duration {
+        // The whole-request deadline also covers the idle wait; leave room for the response
+        // after it. A tiny ordinary-request deadline must not cut off a healthy long-poll.
+        self.request.max(self.live_read.saturating_add(std::time::Duration::from_secs(15)))
+    }
 }
 
 /// The HTTP client the log-server adapter sends its requests with.
@@ -365,10 +415,15 @@ struct HttpDurableStreamsStore {
 /// bundle — and the engine image is Debian slim without `ca-certificates`. There the client falls
 /// back to an empty root store: plain HTTP is unaffected, and an `https://` log-server URL fails its
 /// handshake when used, which is what it did on such a host before reqwest 0.13.
-fn http_client() -> reqwest::Client {
-    reqwest::Client::builder().build().unwrap_or_else(|e| {
+fn http_client(
+    connect: std::time::Duration,
+    read: std::time::Duration,
+    request: std::time::Duration,
+) -> reqwest::Client {
+    let builder = || reqwest::Client::builder().connect_timeout(connect).read_timeout(read).timeout(request);
+    builder().build().unwrap_or_else(|e| {
         tracing::debug!("log-server HTTP client: no system CA roots ({e}); https would verify against none");
-        reqwest::Client::builder()
+        builder()
             .tls_certs_only(Vec::<reqwest::Certificate>::new())
             .build()
             .expect("an HTTP client with an empty CA root store")
@@ -377,7 +432,15 @@ fn http_client() -> reqwest::Client {
 
 impl HttpDurableStreamsStore {
     fn new(base: String) -> Self {
-        Self { base, http: http_client() }
+        Self::with_timeouts(base, DsTimeouts::from_env())
+    }
+
+    fn with_timeouts(base: String, timeouts: DsTimeouts) -> Self {
+        Self {
+            base,
+            http: http_client(timeouts.connect, timeouts.read, timeouts.request),
+            live_http: http_client(timeouts.connect, timeouts.live_read, timeouts.live_request()),
+        }
     }
 
     fn stream_url(&self, path: &str) -> String {
@@ -445,7 +508,8 @@ impl DurableStreamStore for HttpDurableStreamsStore {
             if live {
                 url.push_str("&live=long-poll");
             }
-            let res = self.http.get(url).send().await.with_context(|| format!("GET {path}"))?;
+            let http = if live { &self.live_http } else { &self.http };
+            let res = http.get(url).send().await.with_context(|| format!("GET {path}"))?;
             Ok(Self::response(res, BodyRead::OnData).await)
         })
     }
@@ -609,6 +673,9 @@ impl DsClient {
     /// re-seed, a dormant shape's replay. Transient storage failures (`ds::is_unavailable`:
     /// transport, timeout, 5xx) are retried with capped backoff until `budget` runs out or the
     /// shutdown token fires.
+    /// The budget is checked between attempts, including their reconciliation `HEAD`: an
+    /// already-started HTTP request finishes under its transport deadlines before this check,
+    /// so the total wait can exceed `budget` by that bounded append/reconciliation sequence.
     ///
     /// The plain [`Self::append`] propagates the first error, and an error on these paths is costly
     /// — a dormant shape's failed replay evicts it, and a restore that fails costs the whole boot
@@ -922,6 +989,181 @@ fn header(res: &reqwest::Response, name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    /// Keep the connection open after the selected chunks, even when the advertised body is
+    /// incomplete. Dropping the server aborts its task and closes the socket on every test path.
+    struct ControlledServer {
+        base: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ControlledServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn controlled_server(chunks: Vec<(Duration, Vec<u8>)>) -> ControlledServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                request.push(byte[0]);
+            }
+            for (delay, chunk) in chunks {
+                tokio::time::sleep(delay).await;
+                if socket.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        ControlledServer { base, task }
+    }
+
+    fn short_timeouts() -> DsTimeouts {
+        DsTimeouts {
+            connect: Duration::from_secs(1),
+            read: Duration::from_millis(120),
+            live_read: Duration::from_secs(1),
+            request: Duration::from_millis(200),
+        }
+    }
+
+    fn timeout_client(base: &str, timeouts: DsTimeouts) -> DsClient {
+        DsClient::with_store(
+            base.to_string(),
+            Arc::new(HttpDurableStreamsStore::with_timeouts(base.to_string(), timeouts)),
+        )
+    }
+
+    fn assert_transport_timeout(error: &anyhow::Error) {
+        assert!(is_unavailable(error), "a transport timeout must be retryable: {error:#}");
+        assert!(
+            error.chain().filter_map(|e| e.downcast_ref::<reqwest::Error>()).any(reqwest::Error::is_timeout),
+            "the reqwest timeout must survive the facade: {error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_http_operations_bound_a_server_that_never_sends_headers() {
+        for operation in ["ensure", "append", "read", "head", "close", "delete"] {
+            let server = controlled_server(Vec::new()).await;
+            let store = HttpDurableStreamsStore::with_timeouts(server.base.clone(), short_timeouts());
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                match operation {
+                    "ensure" => store.ensure("shape/s1", "application/json").await,
+                    "append" => store.append("shape/s1", "application/json", b"[]".to_vec(), BodyRead::Always).await,
+                    "read" => store.read("changes/0", "-1", false).await,
+                    "head" => store.head("shape/s1").await,
+                    "close" => store.close("shape/s1").await,
+                    "delete" => store.delete("shape/s1").await,
+                    _ => unreachable!(),
+                }
+            })
+            .await
+            .expect("every operation must finish under its transport deadline");
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("{operation} accepted a server that sent no headers"),
+            };
+            assert_transport_timeout(&error);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_success_body_never_yields_a_read_page_or_catalog_offset() {
+        for catalog in [false, true] {
+            let server = controlled_server(vec![(
+                Duration::ZERO,
+                b"HTTP/1.1 200 OK\r\nContent-Length: 40\r\nStream-Next-Offset: tempting-offset\r\n\r\n[".to_vec(),
+            )])
+            .await;
+            let client = timeout_client(&server.base, short_timeouts());
+            let result = tokio::time::timeout(Duration::from_secs(2), async {
+                if catalog {
+                    client.read_json("meta/catalog", "prior-offset").await.map(|_| ())
+                } else {
+                    client.read("changes/0", "prior-offset", false).await.map(|_| ())
+                }
+            })
+            .await
+            .expect("body acquisition must finish under its read deadline");
+            assert_transport_timeout(&result.expect_err("an incomplete body is never a successful page"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_trickling_body_is_bounded_by_the_whole_request_deadline() {
+        let mut chunks = vec![(Duration::ZERO, b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n[".to_vec())];
+        chunks.extend((0..8).map(|_| (Duration::from_millis(60), b" ".to_vec())));
+        chunks.push((Duration::from_millis(60), b"]".to_vec()));
+        let server = controlled_server(chunks).await;
+        let client = timeout_client(&server.base, DsTimeouts { read: Duration::from_secs(1), ..short_timeouts() });
+        let result = tokio::time::timeout(Duration::from_secs(2), client.read_json("meta/catalog", "-1"))
+            .await
+            .expect("the total request deadline bounds even a progressing body");
+        assert_transport_timeout(&result.expect_err("read progress cannot reset the whole-request deadline"));
+    }
+
+    #[tokio::test]
+    async fn a_healthy_long_poll_outlives_both_ordinary_deadlines() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nStream-Next-Offset: tail\r\nStream-Up-To-Date: true\r\n\r\n[]";
+        let server = controlled_server(vec![(Duration::from_millis(350), response.to_vec())]).await;
+        let client = timeout_client(&server.base, short_timeouts());
+        let page = tokio::time::timeout(Duration::from_secs(2), client.read("changes/0", "tail", true))
+            .await
+            .expect("a healthy long-poll must finish")
+            .expect("its deadline must allow the server's idle wait");
+        assert!(page.envelopes.is_empty());
+        assert_eq!(page.next_offset.as_deref(), Some("tail"));
+        assert!(page.up_to_date);
+    }
+
+    #[tokio::test]
+    async fn a_long_poll_that_never_answers_also_times_out() {
+        let server = controlled_server(Vec::new()).await;
+        let client = timeout_client(&server.base, short_timeouts());
+        let result = tokio::time::timeout(Duration::from_secs(2), client.read("changes/0", "tail", true))
+            .await
+            .expect("the longer idle deadline must still be finite");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("an unanswered long-poll must time out"),
+        };
+        assert_transport_timeout(&error);
+    }
+
+    #[tokio::test]
+    async fn a_large_indivisible_json_value_remains_readable() {
+        let value = "x".repeat(3 * 1024 * 1024);
+        let body = serde_json::to_vec(&vec![serde_json::json!({ "payload": value })]).unwrap();
+        let mut response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend(body);
+        let server = controlled_server(vec![(Duration::ZERO, response)]).await;
+        let client = timeout_client(&server.base, DsTimeouts::default());
+        let (events, _, _) = client.read_json("meta/catalog", "-1").await.unwrap();
+        assert_eq!(events[0]["payload"].as_str().unwrap(), value);
+    }
+
+    #[test]
+    fn default_long_poll_deadlines_clear_the_log_servers_default_idle_wait() {
+        let timeouts = DsTimeouts::default();
+        assert!(timeouts.live_read > Duration::from_secs(30));
+        assert!(timeouts.live_request() > timeouts.live_read);
+        assert!(timeouts.live_read > timeouts.read);
+        assert!(short_timeouts().live_request() > short_timeouts().request);
+    }
 
     #[derive(Default)]
     struct ScriptedStore {

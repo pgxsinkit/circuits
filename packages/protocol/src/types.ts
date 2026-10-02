@@ -198,12 +198,15 @@ export interface SubsetDef {
   offset?: number;
 }
 
-/** Result of a subset query: the page rows, plus the Postgres snapshot LSN they were read at (so a
- * live tail can be followed from exactly that point with no gap or duplicate). */
+/** A subset page and the visibility fences used to merge its separately followed live tail. */
 export interface SubsetResult {
   rows: Row[];
   /** `pg_current_wal_lsn()` at the read snapshot. */
   lsn: string;
+  /** Transaction visibility (`pg_current_snapshot()::text`, full xid8 values). */
+  snapshot?: string;
+  /** WAL insertion position captured with the snapshot; bounds xid comparison lifetime. */
+  horizon?: string;
 }
 
 /** Scalar aggregation functions. */

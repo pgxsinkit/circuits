@@ -135,6 +135,8 @@ struct QueryReq {
 struct QueryResp {
     rows: Vec<serde_json::Value>,
     lsn: String,
+    snapshot: String,
+    horizon: String,
 }
 
 async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -> Result<Json<QueryResp>, AppError> {
@@ -143,8 +145,8 @@ async fn query_subset(State(engine): State<Engine>, Json(req): Json<QueryReq>) -
     engine.ensure_booted()?;
     engine.ensure_not_degraded()?;
     let order_by = req.order_by.map(|o| (o.col, o.desc));
-    let (rows, lsn) = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
-    Ok(Json(QueryResp { rows, lsn }))
+    let page = engine.query_subset(&req.table, req.where_, req.columns, order_by, req.limit, req.offset).await?;
+    Ok(Json(QueryResp { rows: page.rows, lsn: page.lsn, snapshot: page.snapshot, horizon: page.horizon }))
 }
 
 async fn define_schema(
@@ -719,6 +721,8 @@ async fn replication_lsn(State(engine): State<Engine>) -> Json<serde_json::Value
     let changes = engine.changes_position();
     Json(serde_json::json!({
         "lsn": engine.replication_lsn(),
+        "visibilityWaits": crate::pg::settle_waits_active(),
+        "settle": crate::pg::settle_stats_json(),
         "sync": engine.replication_sync(),
         // Deferred subquery flip batches not yet propagated. Convergence barrier = sync caught up
         // + per-table offsets at tail + pendingFlips == 0. An abandoned batch never decrements, so
@@ -820,7 +824,9 @@ impl From<anyhow::Error> for AppError {
     fn from(e: anyhow::Error) -> Self {
         // A boot that has not finished restoring the durable catalog (ADR-0009): the request is fine
         // and will succeed once the engine is serving, which is what `Retry-After` says.
-        if e.downcast_ref::<crate::engine::Booting>().is_some() {
+        if e.downcast_ref::<crate::engine::Booting>().is_some()
+            || e.downcast_ref::<crate::pg::SnapshotUnsettled>().is_some()
+        {
             return AppError { status: StatusCode::SERVICE_UNAVAILABLE, msg: format!("{e:#}"), retry_after: Some(1) };
         }
         // A degradation is the one engine failure that is not a 500: the request was fine, the
