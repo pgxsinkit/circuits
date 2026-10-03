@@ -882,6 +882,434 @@ impl Drop for StagePause {
     }
 }
 
+async fn stream_frontier_image(store: &Arc<Store>, name: &str) -> serde_json::Value {
+    let stream = store.get(name).unwrap();
+    let written = stream.appender.lock().await.written;
+    let (tail, durable_tail) = {
+        let shared = stream.shared.read().unwrap();
+        (shared.tail, shared.durable_tail)
+    };
+    let mut offsets = Vec::new();
+    for method in [Method::Get, Method::Head] {
+        let request = Req {
+            method,
+            path: name.into(),
+            query: Some(format!("offset={}", fork_offset(0))),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        };
+        let response = handlers::handle(store.clone(), request).await;
+        offsets.push(serde_json::json!({
+            "status": response.status,
+            "next_offset": response.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("stream-next-offset")).map(|(_, value)| value),
+            "declared_body_bytes": response.body.len(),
+        }));
+    }
+    serde_json::json!({
+        "physical_bytes": stream_file_bytes(store, name),
+        "writer_tail": tail,
+        "durable_tail": durable_tail,
+        "appender_written": written,
+        "reads": offsets,
+    })
+}
+
+/// A checkpoint must not certify bytes that a real POST will truncate after
+/// WAL staging rejects it. Pause only at the existing pre-stage seam: the real
+/// handler has written its body, advanced its tail and registered dirty work.
+async fn checkpoint_does_not_certify_rejected_write(initial_put: bool) {
+    let dir = temp_dir("checkpoint-rejected-append-tail");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "other", OCTET).await;
+    if !initial_put {
+        create_stream(&h.store, "stream", OCTET).await;
+        append_acked(&h.store, "stream", OCTET, b"baseline|").await;
+    }
+    let shard = h.walset.shards()[0].clone();
+    shard.checkpoint().await.unwrap();
+    let baseline = if initial_put { None } else { Some(stream_frontier_image(&h.store, "stream").await) };
+    let baseline_bytes = if initial_put { b"".as_slice() } else { b"baseline|".as_slice() };
+    let baseline_tail = baseline_bytes.len() as u64;
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    shard.set_on_stage_hook(Box::new(move |id| {
+        let entered = entered_tx.lock().unwrap().take();
+        if let Some(entered) = entered {
+            let _ = entered.send(id);
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let request =
+        if initial_put { put_req("stream", OCTET, &[b'x'; 512], &[]) } else { post_req("stream", OCTET, &[b'x'; 512]) };
+    let append = tokio::spawn(handlers::handle(h.store.clone(), request));
+    let stream_id = tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    let attempted_tail = h.store.get("stream").unwrap().shared.read().unwrap().tail;
+    let (capture_tx, capture_rx) = tokio::sync::oneshot::channel();
+    let capture_tx = std::sync::Mutex::new(Some(capture_tx));
+    shard.set_on_checkpoint_capture_hook(Box::new(move |id| {
+        if id == stream_id {
+            if let Some(captured) = capture_tx.lock().unwrap().take() {
+                let _ = captured.send(());
+            }
+        }
+    }));
+    let checkpoint_shard = shard.clone();
+    let checkpoint = tokio::spawn(async move { checkpoint_shard.checkpoint().await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), capture_rx).await.unwrap().unwrap();
+    // A blocked capture owns no shard-wide staging/dirty lock. A different
+    // stream on this same shard must still stage, become durable and ACK.
+    let other = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        handlers::handle(h.store.clone(), post_req("other", OCTET, b"other|")),
+    )
+    .await;
+    let blocked = !checkpoint.is_finished();
+    // Always unblock and join the rejected POST before asserting or dropping
+    // the runtime. Its 512-byte body cannot fit a 256-byte WAL segment.
+    drop(pause);
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), checkpoint).await.unwrap().unwrap().unwrap();
+    let checkpoint_tail = shard.read_durable_tails().unwrap().get(&stream_id).copied();
+    shard.set_on_stage_hook(Box::new(|_| {}));
+    shard.set_on_checkpoint_capture_hook(Box::new(|_| {}));
+    let rolled_back = stream_frontier_image(&h.store, "stream").await;
+    let baseline = baseline.unwrap_or_else(|| rolled_back.clone());
+    drop(shard);
+    h.crash();
+
+    // Exercise the entire production recovery sequence, its read offsets and
+    // its next writer, then reboot again. No tail or proof is manufactured.
+    let reopened = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered = stream_frontier_image(&reopened.store, "stream").await;
+    let following = handlers::handle(reopened.store.clone(), post_req("stream", OCTET, b"next|")).await;
+    let after_following = stream_frontier_image(&reopened.store, "stream").await;
+    reopened.crash();
+    let repeated = match Harness::boot_with_segment_size(dir.path(), None, 1, 256) {
+        Ok(rebooted) => {
+            let image = stream_frontier_image(&rebooted.store, "stream").await;
+            rebooted.crash();
+            image
+        }
+        Err(error) => serde_json::json!({ "recovery_error": error.to_string() }),
+    };
+    assert_eq!(rejected.status, 500, "the oversized real append must be rejected");
+    assert_eq!(attempted_tail, baseline_tail + 512, "the fixture must cross the tentative file/tail window");
+    assert!(blocked, "checkpoint must exclude the tentative write/stage/rollback window");
+    assert_eq!(other.expect("other stream must ACK while capture is blocked").status, 204);
+    assert_eq!(rolled_back["physical_bytes"], serde_json::json!(baseline_bytes));
+    assert_eq!(rolled_back["writer_tail"], baseline_tail);
+    assert_eq!(rolled_back["durable_tail"], baseline_tail);
+    assert_eq!(rolled_back["appender_written"], baseline_tail);
+    assert_eq!(rolled_back, baseline, "stage failure must restore live bytes, offsets and appender position");
+    assert_eq!(checkpoint_tail, Some(baseline_tail), "checkpoint must certify only the acknowledged prefix");
+    assert_eq!(recovered, baseline, "recovered offsets and appender position must agree with physical bytes");
+    assert_eq!(following.status, 204);
+    let mut expected = baseline_bytes.to_vec();
+    expected.extend_from_slice(b"next|");
+    assert_eq!(after_following["physical_bytes"], serde_json::json!(expected));
+    assert_eq!(after_following["writer_tail"], baseline_tail + 5);
+    assert_eq!(after_following["durable_tail"], baseline_tail + 5);
+    assert_eq!(after_following["appender_written"], baseline_tail + 5);
+    assert_eq!(repeated, after_following, "a second reboot must preserve the same exact bytes and offsets");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_checkpoint_tail_does_not_certify_rejected_append() {
+    let _guard = DurabilityGuard::wal();
+    checkpoint_does_not_certify_rejected_write(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_checkpoint_tail_does_not_certify_rejected_initial_put() {
+    let _guard = DurabilityGuard::wal();
+    checkpoint_does_not_certify_rejected_write(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_checkpoint_tail_covers_durable_append_before_reader_publication() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("checkpoint-reader-publication-lag");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    create_stream(&h.store, "other", OCTET).await;
+    let stream = h.store.get("stream").unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    stream.set_append_commit_hook(Box::new(move |tail| {
+        if tail == 6 {
+            let entered = entered_tx.lock().unwrap().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let first = tokio::spawn(handlers::handle(h.store.clone(), post_req("stream", OCTET, b"first|")));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    let reader_tail = stream.tail().bytes;
+    // Force the paused append's segment to be sealed, so this checkpoint must
+    // persist its prefix even when its only WAL copy is subsequently recycled.
+    let other = handlers::handle(h.store.clone(), post_req("other", OCTET, &[b'o'; 200])).await;
+    // The existing completion seam runs AFTER wait_durable returned. Its
+    // callback has not exposed bytes yet; recycling must still preserve them.
+    let floor = h.walset.shards()[0].checkpoint().await.unwrap();
+    let proof = h.walset.shards()[0].read_durable_tails().unwrap().get(&stream.id).copied();
+    let recycled = !h.walset.shards()[0].dir().join("1.wal").exists();
+    // The later callback wins publication order and extends the same stream.
+    let second = handlers::handle(h.store.clone(), post_req("stream", OCTET, b"second|")).await;
+    drop(pause);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), first).await.unwrap().unwrap();
+    stream.set_append_commit_hook(Box::new(|_| {}));
+    let live = stream_frontier_image(&h.store, "stream").await;
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered = stream_frontier_image(&reopened.store, "stream").await;
+    reopened.crash();
+    let repeated = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered_again = stream_frontier_image(&repeated.store, "stream").await;
+    repeated.crash();
+    assert_eq!(reader_tail, 0, "the fixture must stop before reader publication");
+    assert_eq!(other.status, 204);
+    assert!(recycled, "the WAL segment holding the paused append must actually be recycled");
+    assert!(floor > 0, "the append must already be WAL-durable");
+    assert_eq!(proof, Some(6), "checkpoint must not substitute the lagging reader frontier");
+    assert_eq!((first.status, second.status), (204, 204));
+    assert_eq!(live["physical_bytes"], serde_json::json!(b"first|second|"));
+    assert_eq!(live["writer_tail"], 13);
+    assert_eq!(live["durable_tail"], 13);
+    assert_eq!(live["appender_written"], 13);
+    assert_eq!((recovered, recovered_again), (live.clone(), live));
+}
+
+/// Compaction holds the async appender while awaiting filesystem work from
+/// this pool. Checkpoint must never wait for that appender on a blocking worker.
+#[test]
+fn e2e_checkpoint_tail_capture_progresses_with_one_blocking_worker() {
+    let _guard = DurabilityGuard::wal();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = temp_dir("checkpoint-single-blocking-worker");
+        let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+        create_stream(&h.store, "stream", OCTET).await;
+        append_acked(&h.store, "stream", OCTET, b"baseline|").await;
+        let stream = h.store.get("stream").unwrap();
+        let appender = stream.appender.lock().await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        h.walset.shards()[0].set_on_checkpoint_capture_hook(Box::new(move |_| {
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+        }));
+        let shard = h.walset.shards()[0].clone();
+        let checkpoint = tokio::spawn(async move { shard.checkpoint().await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        // Queue real file IO behind checkpoint's sole blocking worker, as a
+        // compaction does while retaining its appender guard. Collect timeout
+        // before releasing the guard; always release it before any assertion.
+        let file = stream.file_path.clone();
+        let mut filesystem = tokio::task::spawn_blocking(move || std::fs::metadata(file).map(|meta| meta.len()));
+        let work = tokio::time::timeout(std::time::Duration::from_secs(2), &mut filesystem).await;
+        drop(appender);
+        let progressed = work.is_ok();
+        let bytes = match work {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => filesystem.await.unwrap().unwrap(),
+        };
+        checkpoint.await.unwrap().unwrap();
+        h.walset.shards()[0].set_on_checkpoint_capture_hook(Box::new(|_| {}));
+        let proof = h.walset.shards()[0].read_durable_tails().unwrap().get(&stream.id).copied();
+        drop(stream);
+        h.crash();
+        assert!(progressed, "checkpoint must leave the sole blocking worker available for appender-owned IO");
+        assert_eq!(bytes, 9);
+        assert_eq!(proof, Some(9));
+    });
+}
+
+fn wal_file_image(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "wal"))
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect()
+}
+
+/// Defense for an image an older writer may have corrupted. The false tail
+/// below is deliberately synthetic; the real race is reproduced separately.
+#[tokio::test]
+async fn e2e_recovery_refuses_false_checkpoint_tail_without_mutating_its_stream() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("recovery-false-checkpoint-tail");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    append_acked(&h.store, "stream", OCTET, b"baseline|").await;
+    create_stream(&h.store, "control", OCTET).await;
+    append_acked(&h.store, "control", OCTET, &[b'c'; 200]).await;
+    let stream = h.store.get("stream").unwrap();
+    let file = stream.file_path.clone();
+    let meta = crate::store::meta_path(&file);
+    let id = stream.id;
+    let shard = h.walset.shards()[0].clone();
+    shard.checkpoint().await.unwrap();
+    let shard_dir = shard.dir().to_path_buf();
+    let tails = shard_dir.join("tails");
+    assert!(!shard_dir.join("1.wal").exists(), "the baseline WAL must have been recycled");
+    let control_id = h.store.get("control").unwrap().id;
+    drop(stream);
+    drop(shard);
+    h.crash();
+    std::fs::write(&tails, format!("{id} 521\n{control_id} 200\n")).unwrap();
+    let before = (
+        std::fs::read(&file).unwrap(),
+        std::fs::read(&meta).unwrap(),
+        std::fs::read(&tails).unwrap(),
+        wal_file_image(&shard_dir),
+    );
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let outcome = match Harness::boot_with_segment_size(dir.path(), None, 1, 256) {
+            Ok(booted) => {
+                let tail = booted.store.get("stream").unwrap().tail().bytes;
+                booted.crash();
+                (None, format!("boot incorrectly published tail {tail}"))
+            }
+            Err(error) => (Some(error.kind()), error.to_string()),
+        };
+        outcomes.push(outcome);
+    }
+    let after = (
+        std::fs::read(&file).unwrap(),
+        std::fs::read(&meta).unwrap(),
+        std::fs::read(&tails).ok(),
+        wal_file_image(&shard_dir),
+    );
+    assert!(
+        outcomes.iter().all(|(kind, reason)| *kind == Some(io::ErrorKind::InvalidData) && reason.contains("missing durable bytes")),
+        "unsupported proof must refuse every boot with a named production error: {outcomes:?}"
+    );
+    assert_eq!(
+        after,
+        (before.0, before.1, Some(before.2), before.3),
+        "refused boots must preserve the failing stream, proof and retained WAL"
+    );
+}
+
+async fn recovery_refuses_wal_hole(later_record: bool) {
+    let dir = temp_dir("recovery-wal-hole");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    append_acked(&h.store, "stream", OCTET, b"baseline|").await;
+    // Keep a valid earlier record for the later-hole variant. For the first
+    // record variant, a legitimate complete boot resets only the old WAL.
+    let h = if later_record {
+        h
+    } else {
+        h.crash();
+        Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap()
+    };
+    let stream = h.store.get("stream").unwrap();
+    let file = stream.file_path.clone();
+    let meta = crate::store::meta_path(&file);
+    let shard = h.walset.shards()[0].clone();
+    // Deliberately synthetic WAL record: model a writer restored at a phantom
+    // offset. Use the real codec/stage/committer, but never call this an HTTP
+    // race reproduction or manufacture physical zero-filled bytes ourselves.
+    let lsn = shard.reserve_and_stage(crate::wal::codec::RecordKind::Append, stream.id, 521, b"next|").unwrap();
+    shard.wait_durable(lsn).await;
+    let shard_dir = shard.dir().to_path_buf();
+    drop(stream);
+    drop(shard);
+    h.crash();
+    let before = (std::fs::read(&file).unwrap(), std::fs::read(&meta).unwrap(), wal_file_image(&shard_dir));
+    let mut outcomes = Vec::new();
+    for _ in 0..3 {
+        let outcome = match Harness::boot_with_segment_size(dir.path(), None, 1, 256) {
+            Ok(booted) => {
+                let tail = booted.store.get("stream").unwrap().tail().bytes;
+                booted.crash();
+                (None, format!("boot incorrectly published tail {tail}"))
+            }
+            Err(error) => (Some(error.kind()), error.to_string()),
+        };
+        let refused = outcome.0.is_some();
+        outcomes.push(outcome);
+        if !refused {
+            break;
+        }
+    }
+    let after = (std::fs::read(&file).unwrap(), std::fs::read(&meta).unwrap(), wal_file_image(&shard_dir));
+    assert!(
+        after == before,
+        "a WAL hole must refuse BEFORE mutation: physical bytes {}→{}, metadata preserved={}, WAL preserved={}, outcomes={outcomes:?}",
+        before.0.len(), after.0.len(), before.1 == after.1, before.2 == after.2,
+    );
+    assert!(
+        outcomes.len() == 3
+            && outcomes
+                .iter()
+                .all(|(kind, reason)| *kind == Some(io::ErrorKind::InvalidData) && reason.contains("WAL replay hole")),
+        "every attempt must return a named production error: {outcomes:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_recovery_refuses_first_wal_hole_before_mutating_its_stream() {
+    let _guard = DurabilityGuard::wal();
+    recovery_refuses_wal_hole(false).await;
+}
+
+#[tokio::test]
+async fn e2e_recovery_refuses_later_wal_hole_before_mutating_its_stream() {
+    let _guard = DurabilityGuard::wal();
+    recovery_refuses_wal_hole(true).await;
+}
+
+#[tokio::test]
+async fn e2e_recovery_retained_wal_repairs_short_file_with_overlap_and_adjacent_extensions() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("recovery-short-file-repair");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    for bytes in [b"baseline|".as_slice(), b"next|", b"later|"] {
+        append_acked(&h.store, "stream", OCTET, bytes).await;
+    }
+    h.walset.shards()[0].checkpoint().await.unwrap();
+    let file = h.store.get("stream").unwrap().file_path.clone();
+    h.crash();
+    // Simulate a short data file; retained valid records overlap the remaining
+    // prefix, then extend it contiguously twice, despite its higher proof.
+    std::fs::OpenOptions::new().write(true).open(file).unwrap().set_len(5).unwrap();
+    let reopened = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered = stream_frontier_image(&reopened.store, "stream").await;
+    reopened.crash();
+    let repeated = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered_again = stream_frontier_image(&repeated.store, "stream").await;
+    repeated.crash();
+    assert_eq!(recovered["physical_bytes"], serde_json::json!(b"baseline|next|later|"));
+    assert_eq!(recovered["writer_tail"], 20);
+    assert_eq!(recovered["durable_tail"], 20);
+    assert_eq!(recovered["appender_written"], 20);
+    assert_eq!(recovered_again, recovered);
+}
+
 fn append_meta_image(meta: &crate::store::Meta) -> serde_json::Value {
     serde_json::json!({
         "closed": meta.closed,

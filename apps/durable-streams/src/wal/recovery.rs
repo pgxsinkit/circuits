@@ -193,17 +193,11 @@ fn recover_shard(
         let slot = frontier.entry(id).or_insert(0);
         *slot = (*slot).max(proof);
     }
-    // Streams whose per-stream FILE was actually written by the replay below —
-    // their reconcile must run unconditionally (fsync the repair).
-    let mut replay_wrote: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    // (debug) Track, per replayed stream, the lowest replayed offset AND the
-    // file's logical end BEFORE the first replay write touched it, to assert the
-    // replayed records tile onto the existing durable prefix with no interior
-    // hole (see the debug_assert below).
-    #[cfg(debug_assertions)]
-    let mut min_applied: HashMap<u64, u64> = HashMap::new();
-    #[cfg(debug_assertions)]
-    let mut pre_replay_end: HashMap<u64, u64> = HashMap::new();
+    // Actual contiguous logical EOF after each successful replay write. Seed
+    // from physical file length, NEVER a sidecar/checkpoint proof: an old bad
+    // proof must not license pwrite to materialize a missing prefix as zeros.
+    // Entries also identify streams whose replay repair must be fsync'd.
+    let mut replayed_end: HashMap<u64, u64> = HashMap::new();
     // Captured replay error from inside the closure (the closure cannot return
     // `io::Result`). The first error aborts further application for this shard.
     let mut replay_err: Option<io::Error> = None;
@@ -228,26 +222,49 @@ fn recover_shard(
             return;
         }
         let file_pos = stream_offset - file_base;
-        #[cfg(debug_assertions)]
-        pre_replay_end.entry(stream_id).or_insert_with(|| {
-            // Logical end of the per-stream file before replay writes to it —
-            // the durable prefix the replayed records must tile onto.
-            let len = std::fs::metadata(&st.file_path).map(|m| m.len()).unwrap_or(0);
-            file_base + len
-        });
+        let actual_end = match replayed_end.get(&stream_id) {
+            Some(end) => *end,
+            None => {
+                let len = match st.shared.read().unwrap().file.metadata() {
+                    Ok(meta) => meta.len(),
+                    Err(error) => {
+                        replay_err = Some(error);
+                        return;
+                    }
+                };
+                let Some(end) = file_base.checked_add(len) else {
+                    replay_err = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("WAL recovery refused: stream {stream_id} physical logical EOF overflows"),
+                    ));
+                    return;
+                };
+                end
+            }
+        };
+        if stream_offset > actual_end {
+            replay_err = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "WAL replay hole: stream {stream_id}: record offset {stream_offset} is past physical logical EOF {actual_end}; refusing before write (WAL left intact)"
+                ),
+            ));
+            return;
+        }
+        let Some(end) = stream_offset.checked_add(payload.len() as u64) else {
+            replay_err = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WAL recovery refused: stream {stream_id} record end overflows at offset {stream_offset}"),
+            ));
+            return;
+        };
         if let Err(e) = write_at(st, file_pos, payload) {
             replay_err = Some(e);
             return;
         }
-        replay_wrote.insert(stream_id);
-        let end = stream_offset + payload.len() as u64;
+        replayed_end.insert(stream_id, actual_end.max(end));
         let slot = frontier.entry(stream_id).or_insert(0);
         *slot = (*slot).max(end);
-        #[cfg(debug_assertions)]
-        {
-            let lo = min_applied.entry(stream_id).or_insert(u64::MAX);
-            *lo = (*lo).min(stream_offset);
-        }
     })?;
 
     if let Some(e) = replay_err {
@@ -286,32 +303,12 @@ fn recover_shard(
         // Old sidecars (no recorded proof) are left as-is — they keep
         // file-size trust rather than paying a boot-time meta rewrite per
         // stream (the proof materializes on their next natural meta write).
-        if !replay_wrote.contains(stream_id) && boot_tail == logical_tail {
+        if !replayed_end.contains_key(stream_id) && boot_tail == logical_tail {
             if st.boot_meta_durable_tail.is_some_and(|d| d < logical_tail) {
                 write_meta_durable(st)?;
             }
             continue;
         }
-        // (debug) No interior HOLE: a stream's first replayed record must start
-        // at or below the file's pre-replay logical end. The prefix below it is
-        // durable via one of THREE sources — a checkpoint-persisted tail, the
-        // previous boot's recovery reconcile (which fdatasync'd the repaired
-        // file before `reset_after_recovery` wiped the old WAL — so a stream
-        // recovered last boot legitimately has post-boot WAL records starting
-        // at its recovered tail with NO persisted-tail entry yet), or the
-        // records replayed earlier in this pass. A first record strictly ABOVE
-        // the pre-replay end means `[pre_end, lowest_record)` was never written
-        // by anything durable — a gap kept silently. Fail loudly in tests.
-        #[cfg(debug_assertions)]
-        debug_assert!(
-            min_applied
-                .get(stream_id)
-                .map_or(true, |&lo| { pre_replay_end.get(stream_id).is_some_and(|&pre| lo <= pre) }),
-            "WAL replay hole: stream {stream_id}: first replayed record at {:?} is past \
-             the pre-replay file end {:?}",
-            min_applied.get(stream_id),
-            pre_replay_end.get(stream_id)
-        );
         reconcile_tail(st, logical_tail)?;
     }
     Ok(())
@@ -356,13 +353,22 @@ fn reconcile_tail(st: &StreamState, logical_tail: u64) -> io::Result<()> {
 
     let f = open_rw(st)?;
     let cur = f.metadata()?.len();
+    if cur < file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "WAL recovery refused: stream {} missing durable bytes: logical tail proof {logical_tail} requires {file_len} physical bytes at base {file_base}, but only {cur} remain after WAL replay (WAL left intact)",
+                st.id
+            ),
+        ));
+    }
     if cur > file_len {
         // A torn record was written to the file's page cache but never made the
         // durable WAL → un-acked. Truncate to the whole-record durable boundary.
         f.set_len(file_len)?;
     }
-    // (cur < file_len: the replay writes above already extended the file — no
-    //  truncation; cur == file_len: nothing to do.)
+    // A shorter file was either repaired by retained contiguous WAL above or
+    // refused; a proof alone can never establish bytes that are still missing.
 
     // Durability of the REPAIR (spec §9): the truncate above and the replay
     // `write_at` extends land only in the page cache. A crash after recovery but

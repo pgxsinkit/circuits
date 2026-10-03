@@ -15,7 +15,7 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 
 ## Items
 
-The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020, 0022 and 0029. Urgency describes
+The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020, 0022, 0029 and 0030. Urgency describes
 the remaining local surface; parked leads need evidence before they become defect repairs.
 
 | Entries    | Urgency                      | Reason                                                                                                                            |
@@ -27,8 +27,8 @@ the remaining local surface; parked leads need evidence before they become defec
 | 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
 | 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
 | 0029       | Fixed                        | Committed metadata capture, durable close retries and owned completion of cancelled staged POST/PUT bodies.                       |
-| 0030       | Investigate next             | Checkpoint tail capture has a separate rejected-append race lead; source-confirmed, not locally reproduced.                       |
-| 0031       | Investigate after 0030       | Delayed tail publication can regress the watch payload used by inline SSE; source-derived, not locally reproduced.                |
+| 0030       | Fixed                        | Accepted checkpoint tail capture and release recovery guards for false proofs and first/later WAL gaps.                           |
+| 0031       | Conditional; unproved        | Delayed watch publication may affect inline SSE; source-derived, not locally reproduced.                                          |
 | 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                              |
 
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
@@ -60,7 +60,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0027 — Gate shutdown checkpointing on an actually completed read](0027-checkpoint-only-after-a-completed-read.md) — parked
 - [0028 — A slot-busy startup guard is not distributed writer ownership](0028-simultaneous-cold-start-writer-coordination.md) — parked
 - [0029 — General metadata writers can capture speculative append state](0029-general-metadata-writers-capture-speculative-append-state.md) — dropped (fixed)
-- [0030 — Checkpoint tail capture can cross a rejected append](0030-checkpoint-tail-can-cross-a-rejected-append.md) — candidate
+- [0030 — Checkpoint tail capture can cross a rejected append](0030-checkpoint-tail-can-cross-a-rejected-append.md) — dropped (fixed)
 - [0031 — Tail watch publication can regress after close](0031-tail-watch-publication-can-regress-after-close.md) — candidate
 
 ## Not carried over

@@ -355,7 +355,11 @@ pub struct Shard {
     /// precedes `reserve_and_stage` (CQ-1 ordering invariant, spec §7).
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
-    on_stage: Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>,
+    on_stage: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    /// Test-only signal immediately before a stream's checkpoint capture.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    on_checkpoint_capture: Mutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
     /// Test-only fault injection: when set, the NEXT `reserve_and_stage`'s
     /// `write_at` is simulated as failing (returns an `io::Error` instead of
     /// writing). Lets a test prove a transient WAL write error FAILS the ack
@@ -514,6 +518,8 @@ impl Shard {
             #[cfg(test)]
             on_stage: Mutex::new(None),
             #[cfg(test)]
+            on_checkpoint_capture: Mutex::new(None),
+            #[cfg(test)]
             fail_next_write: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             on_checkpoint_tails: Mutex::new(None),
@@ -623,7 +629,8 @@ impl Shard {
         // stream was already registered dirty by the caller (register-before-stage).
         #[cfg(test)]
         {
-            if let Some(cb) = self.on_stage.lock().unwrap().as_ref() {
+            let hook = self.on_stage.lock().unwrap().clone();
+            if let Some(cb) = hook {
                 cb(stream_id);
             }
         }
@@ -836,13 +843,11 @@ impl Shard {
         // 2. Drain the dirty set atomically, then fdatasync each touched file.
         //    Draining first means a concurrent append re-registers into a fresh
         //    map for the next checkpoint — no touched stream is silently dropped.
-        //    For each touched stream we capture its current logical `Shared.tail`
-        //    (the durable end the upcoming fdatasync will make durable on disk)
-        //    and its live `Shared.file` (the handle to fsync). The tail is read
-        //    BEFORE the fsync; the fdatasync flushes every page already in the
-        //    file's cache, so the file is durable up to AT LEAST this tail
-        //    afterwards (a later concurrent append only extends past it and lands
-        //    in the next checkpoint). Recording this tail is conservative-safe.
+        //    For each touched stream capture its accepted logical `Shared.tail`
+        //    and live `Shared.file`, excluding the synchronous write/stage/rollback
+        //    window. The later barrier makes that accepted prefix durable. A WAL
+        //    durability callback may still be pending, so the reader-facing
+        //    `durable_tail` is not the frontier to capture before recycling.
         //    LOAD-BEARING ORDERING (Tier-1a): bump the checkpoint epoch and drain
         //    the dirty Vec in the SAME `dirty`-lock critical section that
         //    `register_dirty`'s push also takes. This serialization is what makes
@@ -901,14 +906,24 @@ impl Shard {
             // Phase timing for the `WAL_CKPT` line (`--wal-stats`). One clock
             // read per phase, once per ~3 s per shard — nowhere near the hot path.
             let t_start = std::time::Instant::now();
-            // Capture each touched stream's current logical tail and live file.
-            // The tail is read BEFORE the fsync; the fdatasync flushes every page
-            // already in the file's cache, so the file is durable up to AT LEAST
-            // this tail afterwards (a later concurrent append only extends past
-            // it and lands in the next checkpoint). Conservative-safe.
+            // Exclude tentative writes that can still fail staging and truncate
+            // their bytes. Take only the synchronous capture boundary: waiting
+            // on the async appender here can deadlock a bounded blocking pool
+            // while compaction holds it and awaits filesystem work on that pool.
+            // Drop the boundary before all IO below. Successful staged writes
+            // cannot shrink the accepted tail; compaction atomically swaps its
+            // file/base while retaining that logical tail and a durable prefix.
             let touched: Vec<CheckpointStream> = drained
                 .iter()
                 .map(|st| {
+                    #[cfg(test)]
+                    {
+                        let hook = this.on_checkpoint_capture.lock().unwrap().clone();
+                        if let Some(hook) = hook {
+                            hook(st.id);
+                        }
+                    }
+                    let _capture = st.checkpoint_capture.lock().unwrap();
                     let s = st.shared.read().unwrap();
                     CheckpointStream { stream: Arc::clone(st), tail: s.tail, file: Arc::clone(&s.file) }
                 })
@@ -1648,7 +1663,13 @@ impl Shard {
     /// Test-only: install the `reserve_and_stage` ordering seam (see `on_stage`).
     #[cfg(test)]
     pub fn set_on_stage_hook(&self, cb: Box<dyn Fn(u64) + Send + Sync>) {
-        *self.on_stage.lock().unwrap() = Some(cb);
+        *self.on_stage.lock().unwrap() = Some(Arc::from(cb));
+    }
+
+    /// Test-only: signal entry to a stream's short checkpoint capture.
+    #[cfg(test)]
+    pub fn set_on_checkpoint_capture_hook(&self, cb: Box<dyn Fn(u64) + Send + Sync>) {
+        *self.on_checkpoint_capture.lock().unwrap() = Some(Arc::from(cb));
     }
 
     /// Test-only: pause after captured files are durable, before publishing

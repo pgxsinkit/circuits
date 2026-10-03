@@ -651,34 +651,38 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
                 crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
-                let pre_written = ap.written;
-                let new_tail = match write_wire(&st, &mut ap, &wire) {
-                    Ok(t) => t,
-                    Err(_) => return text_response(500, "write failed"),
-                };
-                let target = ap.written;
-                // Read `file_base` under the appender lock so a concurrent
-                // compaction that raises `file_base` + resets `ap.written` together
-                // can't desync it from `target`.
-                let stream_offset = wal_stream_offset(&st, target, &wire);
-                // Stage to the WAL UNDER the appender lock so per-stream LSN order
-                // matches byte order (see stage_for_durability); the slow
-                // durability wait runs after the lock is dropped.
-                let staged_lsn = match stage_for_durability(&store, &st, &wire, stream_offset) {
-                    Ok(lsn) => lsn,
-                    Err(_) => {
-                        // ROLL BACK the data-file write: the bytes were 500'd but
-                        // already sit in the file — left in place they would be
-                        // durably resurrected by the next successful append /
-                        // checkpoint (client told "failed", bytes served anyway).
-                        let _ = ap.file.set_len(pre_written);
-                        ap.written = pre_written;
-                        {
-                            let mut sh = st.shared.write().unwrap();
-                            sh.tail = sh.file_base + pre_written;
+                let (new_tail, staged_lsn) = {
+                    let _capture = st.checkpoint_capture.lock().unwrap();
+                    let pre_written = ap.written;
+                    let new_tail = match write_wire(&st, &mut ap, &wire) {
+                        Ok(t) => t,
+                        Err(_) => return text_response(500, "write failed"),
+                    };
+                    let target = ap.written;
+                    // Read `file_base` under the appender lock so a concurrent
+                    // compaction that raises `file_base` + resets `ap.written` together
+                    // can't desync it from `target`.
+                    let stream_offset = wal_stream_offset(&st, target, &wire);
+                    // Stage to the WAL UNDER the appender lock so per-stream LSN order
+                    // matches byte order (see stage_for_durability); the slow
+                    // durability wait runs after the lock is dropped.
+                    let staged_lsn = match stage_for_durability(&store, &st, &wire, stream_offset) {
+                        Ok(lsn) => lsn,
+                        Err(_) => {
+                            // ROLL BACK the data-file write: the bytes were 500'd but
+                            // already sit in the file — left in place they would be
+                            // durably resurrected by the next successful append /
+                            // checkpoint (client told "failed", bytes served anyway).
+                            let _ = ap.file.set_len(pre_written);
+                            ap.written = pre_written;
+                            {
+                                let mut sh = st.shared.write().unwrap();
+                                sh.tail = sh.file_base + pre_written;
+                            }
+                            return text_response(500, "wal stage failed");
                         }
-                        return text_response(500, "wal stage failed");
-                    }
+                    };
+                    (new_tail, staged_lsn)
                 };
                 drop(ap);
                 let operation = _operation.into_owned(st.clone());
@@ -1299,7 +1303,6 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     // Write + state updates. `new_tail` carries the writer tail to publish to
     // readers only AFTER durability (below), so a live reader never observes
     // bytes a crash could roll back (PROTOCOL.md §4.1).
-    let mut new_tail = None;
     let pre_written = ap.written;
     // Pre-mutation snapshots for the stage-failure rollback below: a 500'd
     // append must leave NO trace — neither bytes (resurrected by the next
@@ -1316,98 +1319,103 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         producer: producer.as_ref().map(|p| (p.id.clone(), ProducerState { epoch: p.epoch, last_seq: p.seq })),
         seq_header: seq_header.clone(),
     });
-    if !wire.is_empty() {
-        match write_wire(&st, &mut ap, &wire) {
-            Ok(t) => new_tail = Some(t),
-            Err(_) => ret!(text_response(500, "write failed"), Conflict),
-        }
-    }
-    // Does this append change state the memory-mode sidecar must persist? Captured
-    // BEFORE `seq_header` is consumed below. Producer/seq updates are idempotency
-    // state; a TTL stream's sliding `last_access` must survive restart (mirrors the
-    // read path, which marks dirty only for TTL streams). A plain append to a non-TTL stream changes
-    // only `durable_tail`/`last_access`. In BOTH modes the durable tail is carried
-    // elsewhere (memory: re-derived from the data-file length on restart; wal: the
-    // checkpoint's per-shard `tails` map), and `last_access` only gates TTL — so a
-    // plain non-TTL append needs no sidecar flush at all (cardinality-cliff #1).
+    // Producer/seq updates are idempotency state; a TTL stream's sliding
+    // last_access must survive restart. A plain non-TTL append changes only
+    // durable_tail/last_access, so it needs no sidecar flush: the durable frontier
+    // is recovered from file length in memory mode or WAL/checkpoint proof.
     let meta_persist_needed = producer.is_some() || seq_header.is_some() || st.config.ttl_seconds.is_some();
-    {
-        let mut s = st.shared.write().unwrap();
-        // A body append refreshes last_access in write_wire. A close-only POST
-        // has no wire bytes, but it is still a successful write operation and
-        // therefore MUST slide a Stream-TTL window as well.
-        if close_req && wire.is_empty() {
-            s.last_access = SystemTime::now();
+    // Checkpoint may certify this tail only once staging accepts the write or
+    // rollback has restored it. This synchronous boundary never spans an await.
+    let (new_tail, staged_lsn) = {
+        let _capture = st.checkpoint_capture.lock().unwrap();
+        let mut new_tail = None;
+        if !wire.is_empty() {
+            match write_wire(&st, &mut ap, &wire) {
+                Ok(t) => new_tail = Some(t),
+                Err(_) => ret!(text_response(500, "write failed"), Conflict),
+            }
         }
-        if let Some(p) = &producer {
-            let state = ProducerState { epoch: p.epoch, last_seq: p.seq };
-            match s.producers.get_mut(&p.id) {
-                Some(entry) => entry.writer = state,
-                None => {
-                    s.producers.insert(p.id.clone(), ProducerEntry { writer: state, committed: None });
+        {
+            let mut s = st.shared.write().unwrap();
+            // A body append refreshes last_access in write_wire. A close-only POST
+            // has no wire bytes, but it is still a successful write operation and
+            // therefore MUST slide a Stream-TTL window as well.
+            if close_req && wire.is_empty() {
+                s.last_access = SystemTime::now();
+            }
+            if let Some(p) = &producer {
+                let state = ProducerState { epoch: p.epoch, last_seq: p.seq };
+                match s.producers.get_mut(&p.id) {
+                    Some(entry) => entry.writer = state,
+                    None => {
+                        s.producers.insert(p.id.clone(), ProducerEntry { writer: state, committed: None });
+                    }
+                }
+            }
+            if let Some(seq) = &seq_header {
+                s.last_seq_header = Some(seq.clone());
+            }
+            if close_req {
+                // Fence later writers with close intent. General metadata captures
+                // still see an open stream; the owned close worker persists this
+                // request's candidate before publishing durable EOF to readers.
+                s.closed = true;
+                if let Some(p) = &producer {
+                    s.closed_by = Some((p.id.clone(), p.epoch, p.seq));
                 }
             }
         }
-        if let Some(seq) = &seq_header {
-            s.last_seq_header = Some(seq.clone());
-        }
-        if close_req {
-            // Fence later writers with close intent. General metadata captures
-            // still see an open stream; the owned close worker persists this
-            // request's candidate before publishing durable EOF to readers.
-            s.closed = true;
-            if let Some(p) = &producer {
-                s.closed_by = Some((p.id.clone(), p.epoch, p.seq));
-            }
-        }
-    }
-    let target = ap.written;
-    // Read `file_base` under the appender lock so a concurrent compaction can't desync
-    // it from `target`.
-    let stream_offset = wal_stream_offset(&st, target, &wire);
-    // Stage to the WAL UNDER the appender lock so per-stream LSN order matches
-    // byte order (see stage_for_durability). A stage failure is not durable —
-    // error out (and skip the close commit below) rather than ack 2xx.
-    let staged_lsn = if !wire.is_empty() {
-        match stage_for_durability(&store, &st, &wire, stream_offset) {
-            Ok(lsn) => lsn,
-            Err(_) => {
-                // ROLL BACK everything this append changed (still under the
-                // appender lock, so no concurrent appender observed it):
-                // 1) the data-file bytes — otherwise the next successful append
-                //    advances the durable frontier over them and they are served
-                //    (and checkpoint-persisted) despite the 500;
-                // 2) the in-memory tail;
-                // 3) producer/seq/closed state — otherwise the client's RETRY of
-                //    this failed append is deduplicated as "already seen" and
-                //    silently dropped.
-                let _ = ap.file.set_len(pre_written);
-                ap.written = pre_written;
-                {
-                    let mut sh = st.shared.write().unwrap();
-                    sh.tail = sh.file_base + pre_written;
-                    if let Some((id, prev)) = &prev_producer {
-                        match prev {
-                            Some(ps) => sh.producers.get_mut(id).expect("writer entry survives staging").writer = *ps,
-                            None => match sh.producers.get(id).and_then(|entry| entry.committed) {
-                                Some(committed) => sh.producers.get_mut(id).unwrap().writer = committed,
-                                None => {
-                                    sh.producers.remove(id);
+        let target = ap.written;
+        // Read `file_base` under the appender lock so a concurrent compaction can't desync
+        // it from `target`.
+        let stream_offset = wal_stream_offset(&st, target, &wire);
+        // Stage to the WAL UNDER the appender lock so per-stream LSN order matches
+        // byte order (see stage_for_durability). A stage failure is not durable —
+        // error out (and skip the close commit below) rather than ack 2xx.
+        let staged_lsn = if !wire.is_empty() {
+            match stage_for_durability(&store, &st, &wire, stream_offset) {
+                Ok(lsn) => lsn,
+                Err(_) => {
+                    // ROLL BACK everything this append changed (still under the
+                    // appender lock, so no concurrent appender observed it):
+                    // 1) the data-file bytes — otherwise the next successful append
+                    //    advances the durable frontier over them and they are served
+                    //    (and checkpoint-persisted) despite the 500;
+                    // 2) the in-memory tail;
+                    // 3) producer/seq/closed state — otherwise the client's RETRY of
+                    //    this failed append is deduplicated as "already seen" and
+                    //    silently dropped.
+                    let _ = ap.file.set_len(pre_written);
+                    ap.written = pre_written;
+                    {
+                        let mut sh = st.shared.write().unwrap();
+                        sh.tail = sh.file_base + pre_written;
+                        if let Some((id, prev)) = &prev_producer {
+                            match prev {
+                                Some(ps) => {
+                                    sh.producers.get_mut(id).expect("writer entry survives staging").writer = *ps
                                 }
-                            },
+                                None => match sh.producers.get(id).and_then(|entry| entry.committed) {
+                                    Some(committed) => sh.producers.get_mut(id).unwrap().writer = committed,
+                                    None => {
+                                        sh.producers.remove(id);
+                                    }
+                                },
+                            }
+                        }
+                        sh.last_seq_header = prev_seq_header.clone();
+                        if close_req {
+                            sh.closed = false;
+                            sh.closed_by = None;
                         }
                     }
-                    sh.last_seq_header = prev_seq_header.clone();
-                    if close_req {
-                        sh.closed = false;
-                        sh.closed_by = None;
-                    }
+                    ret!(text_response(500, "wal stage failed"), Conflict)
                 }
-                ret!(text_response(500, "wal stage failed"), Conflict)
             }
-        }
-    } else {
-        None
+        } else {
+            None
+        };
+        (new_tail, staged_lsn)
     };
     drop(ap);
 

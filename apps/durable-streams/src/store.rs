@@ -302,6 +302,11 @@ pub struct StreamState {
     /// Fork source: ranges below base_offset are read through this chain.
     pub parent: Option<Arc<StreamState>>,
     pub appender: AsyncMutex<Appender>,
+    /// Excludes checkpoint tail/file capture from a tentative synchronous write
+    /// through WAL staging or complete rollback. Appenders take this AFTER the
+    /// async appender; checkpoint takes only this lock. Never hold it across an
+    /// await, WAL durability wait, or checkpoint filesystem barrier.
+    pub(crate) checkpoint_capture: StdMutex<()>,
     pub shared: RwLock<Shared>,
     pub tail_tx: watch::Sender<Tail>,
     /// Sticky terminal identity state, distinct from durable stream EOF. A
@@ -1248,6 +1253,7 @@ impl Store {
             parent,
             boot_meta_durable_tail: meta.durable_tail,
             appender: AsyncMutex::new(Appender { file: file.clone(), written }),
+            checkpoint_capture: StdMutex::new(()),
             shared: RwLock::new(Shared {
                 tail,
                 // Recovered/opened tail is durable by definition.
@@ -1598,6 +1604,7 @@ impl Store {
             // create meta below persists it). Only consulted by boot recovery.
             boot_meta_durable_tail: Some(base_offset),
             appender: AsyncMutex::new(Appender { file: file.clone(), written: 0 }),
+            checkpoint_capture: StdMutex::new(()),
             shared: RwLock::new(Shared {
                 tail: base_offset,
                 durable_tail: base_offset,
