@@ -858,6 +858,243 @@ async fn e2e_stage_failure_rolls_back_data_write() {
     h2.crash();
 }
 
+/// Release the synchronous WAL stage hook even if a fixture assertion panics.
+/// The hook has its own timeout as a second bound on test-runtime shutdown.
+struct StagePause(std::sync::mpsc::Sender<()>);
+
+impl Drop for StagePause {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+
+fn append_meta_image(meta: &crate::store::Meta) -> serde_json::Value {
+    serde_json::json!({
+        "closed": meta.closed,
+        "closed_by": meta.closed_by,
+        "producers": meta.producers,
+        "last_seq_header": meta.last_seq_header,
+        "durable_tail": meta.durable_tail,
+    })
+}
+
+/// Cross a real fork-reference update with an append that has changed its
+/// speculative writer state but has not staged any WAL record. Its 512-byte
+/// body cannot fit the fixture's 256-byte segment, so releasing the hook
+/// deterministically produces a 500 and rolls back the live append.
+async fn fork_reference_does_not_persist_inflight_append(release_child: bool) {
+    let dir = temp_dir(if release_child { "fork-release-inflight" } else { "fork-reserve-inflight" });
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "parent", OCTET).await;
+    let parent = h.store.get("parent").unwrap();
+    let sidecar = crate::store::meta_path(&parent.file_path);
+    let read_meta = || serde_json::from_slice::<crate::store::Meta>(&std::fs::read(&sidecar).unwrap()).unwrap();
+    let committed = append_meta_image(&read_meta());
+    let fork_request =
+        || put_req("child", OCTET, b"", &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))]);
+    if release_child {
+        assert_eq!(handlers::handle(h.store.clone(), fork_request()).await.status, 201);
+        assert_eq!(read_meta().ref_count, 1);
+    }
+
+    let parent_id = parent.id;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    h.walset.shards()[0].set_on_stage_hook(Box::new(move |id| {
+        if id == parent_id {
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let mut request = post_req("parent", OCTET, &[b'x'; 512]);
+    request.headers.extend([
+        ("producer-id".into(), "failed-producer".into()),
+        ("producer-epoch".into(), "1".into()),
+        ("producer-seq".into(), "0".into()),
+        ("stream-seq".into(), "0001".into()),
+        ("stream-closed".into(), "true".into()),
+    ]);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), request));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    {
+        let shared = parent.shared.read().unwrap();
+        assert!(shared.closed, "the hook must cross the speculative close window");
+        assert!(!shared.closed_durable);
+        assert_eq!(shared.durable_tail, 0);
+        assert!(shared.producers.contains_key("failed-producer"));
+    }
+
+    let crossed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        if release_child {
+            let deletion =
+                Req { method: Method::Delete, path: "child".into(), query: None, headers: vec![], body: Bytes::new() };
+            assert_eq!(handlers::handle(h.store.clone(), deletion).await.status, 204);
+            // DELETE owns removal, while parent-reference persistence is an
+            // asynchronous follow-up. Wait for its actual disk publication.
+            while read_meta().ref_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        } else {
+            assert_eq!(handlers::handle(h.store.clone(), fork_request()).await.status, 201);
+            assert_eq!(read_meta().ref_count, 1);
+        }
+        append_meta_image(&read_meta())
+    })
+    .await;
+    drop(pause);
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap().status, 500);
+    h.walset.shards()[0].set_on_stage_hook(Box::new(|_| {}));
+    {
+        let shared = parent.shared.read().unwrap();
+        assert!(!shared.closed, "failed append rolls back its live close");
+        assert!(!shared.closed_durable);
+        assert!(shared.producers.is_empty(), "failed append rolls back live producer dedupe");
+        assert!(shared.last_seq_header.is_none(), "failed append rolls back live writer sequence");
+    }
+    assert_eq!(stream_file_bytes(&h.store, "parent"), b"", "failed bytes are removed before restart");
+    let persisted = crossed.expect("fork-reference metadata update must finish while the append is paused");
+    drop(parent);
+    h.crash();
+
+    let restored = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered = append_meta_image(&read_meta());
+    assert_eq!(stream_file_bytes(&restored.store, "parent"), b"", "failed bytes do not recover from WAL");
+    let reopened_parent = restored.store.get("parent").unwrap();
+    let reopened = reopened_parent.shared.read().unwrap();
+    let reopened_state = serde_json::json!({
+        "closed": reopened.closed,
+        "closed_by": reopened.closed_by,
+        "producers": reopened.producers,
+        "last_seq_header": reopened.last_seq_header,
+        "durable_tail": reopened.durable_tail,
+    });
+    drop(reopened);
+    drop(reopened_parent);
+    restored.crash();
+    assert_eq!(
+        (persisted, recovered, reopened_state),
+        (committed.clone(), committed.clone(), committed),
+        "the reference write, recovered sidecar, and reopened stream must preserve committed append metadata"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_fork_reservation_does_not_persist_an_inflight_append_snapshot() {
+    let _guard = DurabilityGuard::wal();
+    fork_reference_does_not_persist_inflight_append(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_parent_refcount_release_does_not_persist_an_inflight_append_snapshot() {
+    let _guard = DurabilityGuard::wal();
+    fork_reference_does_not_persist_inflight_append(true).await;
+}
+
+async fn fork_reference_preserves_metadata_while_append_waits_for_durability(release_child: bool) {
+    let dir = temp_dir(if release_child { "fork-release-wal-wait" } else { "fork-reserve-wal-wait" });
+    let mut h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", OCTET).await;
+    let prefix = b"acked-prefix|";
+    append_acked(&h.store, "parent", OCTET, prefix).await;
+    let parent = h.store.get("parent").unwrap();
+    let sidecar = crate::store::meta_path(&parent.file_path);
+    let fork_request = || {
+        put_req(
+            "child",
+            OCTET,
+            b"",
+            &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(prefix.len() as u64))],
+        )
+    };
+    if release_child {
+        assert_eq!(handlers::handle(h.store.clone(), fork_request()).await.status, 201);
+    }
+    crate::store::write_meta_sync(&parent, true).unwrap();
+    let read_meta = || serde_json::from_slice::<crate::store::Meta>(&std::fs::read(&sidecar).unwrap()).unwrap();
+    let committed = append_meta_image(&read_meta());
+    h.stop_committers();
+
+    let mut request = post_req("parent", OCTET, b"acked-after-wait|");
+    request.headers.extend([
+        ("producer-id".into(), "waiting-producer".into()),
+        ("producer-epoch".into(), "1".into()),
+        ("producer-seq".into(), "0".into()),
+        ("stream-seq".into(), "0002".into()),
+        ("stream-closed".into(), "true".into()),
+    ]);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), request));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while h.walset.shards()[0].waiter_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!append.is_finished(), "staged append must wait for its WAL barrier");
+    assert!(!parent.tail().closed);
+    assert_eq!(parent.tail().bytes, prefix.len() as u64);
+    let crossed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        if release_child {
+            let response = handlers::handle(
+                h.store.clone(),
+                Req { method: Method::Delete, path: "child".into(), query: None, headers: vec![], body: Bytes::new() },
+            )
+            .await;
+            assert_eq!(response.status, 204);
+            while read_meta().ref_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        } else {
+            assert_eq!(handlers::handle(h.store.clone(), fork_request()).await.status, 201);
+        }
+        append_meta_image(&read_meta())
+    })
+    .await;
+    // Finish the real WAL barrier and acknowledged append before crashing.
+    // This fixture tests premature metadata, not a synthetic WAL power cut.
+    h.committers.push(h.walset.shards()[0].spawn_committer());
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap().status, 200);
+    let crossed = crossed.expect("fork update must finish before the WAL barrier");
+    assert_eq!(crossed, committed, "staged producer/close state stays out of a reference-only write");
+    drop(parent);
+    h.crash();
+
+    let restored = Harness::boot(dir.path(), None, 1).unwrap();
+    assert_eq!(stream_file_bytes(&restored.store, "parent"), b"acked-prefix|acked-after-wait|");
+    assert!(restored.store.get("parent").unwrap().tail().closed, "the acknowledged close now recovers");
+    if release_child {
+        assert!(restored.store.get("child").is_none());
+    } else {
+        let child = restored.store.get("child").unwrap();
+        let mut slices = Vec::new();
+        crate::store::resolve_range(&child, 0, prefix.len() as u64, &mut slices);
+        let segments = crate::store::into_local_segments(slices).unwrap_or_else(|_| panic!("local inherited prefix"));
+        assert_eq!(
+            crate::store::materialize_segments(&segments).as_ref(),
+            prefix,
+            "surviving fork retains its committed prefix"
+        );
+    }
+    restored.crash();
+}
+
+#[tokio::test]
+async fn e2e_fork_reservation_preserves_metadata_before_durable_append_publication() {
+    let _guard = DurabilityGuard::wal();
+    fork_reference_preserves_metadata_while_append_waits_for_durability(false).await;
+}
+
+#[tokio::test]
+async fn e2e_parent_refcount_release_preserves_metadata_before_durable_append_publication() {
+    let _guard = DurabilityGuard::wal();
+    fork_reference_preserves_metadata_while_append_waits_for_durability(true).await;
+}
+
 /// Recovery-hardening: an unparsable sidecar must QUARANTINE the stream (skip
 /// + keep the data file + park the sidecar as .meta.corrupt), never delete the
 /// data file — a torn sidecar next to real data is a torn write, not garbage.

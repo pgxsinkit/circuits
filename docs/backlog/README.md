@@ -15,16 +15,18 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 
 ## Items
 
-The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0020 and 0022. Urgency describes
+The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020 and 0022. Urgency describes
 the remaining local surface; parked leads need evidence before they become defect repairs.
 
 | Entries    | Urgency                      | Reason                                                                                                                            |
 | ---------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | 0017       | Fixed                        | Shared pending memory/spill budget, replay admission and a fixed endpoint; total process RSS and disk capacity remain separate.   |
-| 0018–0019  | Conditional medium           | Fork correctness concerns; the engine's ordinary read path does not use DS forks.                                                 |
+| 0018       | Fixed                        | Reference-only parent metadata writes, conservative failed-write pins and owned release retries.                                  |
+| 0019       | Conditional medium           | Fork graph crash recovery remains separate; the engine's ordinary read path does not use DS forks.                                |
 | 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.             |
 | 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
 | 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
+| 0029       | Investigate next             | Ordinary metadata sweep/checkpoint may capture speculative append state; source-confirmed, not locally reproduced.                |
 | 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                              |
 
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
@@ -44,7 +46,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0015 — Two dbsp settings are read, logged and do nothing](0015-two-dbsp-settings-are-read-and-do-nothing.md) — candidate
 - [0016 — IndexedLabs upstream audit and resolution ledger](0016-indexedlabs-audit-resolution-ledger.md) — parked
 - [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — dropped (fixed)
-- [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — candidate
+- [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — dropped (fixed)
 - [0019 — Fork reference counts need graph-aware crash recovery](0019-fork-graph-and-reference-recovery.md) — candidate
 - [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — dropped (fixed)
 - [0021 — Direct DELETE terminal notification is not wired through SSE serving](0021-direct-delete-sse-terminal-notification.md) — candidate
@@ -55,6 +57,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0026 — Qualify the log server's complete shutdown bound under stalled storage](0026-log-server-shutdown-drain-qualification.md) — parked
 - [0027 — Gate shutdown checkpointing on an actually completed read](0027-checkpoint-only-after-a-completed-read.md) — parked
 - [0028 — A slot-busy startup guard is not distributed writer ownership](0028-simultaneous-cold-start-writer-coordination.md) — parked
+- [0029 — General metadata writers can capture speculative append state](0029-general-metadata-writers-capture-speculative-append-state.md) — candidate
 
 ## Not carried over
 

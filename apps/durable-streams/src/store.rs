@@ -306,9 +306,15 @@ pub struct StreamState {
     retirement_lock: StdMutex<()>,
     hard_delete: AtomicBool,
     wal_retired: AtomicBool,
+    /// Exactly one owned task releases this child's parent reference. True
+    /// means scheduled or completed; a failed attempt retains its pin and task.
     parent_released: AtomicBool,
     #[cfg(test)]
     delete_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    ref_meta_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    ref_meta_attempts: AtomicU64,
     /// Most recently appended wire chunk, kept resident so caught-up live
     /// readers (SSE / long-poll) and immediate catch-up reads are served from
     /// memory — one read+encode shared across all subscribers — instead of a
@@ -655,18 +661,47 @@ impl RetirementContext {
         if child.parent_released.swap(true, Ordering::AcqRel) {
             return;
         }
-        let gone = {
-            let mut s = parent.shared.write().unwrap();
-            s.ref_count = s.ref_count.saturating_sub(1);
-            s.soft_deleted && s.ref_count == 0
-        };
-        if gone {
-            self.schedule(parent);
-        } else {
-            tokio::task::spawn_blocking(move || {
-                let _ = write_meta_sync(&parent, true);
-            });
-        }
+        let context = self.clone();
+        // The CAS owns one logical release. Retain its parent pin and logging
+        // identity, not the removed child's data-file fd and tiering state.
+        let child_path = child.path.clone();
+        let child_id = child.id;
+        tokio::spawn(async move {
+            let mut delay = Duration::from_millis(100);
+            loop {
+                let attempt_context = context.clone();
+                let attempt_parent = parent.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let parent = attempt_parent;
+                    let _retirement = parent.retirement_lock.lock().unwrap();
+                    let _metadata = parent.meta_lock.lock().unwrap();
+                    if !attempt_context
+                        .streams
+                        .get(&parent.path)
+                        .is_some_and(|entry| Arc::ptr_eq(entry.value(), &parent))
+                    {
+                        return Err(std::io::Error::other("fork parent incarnation is no longer registered"));
+                    }
+                    release_parent_ref_locked(&parent)
+                })
+                .await
+                .map_err(std::io::Error::other)
+                .and_then(|result| result);
+                match result {
+                    Ok(gone) => {
+                        if gone {
+                            context.schedule(parent);
+                        }
+                        break;
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %parent.path, child = %child_path, child_id, error = %error, "fork reference release failed; retaining pin and retrying");
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+        });
     }
 
     fn schedule(self: &Arc<Self>, st: Arc<StreamState>) {
@@ -685,9 +720,8 @@ impl RetirementContext {
             // which then failed and rolled back. Revalidate behind both writer
             // barriers before fencing, collecting segments, or releasing pins.
             if !eligible {
-                if let Err(e) = write_meta_locked(&st, true) {
-                    tracing::warn!(path = %st.path, error = %e, "fork refcount persistence failed");
-                }
+                // The owned release already persisted its reference-only
+                // update. A rolled-back soft deletion needs no general capture.
                 return;
             }
             // Eligibility follows a completed soft delete or a lazy hard
@@ -1158,6 +1192,10 @@ impl Store {
             parent_released: AtomicBool::new(false),
             #[cfg(test)]
             delete_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            ref_meta_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            ref_meta_attempts: AtomicU64::new(0),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::from_meta(&meta.segments, meta.sealed_offset, &self.segments_dir()),
             blobstore: self.blobstore.clone(),
@@ -1490,6 +1528,10 @@ impl Store {
             parent_released: AtomicBool::new(false),
             #[cfg(test)]
             delete_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            ref_meta_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            ref_meta_attempts: AtomicU64::new(0),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::default(),
             blobstore: self.blobstore.clone(),
@@ -1501,9 +1543,21 @@ impl Store {
         let mut reserved = false;
         let created = (|| -> std::io::Result<()> {
             if let Some(p) = &parent {
-                p.shared.write().unwrap().ref_count += 1;
+                let _metadata = p.meta_lock.lock().unwrap();
+                let mut meta = read_parent_ref_meta_locked(p)?;
+                let next = p
+                    .shared
+                    .read()
+                    .unwrap()
+                    .ref_count
+                    .checked_add(1)
+                    .ok_or_else(|| std::io::Error::other("fork reference count overflow"))?;
+                p.shared.write().unwrap().ref_count = next;
+                // The rename may succeed before its directory fsync fails.
+                // Compensation must own that possibly persisted reservation.
                 reserved = true;
-                write_meta_sync(p, true)?;
+                meta.ref_count = next;
+                write_parent_ref_meta_locked(p, &meta)?;
             }
             self.prepare_create_meta(&state)
         })();
@@ -1530,13 +1584,8 @@ impl Store {
         fsync_parent_dir(&state.file_path)?;
         if reserved {
             let parent = state.parent.as_ref().expect("a reserved create has a parent");
-            parent.shared.write().unwrap().ref_count -= 1;
-            if let Err(error) = write_meta_sync(parent, true) {
-                // Retain the conservative in-memory pin when persistence is
-                // uncertain. Never hide an incomplete compensation as success.
-                parent.shared.write().unwrap().ref_count += 1;
-                return Err(error);
-            }
+            let _metadata = parent.meta_lock.lock().unwrap();
+            release_parent_ref_locked(parent)?;
         }
         Ok(())
     }
@@ -1832,7 +1881,95 @@ pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
 
 fn write_meta_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
     let meta = Meta::capture(st);
-    let bytes = serde_json::to_vec(&meta).expect("meta serializes");
+    replace_meta_locked(st, &meta)?;
+    // A rename is crash-durable only once the parent dir entry is fsynced.
+    if durable {
+        fsync_parent_dir(&meta_path(&st.file_path))?;
+    }
+    Ok(())
+}
+
+/// Only called behind meta_lock. An admitted create keeps the parent's
+/// lifetime reserved; release additionally holds retirement_lock so a soft
+/// deletion must finish or roll back before its eligibility is inspected.
+fn read_parent_ref_meta_locked(st: &StreamState) -> std::io::Result<Meta> {
+    if st.hard_delete.load(Ordering::Acquire) {
+        return Err(std::io::Error::other("cannot change references of a hard-deleted parent"));
+    }
+    let bytes = std::fs::read(meta_path(&st.file_path))?;
+    let meta: Meta =
+        serde_json::from_slice(&bytes).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if meta.id != st.id
+        || meta.path != st.path
+        || meta.base_offset != st.base_offset
+        || meta.content_type != st.config.content_type
+        || meta.ttl_seconds != st.config.ttl_seconds
+        || meta.expires_at_unix != st.config.expires_at.map(unix_secs)
+        || meta.expires_at_raw != st.config.expires_at_raw
+        || meta.create_closed != st.config.create_closed
+        || meta.forked_from != st.config.forked_from
+        || meta.fork_offset_raw != st.config.fork_offset_raw
+        || meta.fork_sub_offset != st.config.fork_sub_offset
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "fork parent sidecar identity mismatch"));
+    }
+    if !meta.valid_deadlines() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "fork parent sidecar has invalid deadlines"));
+    }
+    if meta.ref_count > st.shared.read().unwrap().ref_count {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "fork parent durable references exceed live pins",
+        ));
+    }
+    Ok(meta)
+}
+
+fn write_parent_ref_meta_locked(st: &StreamState, meta: &Meta) -> std::io::Result<()> {
+    #[cfg(test)]
+    let fault = {
+        st.ref_meta_attempts.fetch_add(1, Ordering::AcqRel);
+        let fault = st.ref_meta_fault.load(Ordering::Acquire);
+        // 1/2 persist until repair; 3/4 fail only the reservation attempt,
+        // allowing its subsequent compensation to exercise the real writer.
+        if matches!(fault, 3 | 4) {
+            st.ref_meta_fault.store(0, Ordering::Release);
+        }
+        fault
+    };
+    #[cfg(test)]
+    if matches!(fault, 1 | 3) {
+        return Err(std::io::Error::other("injected fork reference failure before rename"));
+    }
+    replace_meta_locked(st, meta)?;
+    #[cfg(test)]
+    if matches!(fault, 2 | 4) {
+        return Err(std::io::Error::other("injected fork reference directory fsync failure after rename"));
+    }
+    fsync_parent_dir(&meta_path(&st.file_path))
+}
+
+fn release_parent_ref_locked(st: &StreamState) -> std::io::Result<bool> {
+    let mut meta = read_parent_ref_meta_locked(st)?;
+    let next = st
+        .shared
+        .read()
+        .unwrap()
+        .ref_count
+        .checked_sub(1)
+        .ok_or_else(|| std::io::Error::other("fork reference count underflow"))?;
+    // On a previous post-rename failure the disk may already contain `next`.
+    // Rewrite the absolute target from the retained live pin; never decrement
+    // the disk count a second time. No lower count is exposed until dir fsync.
+    meta.ref_count = next;
+    write_parent_ref_meta_locked(st, &meta)?;
+    let mut shared = st.shared.write().unwrap();
+    shared.ref_count = next;
+    Ok(shared.soft_deleted && next == 0)
+}
+
+fn replace_meta_locked(st: &StreamState, meta: &Meta) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(meta).expect("meta serializes");
     let tmp = meta_path(&st.file_path).with_extension("meta.tmp");
     let final_path = meta_path(&st.file_path);
     {
@@ -1844,15 +1981,11 @@ fn write_meta_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
         // previously-durable sidecar lets a power crash land the rename with
         // zero-length/garbage content (no ext4-style rename heuristic on all
         // filesystems), and boot treats an unparsable sidecar as corruption.
-        // The `durable` flag now only gates the parent-dir fsync (rename
-        // persistence), preserving the lagging-flush contract's cheapness.
+        // Callers separately gate the parent-dir fsync (rename persistence),
+        // preserving the lagging-flush contract's cheapness.
         f.sync_all()?;
     }
     std::fs::rename(&tmp, &final_path)?;
-    // A rename is crash-durable only once the parent dir entry is fsynced.
-    if durable {
-        fsync_parent_dir(&final_path)?;
-    }
     Ok(())
 }
 
@@ -2878,6 +3011,374 @@ mod meta_sweep_tests {
         serde_json::from_slice(&std::fs::read(meta_path(&st.file_path)).unwrap()).unwrap()
     }
 
+    #[test]
+    fn parent_reference_merge_preserves_every_other_committed_metadata_field() {
+        let dir = temp_dir("ref-merge-fields");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent");
+        let mut committed = disk_meta(&parent);
+        committed.last_access_unix = 123;
+        committed.producers.insert("committed".into(), ProducerState { epoch: 7, last_seq: 9 });
+        committed.last_seq_header = Some("committed-sequence".into());
+        committed.segments = vec![MetaSegment {
+            logical_start: 0,
+            len: 5,
+            remote_key: Some("committed-segment".into()),
+            local_file: None,
+        }];
+        committed.sealed_offset = 5;
+        committed.file_base = Some(5);
+        committed.pending_compaction = Some(PendingCompaction { new_file_base: 5, tail: 8 });
+        committed.durable_tail = Some(8);
+        std::fs::write(meta_path(&parent.file_path), serde_json::to_vec(&committed).unwrap()).unwrap();
+        {
+            let mut shared = parent.shared.write().unwrap();
+            shared.closed = true;
+            shared.closed_by = Some(("speculative".into(), 1, 0));
+            shared.producers.clear();
+            shared.last_seq_header = Some("speculative-sequence".into());
+            shared.file_base = 100;
+            shared.durable_tail = 100;
+            shared.last_access = SystemTime::now();
+        }
+        let baseline = serde_json::to_value(&committed).unwrap();
+        let _child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+            CreateResult::Created(child) => child,
+            _ => panic!("fork create failed"),
+        };
+        let mut reserved = serde_json::to_value(disk_meta(&parent)).unwrap();
+        assert_eq!(reserved["ref_count"], 1);
+        reserved["ref_count"] = baseline["ref_count"].clone();
+        assert_eq!(reserved, baseline, "reservation only changes ref_count, including tier and access fields");
+        // Compensation uses the same merge without capturing speculative state.
+        store.create_fault.store(1, Ordering::Release);
+        assert!(store.create("failed-child", octet_cfg(), Some(parent.clone()), 0).is_err());
+        let mut compensated = serde_json::to_value(disk_meta(&parent)).unwrap();
+        assert_eq!(compensated["ref_count"], 1);
+        compensated["ref_count"] = baseline["ref_count"].clone();
+        assert_eq!(compensated, baseline);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+    }
+
+    #[test]
+    fn parent_reference_merge_rejects_missing_corrupt_and_foreign_sidecars() {
+        for defect in [
+            "missing",
+            "corrupt",
+            "id",
+            "path",
+            "base",
+            "fork",
+            "content_type",
+            "invalid_ref",
+            "deadline",
+            "excess_ref",
+        ] {
+            let dir = temp_dir(&format!("ref-merge-invalid-{defect}"));
+            let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+            let parent = create(&store, "parent");
+            std::fs::write(&parent.file_path, b"retained-prefix").unwrap();
+            let sidecar = meta_path(&parent.file_path);
+            let mut value = serde_json::to_value(disk_meta(&parent)).unwrap();
+            match defect {
+                "missing" => std::fs::remove_file(&sidecar).unwrap(),
+                "corrupt" => std::fs::write(&sidecar, b"{torn").unwrap(),
+                other => {
+                    match other {
+                        "id" => value["id"] = serde_json::json!(parent.id + 1),
+                        "path" => value["path"] = serde_json::json!("foreign"),
+                        "base" => value["base_offset"] = serde_json::json!(1),
+                        "fork" => value["forked_from"] = serde_json::json!("foreign-parent"),
+                        "content_type" => value["content_type"] = serde_json::json!("application/json"),
+                        "invalid_ref" => value["ref_count"] = serde_json::json!(u64::MAX),
+                        "deadline" => value["last_access_unix"] = serde_json::json!(u64::MAX),
+                        "excess_ref" => value["ref_count"] = serde_json::json!(1),
+                        _ => unreachable!(),
+                    }
+                    std::fs::write(&sidecar, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+            }
+            let damaged = std::fs::read(&sidecar).ok();
+            assert!(store.create("child", octet_cfg(), Some(parent.clone()), 0).is_err(), "reject {defect}");
+            assert_eq!(parent.shared.read().unwrap().ref_count, 0, "invalid proof cannot reserve a reference");
+            assert_eq!(std::fs::read(&sidecar).ok(), damaged, "no general-capture fallback repairs {defect}");
+            assert_eq!(std::fs::read(&parent.file_path).unwrap(), b"retained-prefix");
+            assert!(!store.streams.contains_key("child"));
+            assert!(!std::fs::read_dir(dir.path().join("streams"))
+                .unwrap()
+                .any(|entry| { entry.unwrap().file_name().to_string_lossy().starts_with("child~") }));
+        }
+    }
+
+    #[test]
+    fn parent_reference_counts_refuse_overflow_and_underflow_without_writing() {
+        let dir = temp_dir("ref-count-limits");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let parent = create(&store, "parent");
+        let committed = std::fs::read(meta_path(&parent.file_path)).unwrap();
+        parent.shared.write().unwrap().ref_count = u32::MAX;
+        assert!(store.create("child", octet_cfg(), Some(parent.clone()), 0).is_err());
+        assert_eq!(parent.shared.read().unwrap().ref_count, u32::MAX);
+        parent.shared.write().unwrap().ref_count = 0;
+        let _metadata = parent.meta_lock.lock().unwrap();
+        assert!(release_parent_ref_locked(&parent).is_err());
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        assert_eq!(std::fs::read(meta_path(&parent.file_path)).unwrap(), committed);
+    }
+
+    #[test]
+    fn failed_parent_reservation_is_compensated_before_and_after_rename() {
+        for fault in [3, 4] {
+            let dir = temp_dir(&format!("ref-reservation-compensation-{fault}"));
+            let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+            let parent = create(&store, "parent");
+            let committed = serde_json::to_value(disk_meta(&parent)).unwrap();
+            parent.ref_meta_fault.store(fault, Ordering::Release);
+            assert!(store.create("child", octet_cfg(), Some(parent.clone()), 0).is_err());
+            assert_eq!(
+                parent.ref_meta_attempts.load(Ordering::Acquire),
+                2,
+                "failed reservation still owns compensation"
+            );
+            assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+            assert_eq!(serde_json::to_value(disk_meta(&parent)).unwrap(), committed);
+            assert!(!store.streams.contains_key("child"));
+            assert!(!store.failed_creates.lock().unwrap().contains("child"), "completed compensation permits a retry");
+            assert!(matches!(
+                store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap(),
+                CreateResult::Created(_)
+            ));
+            assert_eq!(disk_meta(&parent).ref_count, 1);
+        }
+    }
+
+    #[test]
+    fn failed_parent_reservation_compensation_retains_a_conservative_pin() {
+        for fault in [1, 2] {
+            let dir = temp_dir(&format!("ref-reservation-unrepaired-{fault}"));
+            let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+            let parent = create(&store, "parent");
+            parent.ref_meta_fault.store(fault, Ordering::Release);
+            let error = match store.create("child", octet_cfg(), Some(parent.clone()), 0) {
+                Err(error) => error,
+                Ok(_) => panic!("reservation must fail"),
+            };
+            assert!(error.to_string().contains("durable rollback failed"));
+            assert_eq!(parent.shared.read().unwrap().ref_count, 1, "uncertain compensation retains its pin");
+            assert!(store.failed_creates.lock().unwrap().contains("child"));
+            assert!(!store.streams.contains_key("child"));
+            assert!(parent.file_path.exists());
+            assert!(
+                store.create("child", octet_cfg(), Some(parent), 0).is_err(),
+                "path stays blocked until restart/repair"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_reference_release_retries_without_exposing_a_lower_live_pin() {
+        for fault in [1, 2] {
+            let dir = temp_dir(&format!("ref-release-retry-{fault}"));
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+            let parent = create(&store, "parent");
+            let child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+                CreateResult::Created(child) => child,
+                _ => panic!("fork create failed"),
+            };
+            let before = parent.ref_meta_attempts.load(Ordering::Acquire);
+            parent.ref_meta_fault.store(fault, Ordering::Release);
+            store.delete_durable(&child).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while parent.ref_meta_attempts.load(Ordering::Acquire) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            // The metadata lock joins the first attempt, including its rename.
+            {
+                let _metadata = parent.meta_lock.lock().unwrap();
+                assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+                assert_eq!(disk_meta(&parent).ref_count, if fault == 1 { 1 } else { 0 });
+            }
+            assert!(!child.file_path.exists());
+            assert!(child.parent_released.load(Ordering::Acquire), "removed child has an owned release task");
+            parent.ref_meta_fault.store(0, Ordering::Release);
+            // A concurrent fresh reservation must compose with the retry's
+            // absolute target instead of decrementing a post-rename disk zero.
+            let next = match store.create("next", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+                CreateResult::Created(child) => child,
+                _ => panic!("second fork create failed"),
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while parent.shared.read().unwrap().ref_count != 1 || disk_meta(&parent).ref_count != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            store.delete_durable(&child).await.unwrap();
+            assert_eq!(parent.shared.read().unwrap().ref_count, 1, "repeated child deletion cannot release twice");
+            store.delete_durable(&next).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while parent.shared.read().unwrap().ref_count != 0 || disk_meta(&parent).ref_count != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(parent.file_path.exists(), "an open zero-ref parent stays alive");
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_reference_release_failure_defers_nested_soft_parent_cleanup() {
+        for fault in [1, 2] {
+            let dir = temp_dir(&format!("ref-release-soft-retry-{fault}"));
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+            let grandparent = create(&store, "grandparent");
+            let parent = match store.create("parent", octet_cfg(), Some(grandparent.clone()), 0).unwrap() {
+                CreateResult::Created(parent) => parent,
+                _ => panic!("parent create failed"),
+            };
+            let child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+                CreateResult::Created(child) => child,
+                _ => panic!("child create failed"),
+            };
+            store.delete_durable(&parent).await.unwrap();
+            let before = parent.ref_meta_attempts.load(Ordering::Acquire);
+            parent.ref_meta_fault.store(fault, Ordering::Release);
+            store.delete_durable(&child).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while parent.ref_meta_attempts.load(Ordering::Acquire) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let _metadata = parent.meta_lock.lock().unwrap();
+                assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+                assert!(disk_meta(&parent).soft_deleted);
+            }
+            assert!(parent.file_path.exists(), "failed merge retains the soft parent's prefix");
+            assert_eq!(grandparent.shared.read().unwrap().ref_count, 1, "no ancestor release before parent removal");
+            parent.ref_meta_fault.store(0, Ordering::Release);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while store.streams.contains_key("parent")
+                    || grandparent.shared.read().unwrap().ref_count != 0
+                    || disk_meta(&grandparent).ref_count != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!parent.file_path.exists());
+            let replacement = create(&store, "parent");
+            store.delete_durable(&child).await.unwrap();
+            assert!(Arc::ptr_eq(&store.get("parent").unwrap(), &replacement), "old release cannot touch replacement");
+            assert_eq!(grandparent.shared.read().unwrap().ref_count, 0, "cascade releases ancestor exactly once");
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_reference_release_retry_drops_unlinked_child_state() {
+        let dir = temp_dir("ref-release-child-resources");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent");
+        let child = match store.create("child", octet_cfg(), Some(parent.clone()), 0).unwrap() {
+            CreateResult::Created(child) => child,
+            _ => panic!("child create failed"),
+        };
+        let weak_child = Arc::downgrade(&child);
+        let before = parent.ref_meta_attempts.load(Ordering::Acquire);
+        parent.ref_meta_fault.store(1, Ordering::Release);
+        store.delete_durable(&child).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.ref_meta_attempts.load(Ordering::Acquire) == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(child);
+        assert!(weak_child.upgrade().is_none(), "retry ownership must not retain an unlinked child's file handles");
+        assert_eq!(
+            parent.shared.read().unwrap().ref_count,
+            1,
+            "logical parent pin remains until its release is durable"
+        );
+        parent.ref_meta_fault.store(0, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.shared.read().unwrap().ref_count != 0 || disk_meta(&parent).ref_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parent_reference_reservation_drains_before_concurrent_delete_decides_removal() {
+        let dir = temp_dir("ref-reserve-delete-race");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let parent = create(&store, "parent");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let locking_parent = parent.clone();
+        let writer = std::thread::spawn(move || {
+            let _metadata = locking_parent.meta_lock.lock().unwrap();
+            let _ = locked_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        locked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let creating_store = store.clone();
+        let creating_parent = parent.clone();
+        let creating =
+            tokio::task::spawn_blocking(move || creating_store.create("child", octet_cfg(), Some(creating_parent), 0));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.lifecycle.lock().unwrap().in_flight == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let deleting_store = store.clone();
+        let deleting_parent = parent.clone();
+        let deleting = tokio::spawn(async move { deleting_store.delete_durable(&deleting_parent).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !parent.is_retiring() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let held = !deleting.is_finished() && parent.file_path.exists();
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0, "counter mutation waits behind metadata lock");
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let child = match tokio::time::timeout(Duration::from_secs(2), creating).await.unwrap().unwrap().unwrap() {
+            CreateResult::Created(child) => child,
+            _ => panic!("admitted fork must finish its reservation"),
+        };
+        tokio::time::timeout(Duration::from_secs(2), deleting).await.unwrap().unwrap().unwrap();
+        assert!(held, "DELETE must wait for the admitted reservation without removing its parent");
+        assert!(parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        assert!(disk_meta(&parent).soft_deleted);
+        assert!(parent.file_path.exists());
+        store.delete_durable(&child).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.streams.contains_key("parent") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!parent.file_path.exists());
+    }
+
     #[tokio::test]
     async fn ttl_lookup_rechecks_after_an_admitted_append_renews() {
         let dir = temp_dir("ttl-observation-race");
@@ -3113,12 +3614,13 @@ mod meta_sweep_tests {
         let creating =
             tokio::task::spawn_blocking(move || creating_store.create("child", octet_cfg(), Some(creating_parent), 0));
         tokio::time::timeout(Duration::from_secs(2), async {
-            while parent.shared.read().unwrap().ref_count == 0 {
+            while parent.lifecycle.lock().unwrap().in_flight == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0, "reservation waits for the metadata writer boundary");
         let append = crate::handlers::handle(
             store.clone(),
             crate::api::Req {
