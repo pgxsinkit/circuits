@@ -1,6 +1,6 @@
 # 0029 — General metadata writers can capture speculative append state
 
-Status: dropped (fixed 2026-10-03)
+Status: resolved (fixed 2026-10-03)
 Opened: 2026-10-03 · Area: `apps/durable-streams/src/store.rs` metadata sweep/capture, `wal/shard.rs` checkpoint, `handlers.rs` append
 Reopen trigger: regression in committed metadata capture, close ownership/retry or cancelled staged-request completion; checkpoint tail-proof and notification ordering have separate entries 0030/0031.
 

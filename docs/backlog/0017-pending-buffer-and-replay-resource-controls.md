@@ -1,6 +1,6 @@
 # 0017 — Pending shapes and dormant replay need resource accounting and bounds
 
-Status: dropped (fixed and qualified 2026-10-03)
+Status: resolved (fixed and qualified 2026-10-03)
 Opened: 2026-10-02 · Area: `apps/engine/src/engine/sequencer.rs` (`PendingShape`, replay), `engine/lifecycle.rs` (`resume_dormant`), memory introspection
 Reopen trigger: retained pending payload estimates exceeding their configured budget, a spill/drain/retirement regression, or measured RSS, disk growth or latency showing that the remaining unbudgeted state or synchronous spill I/O needs further controls.
 

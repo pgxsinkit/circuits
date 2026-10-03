@@ -1,6 +1,6 @@
 # 0030 — Checkpoint tail capture can cross a rejected append
 
-Status: dropped (fixed 2026-10-03; regression and recovery qualification retained)
+Status: resolved (fixed 2026-10-03; regression and recovery qualification retained)
 Opened: 2026-10-03 · Area: `apps/durable-streams/src/wal/shard.rs` checkpoint tail capture, `handlers.rs` write/stage rollback, `wal/recovery.rs` tail reconciliation
 Reopen trigger: a rejected append again crosses checkpoint capture, valid retained WAL is refused by the recovery guards, or a recovered stream publishes a frontier unsupported by its available bytes. Same-length content corruption requires independent evidence and a separate repair design.
 

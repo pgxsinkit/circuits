@@ -1,6 +1,6 @@
 # 0004 — The boot-errors test raced the engine's first retry warning
 
-Status: dropped (fixed when recorded, 2026-09-29; kept for the symptom)
+Status: resolved (fixed when recorded, 2026-09-29; kept for the symptom)
 Opened: 2026-09-29 · Area: `packages/conformance/src/conformance-boot-errors.test.ts`,
 `apps/engine/src/main.rs` (the boot retry loop)
 Reopen trigger: `conformance-boot-errors.test.ts` failing intermittently again on a missing log

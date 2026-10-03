@@ -2155,6 +2155,7 @@ pub(crate) fn sse_control_event(out: &mut String, next: u64, cursor: u64, up_to_
 struct SseSource {
     st: Arc<StreamState>,
     rxw: tokio::sync::watch::Receiver<Tail>,
+    deleted: tokio::sync::watch::Receiver<bool>,
     pos: u64,
     start: u64,
     deadline: Instant,
@@ -2173,6 +2174,12 @@ impl SseSource {
             return None;
         }
         loop {
+            // Deletion retires this incarnation; it is distinct from durable
+            // EOF and must not emit retained bytes or a streamClosed control.
+            if *self.deleted.borrow_and_update() {
+                self.done = true;
+                return None;
+            }
             let t = *self.rxw.borrow_and_update();
             if t.bytes > self.pos {
                 // One event carries at most the read chunk cap. SSE is already an
@@ -2182,7 +2189,15 @@ impl SseSource {
                 // read memory the cap exists to prevent. A capped batch simply
                 // leaves `pos` short of the tail, so `up_to_date`/`closed_now`
                 // stay false and the next call emits the following batch.
-                let (end, prefetched) = match chunk_capped_end(&self.st, self.pos, t.bytes).await {
+                let capped = tokio::select! {
+                    biased;
+                    _ = self.deleted.changed() => {
+                        self.done = true;
+                        return None;
+                    }
+                    capped = chunk_capped_end(&self.st, self.pos, t.bytes) => capped,
+                };
+                let (end, prefetched) = match capped {
                     ChunkEnd::At { end, body } => (end, body),
                     // Unreadable or not value-aligned: end the stream without
                     // advancing `pos`, exactly like a failed read below.
@@ -2212,7 +2227,15 @@ impl SseSource {
                         }
                         None => {
                             cache_hit = false;
-                            match read_range_bytes(&self.st, self.pos, end).await {
+                            let read = tokio::select! {
+                                biased;
+                                _ = self.deleted.changed() => {
+                                    self.done = true;
+                                    return None;
+                                }
+                                read = read_range_bytes(&self.st, self.pos, end) => read,
+                            };
+                            match read {
                                 Ok(d) => d,
                                 // End the stream without advancing `pos`: the client
                                 // reconnects from its last offset, never skipping a gap.
@@ -2224,6 +2247,12 @@ impl SseSource {
                         }
                     },
                 };
+                // A cold/local read can await while DELETE finishes. Do not
+                // frame its retained bytes after observing terminal deletion.
+                if *self.deleted.borrow_and_update() {
+                    self.done = true;
+                    return None;
+                }
                 crate::telemetry::record_tail_cache(cache_hit, "sse");
                 crate::telemetry::record_read(read_t0.elapsed_secs(), "sse", cache_hit);
                 // A capped `text/*` frame must not split a UTF-8 character.
@@ -2282,6 +2311,13 @@ impl SseSource {
             }
             let wait = SSE_KEEPALIVE.min(self.deadline - now);
             tokio::select! {
+                biased;
+                r = self.deleted.changed() => {
+                    if r.is_err() {
+                        self.done = true;
+                        return None;
+                    }
+                }
                 r = self.rxw.changed() => {
                     if r.is_err() {
                         self.done = true;
@@ -2336,6 +2372,7 @@ fn handle_sse(st: Arc<StreamState>, offset: ParsedOffset, client_cursor: Option<
 
     let src = SseSource {
         rxw: st.tail_tx.subscribe(),
+        deleted: st.deletion_watch(),
         st,
         pos: start,
         start,

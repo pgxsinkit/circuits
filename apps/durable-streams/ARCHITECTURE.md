@@ -125,7 +125,9 @@ Same-path creates serialize outside the stream registry. A new stream remains pr
 
 Fork reference writes read the parent's persisted sidecar behind its metadata barrier, validate its incarnation and immutable configuration, and change only `ref_count`. They never capture the append's speculative close, producer or sequence state. A reservation retains ownership even if rename succeeds but directory fsync fails, so failed-create compensation can durably undo it. A release publishes its lower in-memory count only after the narrow write is durable; a failed release retains the pin and an owned retry task, with backoff from 100 ms to 5 seconds. The child has already been durably removed, and ancestor cleanup follows only a successful release. This process-owned retry does not reconstruct fork counts after a crash: graph recovery remains [0019](../../docs/backlog/0019-fork-graph-and-reference-recovery.md). General committed metadata capture and its qualification are recorded in [0029](../../docs/backlog/0029-general-metadata-writers-capture-speculative-append-state.md); checkpoint tail-proof capture has its own boundary described above.
 
-Direct DELETE publishes a sticky terminal watch for long-poll readers. Waiting readers and readers whose subscription starts after deletion both observe `410`; a soft deletion whose metadata write fails restores admission without publishing that terminal state. A hard deletion whose physical removal fails remains fenced and retryable, and its readers observe terminal identity state. Direct-DELETE SSE reactor wakeups remain a separate follow-up.
+Direct DELETE publishes a stream-owned sticky terminal watch. Existing long-poll readers, including subscriptions started on that identity after deletion, observe `410`. Inline SSE ends its source and the Linux reactor wakes and closes subscribers of that incarnation without a `streamClosed` event: deletion is distinct from durable closure. Late registration observes the sticky value, and path recreation cannot redirect an old subscriber. Failed soft-delete metadata persistence restores admission without a terminal event; failed hard removal remains fenced, terminal and retryable. A retained fork observes its own lifecycle and can still read its soft-deleted parent's inherited prefix.
+
+The reactor aborts deleted connections with queued or partially written output, so client backpressure cannot retain the subscriber permit. When no output remains queued, it attempts the ordinary HTTP zero chunk once and closes regardless of a blocked or partial write. An in-flight response can therefore be truncated; already transmitted bytes and concurrently completed events cannot be recalled. Inline SSE races asynchronous read preparation and idle waits against deletion, then checks deletion again before emitting a prepared frame. Cancelling that preparation ends the source, but does not promise to cancel an already dispatched storage operation. Diagnosis, the chosen transport contract and qualification are recorded in [0021](../../docs/backlog/0021-direct-delete-sse-terminal-notification.md).
 
 The invariant: **readers only ever observe durable bytes** (PROTOCOL.md §4.1). Bytes land in the page cache immediately, but the reader-observable `durable_tail` (and the `watch` wake) advances only after the WAL `fdatasync` covering the record — the same barrier that releases the appender's acknowledgement. A crash therefore never rolls back anything a reader has seen.
 
@@ -153,15 +155,16 @@ In `memory` mode no WAL is created or attached. Appends write directly to the pe
 
 - **Catch-up** (`GET`, no `live`) — `read_range_body(start, tail)`. If the range is covered by the resident tail cache it returns `Body::Full` straight from memory; otherwise `tier::resolve_range` resolves the logical range to placement- aware slices (walking the fork parent chain for forked streams). If every slice is local (the live data file and/or sealed chunk files) it returns a zero-copy `Body::FileRange`; if any slice is remote it streams a bounded `Body::Channel` (one range-GET per remote segment). Every read response is bounded by `--max-chunk-bytes` (default 4 MiB), cutting on a top-level JSON value boundary so each page still parses — see [docs/protocol-alignment.md](docs/protocol-alignment.md#chunked-catch-up-reads-56).
 - **Long-poll** (`live=long-poll`) — if the consumer is behind the tail, return the backlog immediately. Otherwise park on the stream's `watch` receiver until the next append or the timeout (204).
-- **SSE** (`live=sse`) — spawn a task that subscribes to the `watch` channel and, on each tail change, reads the new range (cache fast-path), encodes it (`json` / `text` / `base64`), and pushes a frame onto an `mpsc` channel; the engine streams those frames as chunked transfer-encoding.
+- **SSE** (`live=sse`) — inline `EventSource` subscribes to tail and deletion watches, reads capped ranges (cache fast-path), and encodes data/control frames (`json` / `text` / `base64`) on the connection task. On Linux, root streams with tiering off and a start in the live file hand the socket to the epoll reactor, which observes the same incarnation's durable tail, closure and deletion. Both paths use chunked transfer-encoding.
 
 The engine then serves the response body with the matching primitive:
 
-| body kind                | how it's written                                            |
-| ------------------------ | ----------------------------------------------------------- |
-| `Full` (cached / small)  | one coalesced write (head + body)                           |
-| `FileRange` (large/cold) | **`sendfile(2)`** zero-copy on Linux; positioned reads else |
-| `Channel` (SSE / cold)   | chunked transfer-encoding                                   |
+| body kind                | how it's written                                                |
+| ------------------------ | --------------------------------------------------------------- |
+| `Full` (cached / small)  | one coalesced write (head + body)                               |
+| `FileRange` (large/cold) | **`sendfile(2)`** zero-copy on Linux; positioned reads else     |
+| `Channel` (cold reads)   | chunked transfer-encoding                                       |
+| `Sse`                    | inline event source or Linux reactor, chunked transfer-encoding |
 
 ## Keeping I/O fast from ingestion to fan-out
 

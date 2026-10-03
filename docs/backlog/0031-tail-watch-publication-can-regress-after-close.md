@@ -1,6 +1,6 @@
 # 0031 — Tail watch publication can regress after close
 
-Status: dropped (fixed 2026-10-03; consumer reproduction and qualification retained)
+Status: resolved (fixed 2026-10-03; consumer reproduction and qualification retained)
 Opened: 2026-10-03 · Area: `apps/durable-streams/src/handlers.rs` tail publication, long-poll and inline SSE
 Reopen trigger: a delayed callback again regresses cache/watch bytes or closure, an inline/reactor reader misses committed bytes or EOF, or a valid initially closed PUT body cannot advance its retained closed notification.
 

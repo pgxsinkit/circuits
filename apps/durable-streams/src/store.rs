@@ -511,6 +511,11 @@ impl StreamState {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_soft_delete_meta_failure(&self, enabled: bool) {
+        self.delete_fault.store(u8::from(enabled), Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(crate) fn admitted_operations(&self) -> usize {
         self.lifecycle.lock().unwrap().in_flight
     }
@@ -567,8 +572,17 @@ impl StreamState {
         self.deleted_tx.subscribe()
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_deleted(&self) -> bool {
+        *self.deleted_tx.borrow()
+    }
+
     fn publish_deleted(&self) {
         self.deleted_tx.send_replace(true);
+        // The sticky value covers registration races; the wake covers seated
+        // reactor subscribers. Failed soft-deletion never reaches this point.
+        #[cfg(target_os = "linux")]
+        crate::sse_reactor::wake_stream(self);
     }
     /// Record the just-appended wire chunk as the resident tail. `start` is the
     /// logical offset where `bytes` begins. Chunks larger than the tail-cache cap

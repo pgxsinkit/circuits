@@ -1,6 +1,6 @@
 # 0022 — Subquery inner seeding still materializes the whole row vector
 
-Status: dropped (fixed 2026-10-03)
+Status: resolved (fixed 2026-10-03)
 Opened: 2026-10-02 · Area: `apps/engine/src/engine/lifecycle.rs` (`create_subquery_three_phase`), `pg.rs` (`BackfillReader::collect`), `subquery.rs` (`finish_create`)
 Reopen trigger: evidence that a subquery seed again retains full snapshot rows, or a consumer needs a heap/RSS bound beyond chunk staging.
 

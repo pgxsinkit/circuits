@@ -1,6 +1,6 @@
 # 0018 — Fork reference updates can persist speculative parent append metadata
 
-Status: dropped (fixed and qualified 2026-10-03)
+Status: resolved (fixed and qualified 2026-10-03)
 Opened: 2026-10-02 · Area: `apps/durable-streams/src/store.rs` (`create`, parent release, `Meta::capture`, `write_meta_sync`), `handlers.rs` append publication
 Reopen trigger: a regression shows a reference-only write changing other metadata, an uncertain write releasing a required parent pin, or owned release retry losing its work. General writers and graph recovery have separate entries 0029 and 0019.
 

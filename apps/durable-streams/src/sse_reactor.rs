@@ -134,7 +134,8 @@ pub fn register(stream: tokio::net::TcpStream, head: Vec<u8>, reg: SseReg, permi
     signal(shard.eventfd);
 }
 
-/// Wake every reactor subscriber of `st` after its durable tail advanced. O(subs
+/// Wake every reactor subscriber of `st` after its durable tail advanced or its
+/// incarnation became terminally deleted. O(subs
 /// of this stream); idle streams (the common case) have no list and cost nothing.
 pub fn wake_stream(st: &StreamState) {
     let mut to_signal: Vec<u16> = Vec::new();
@@ -332,11 +333,18 @@ impl Reactor {
     /// `pending`. A faithful synchronous port of `handlers::SseSource::next`
     /// (minus the async idle wait, which the keepalive sweep covers).
     fn produce(&mut self, key: u32) {
+        if self.terminate_deleted(key) {
+            return;
+        }
         let sub = match self.slab[key as usize].sub.as_mut() {
             Some(s) if !s.done => s,
             _ => return,
         };
         loop {
+            if sub.st.is_deleted() {
+                self.terminate_deleted(key);
+                return;
+            }
             let (file, file_base, tail, closed) = {
                 let s = sub.st.shared.read().unwrap();
                 (s.file.clone(), s.file_base, s.durable_tail, s.closed_durable)
@@ -360,6 +368,10 @@ impl Reactor {
                     frame_terminator(&mut sub.pending);
                     return;
                 };
+                if sub.st.is_deleted() {
+                    self.terminate_deleted(key);
+                    return;
+                }
                 let mut ev = String::new();
                 crate::handlers::sse_encode_data(&mut ev, &data, sub.encoding);
                 sub.write_off = end;
@@ -424,11 +436,18 @@ impl Reactor {
     /// backpressure, disarms it once drained, and closes the sub on a fatal write
     /// error or after the terminating chunk flushes.
     fn flush(&mut self, key: u32) {
+        if self.terminate_deleted(key) {
+            return;
+        }
         let sub = match self.slab[key as usize].sub.as_mut() {
             Some(s) => s,
             None => return,
         };
         while sub.sent < sub.pending.len() {
+            if sub.st.is_deleted() {
+                self.terminate_deleted(key);
+                return;
+            }
             let buf = &sub.pending[sub.sent..];
             let n = unsafe { libc::write(sub.fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
             if n > 0 {
@@ -502,6 +521,9 @@ impl Reactor {
     fn tick(&mut self) {
         let now = Instant::now();
         for key in 0..self.slab.len() as u32 {
+            if self.terminate_deleted(key) {
+                continue;
+            }
             let Some(sub) = self.slab[key as usize].sub.as_ref() else {
                 continue;
             };
@@ -530,6 +552,28 @@ impl Reactor {
                 self.flush(key);
             }
         }
+    }
+
+    /// Deletion stops this incarnation without manufacturing a durable-close
+    /// event or draining unread stream bytes. With no queued output, attempt a
+    /// clean HTTP terminator once. Pending/partly written output, a short write,
+    /// or EAGAIN means transport truncation; none may retain a deleted socket
+    /// behind client backpressure. Bytes already written cannot be recalled.
+    fn terminate_deleted(&mut self, key: u32) -> bool {
+        let Some(sub) = self.slab[key as usize].sub.as_ref() else {
+            return false;
+        };
+        if !sub.st.is_deleted() {
+            return false;
+        }
+        if backlog(sub) == 0 {
+            let end = b"0\r\n\r\n";
+            unsafe {
+                libc::write(sub.fd, end.as_ptr() as *const libc::c_void, end.len());
+            }
+        }
+        self.close(key);
+        true
     }
 
     /// Tear down a subscriber: drop it from epoll, close the socket, unlink it

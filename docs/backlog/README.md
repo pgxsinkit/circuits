@@ -8,14 +8,38 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
   someone trips over next year finds the prior investigation instead of restarting it.
 - Every item carries a **Reopen trigger**: the concrete event or evidence that justifies picking it
   up. Until that fires, the item is settled — do not re-litigate it from scratch.
-- `Status: parked` (investigated, evidence recorded, waiting on the trigger) · `candidate`
+- `Status: resolved` (implemented/fixed, with validation and limits retained) · `parked` (investigated, evidence recorded, waiting on the trigger) · `candidate`
   (improvement we would take, unscheduled) · `promoted → adr/00xx` (one-line pointer to the ADR that
-  superseded it) · `dropped` (decided against; keep the why).
+  superseded it) · `dropped` (decided against without implementation; keep the why). Earlier entries used `dropped (fixed)` for completed work; those are now `resolved`.
 - This directory is an engineering ledger, not user documentation.
 
 ## Items
 
-The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020, 0022, 0029, 0030 and 0031. Urgency describes
+Entry numbers are identifiers in creation order, not priority. The 2026-10-03 implementation sequence followed the upstream audit and related defects exposed by its fixes; it was not a comparison of every older entry against every newer one. Future selection should compare consumer impact, correctness, deployment exposure and executed evidence across the whole backlog before choosing another audit follow-up.
+
+### Earlier entries: provisional triage (2026-10-03)
+
+This assessment uses the entries' recorded evidence, with source spot checks for the image default, silent HTTP error conversion, client lifecycle and ignored dbsp settings. It is not a fresh reproduction or closure audit of all fifteen items. Older recommendations and status may need updating before implementation; for example, 0001's separate pool-warning discussion predates the pool check-in fix recorded in 0016.
+
+| Entries          | Assessment                                                  | Reason / next decision                                                                                                                                                                                                                                            |
+| ---------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0011             | Review correctness impact before more optional fork work    | Hard-stop replay is reproduced; final row convergence does not remove transient backward/forward updates. Check the actual downstream reader's replay/order contract before selecting a repair.                                                                   |
+| 0010             | Conditional high for a live consumer of this harness client | Direct terminal-read recovery still needs qualification; current lease renewal already rebinds a changed handle. Production pgxsinkit uses a separate reader according to the entry. Verify the remaining gap and consumer exposure before prioritizing a repair. |
+| 0001             | Medium operational; bounded repair candidate                | A real silent-refusal incident hid an untracked table for over an hour. Correct responses do not make missing diagnostics harmless. Recheck current refusal paths and exclude already fixed pool-warning work.                                                    |
+| 0005             | Medium deployment constraint                                | New/re-created tables require restart; choose automatic discovery or explicit reload only when the migration/restart contract requires it.                                                                                                                        |
+| 0007             | Medium validation debt                                      | Important fail-closed paths have unit coverage but lack complete process-level lanes; refresh which gaps still remain after recent conformance work.                                                                                                              |
+| 0009             | Low to medium operational                                   | Some misconfiguration retries indefinitely, but readiness and logs expose it. Error classification or retry-budget changes need a chosen contract.                                                                                                                |
+| 0015             | Low operational; bounded cleanup candidate                  | Two accepted settings promise effects they do not have; current source still parses/logs them.                                                                                                                                                                    |
+| 0002, 0006, 0008 | Low                                                         | Harness noise, rare redundant resync and late configuration diagnostics respectively; recorded behavior does not show lost durable data.                                                                                                                          |
+| 0003             | Deployment choice                                           | Default image startup deliberately fails without an explicit durable data directory; current deployment arguments supply it. A default path needs an explicit persistence contract.                                                                               |
+| 0004             | Fixed                                                       | Retained historical test-race record.                                                                                                                                                                                                                             |
+| 0012–0014        | Parked or trigger-dependent                                 | Dependency compatibility and load-sensitive test leads retain their recorded evidence and reopen conditions.                                                                                                                                                      |
+
+For the native production read path, assess 0011's downstream impact before treating 0019's fork-only crash recovery as next by default. Small operator-facing repairs in 0001 and 0015 can be selected independently. A conditional harness-client issue should rise immediately if that client becomes a live consumer; entry age alone is neither urgency nor authorization.
+
+### Upstream audit entries
+
+The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020, 0021, 0022, 0029, 0030 and 0031. Urgency describes
 the remaining local surface; parked leads need evidence before they become defect repairs.
 
 | Entries    | Urgency                      | Reason                                                                                                                            |
@@ -24,7 +48,8 @@ the remaining local surface; parked leads need evidence before they become defec
 | 0018       | Fixed                        | Reference-only parent metadata writes, conservative failed-write pins and owned release retries.                                  |
 | 0019       | Conditional medium           | Fork graph crash recovery remains separate; the engine's ordinary read path does not use DS forks.                                |
 | 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.             |
-| 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
+| 0021       | Fixed                        | Sticky DELETE observation ends inline and reactor SSE, including pending reads and backpressured sockets, without claiming close. |
+| 0023       | Low                          | Conservative dormant-age semantics; no production retention incident was reproduced.                                              |
 | 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
 | 0029       | Fixed                        | Committed metadata capture, durable close retries and owned completion of cancelled staged POST/PUT bodies.                       |
 | 0030       | Fixed                        | Accepted checkpoint tail capture and release recovery guards for false proofs and first/later WAL gaps.                           |
@@ -35,7 +60,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
 - [0002 — The harness client retries a dead subscription's renewal at its floor cadence, logging a non-JSON body](0002-harness-client-renewal-retry-storm.md) — candidate
 - [0003 — The log server image's default arguments do not start it](0003-log-server-image-default-arguments-do-not-start.md) — candidate
-- [0004 — The boot-errors test raced the engine's first retry warning](0004-boot-errors-test-raced-the-first-retry-warning.md) — dropped (fixed)
+- [0004 — The boot-errors test raced the engine's first retry warning](0004-boot-errors-test-raced-the-first-retry-warning.md) — resolved
 - [0005 — The reconciler does not pick up new or re-created tables without a restart](0005-reconciler-does-not-pick-up-new-tables.md) — candidate
 - [0006 — A TRUNCATE replayed after a crash re-retires the table's shapes](0006-truncate-replay-window-re-retires-shapes.md) — candidate
 - [0007 — Three refusal paths have no end-to-end lane](0007-three-refusal-paths-have-no-end-to-end-lane.md) — candidate
@@ -48,21 +73,21 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0014 — The log server's second-server test failed once under heavy load](0014-log-server-lock-test-failed-once-under-load.md) — parked
 - [0015 — Two dbsp settings are read, logged and do nothing](0015-two-dbsp-settings-are-read-and-do-nothing.md) — candidate
 - [0016 — IndexedLabs upstream audit and resolution ledger](0016-indexedlabs-audit-resolution-ledger.md) — parked
-- [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — dropped (fixed)
-- [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — dropped (fixed)
+- [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — resolved
+- [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — resolved
 - [0019 — Fork reference counts need graph-aware crash recovery](0019-fork-graph-and-reference-recovery.md) — candidate
-- [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — dropped (fixed)
-- [0021 — Direct DELETE terminal notification is not wired through SSE serving](0021-direct-delete-sse-terminal-notification.md) — candidate
-- [0022 — Subquery inner seeding still materializes the whole row vector](0022-subquery-inner-seed-materializes-all-rows.md) — dropped (fixed)
+- [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — resolved
+- [0021 — Direct DELETE terminal notification is not wired through SSE serving](0021-direct-delete-sse-terminal-notification.md) — resolved
+- [0022 — Subquery inner seeding still materializes the whole row vector](0022-subquery-inner-seed-materializes-all-rows.md) — resolved
 - [0023 — A restart resets the age used for dormant-shape TTL](0023-dormancy-age-restarts-at-boot.md) — parked
 - [0024 — Aggregate stream creation precedes catalog identity: unproven crash lead](0024-aggregate-stream-before-catalog-identity.md) — parked
 - [0025 — Failed log-server create compensation needs crash-image qualification](0025-failed-create-compensation-crash-recovery.md) — parked
 - [0026 — Qualify the log server's complete shutdown bound under stalled storage](0026-log-server-shutdown-drain-qualification.md) — parked
 - [0027 — Gate shutdown checkpointing on an actually completed read](0027-checkpoint-only-after-a-completed-read.md) — parked
 - [0028 — A slot-busy startup guard is not distributed writer ownership](0028-simultaneous-cold-start-writer-coordination.md) — parked
-- [0029 — General metadata writers can capture speculative append state](0029-general-metadata-writers-capture-speculative-append-state.md) — dropped (fixed)
-- [0030 — Checkpoint tail capture can cross a rejected append](0030-checkpoint-tail-can-cross-a-rejected-append.md) — dropped (fixed)
-- [0031 — Tail watch publication can regress after close](0031-tail-watch-publication-can-regress-after-close.md) — dropped (fixed)
+- [0029 — General metadata writers can capture speculative append state](0029-general-metadata-writers-capture-speculative-append-state.md) — resolved
+- [0030 — Checkpoint tail capture can cross a rejected append](0030-checkpoint-tail-can-cross-a-rejected-append.md) — resolved
+- [0031 — Tail watch publication can regress after close](0031-tail-watch-publication-can-regress-after-close.md) — resolved
 - [0032 — CLI readiness accepted before the first PUT connection was refused](0032-cli-readiness-accepted-before-first-connection-refused.md) — parked
 
 ## Not carried over

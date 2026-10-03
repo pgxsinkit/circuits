@@ -1,6 +1,6 @@
 # 0020 — Checked TTL deadlines and atomic touch/expiry
 
-Status: dropped (fixed 2026-10-03)
+Status: resolved (fixed 2026-10-03)
 Opened: 2026-10-02 · Area: `apps/durable-streams/src/store.rs`, `handlers.rs`
 Reopen trigger: an accepted renewal is lost to expiry, a representable persisted deadline fails recovery, or standalone TTL workloads require an active reaper.
 

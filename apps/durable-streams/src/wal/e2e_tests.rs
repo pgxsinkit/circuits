@@ -1708,6 +1708,547 @@ async fn e2e_tail_publication_reactor_delivers_data_and_eof_without_watch_receiv
     assert_eq!(semaphore.available_permits(), 1, "EOF must release the reactor subscriber");
 }
 
+#[tokio::test]
+async fn e2e_direct_delete_sse_terminates_caught_up_inline_source() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-inline");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", "text/plain").await;
+    let fork = put_req(
+        "stream",
+        "text/plain",
+        b"baseline|",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), fork).await.status, 201);
+    let stream = h.store.get("stream").unwrap();
+    let mut source = inline_sse_source(&h.store, "stream", "now").await;
+    let initial = source.next_chunk().await.expect("caught-up SSE must emit its initial control");
+    let mut next = Box::pin(source.next_chunk());
+    std::future::poll_fn(|cx| match next.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => panic!("caught-up open SSE must wait before DELETE"),
+    })
+    .await;
+    let deleted = handlers::handle(
+        h.store.clone(),
+        Req { method: Method::Delete, path: "stream".into(), query: None, headers: Vec::new(), body: Bytes::new() },
+    )
+    .await;
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(500), next.as_mut()).await;
+    drop(next);
+    drop(source);
+    let terminal = *stream.deletion_watch().borrow();
+    let tail = stream.tail();
+    let absent = h.store.get("stream").is_none();
+    drop(stream);
+    h.crash();
+    assert_eq!(deleted.status, 204);
+    assert!(terminal && absent && !tail.closed, "direct DELETE is terminal but must not manufacture durable close");
+    assert!(!String::from_utf8_lossy(&initial).contains("streamClosed"));
+    assert!(
+        matches!(ended, Ok(None)),
+        "deleted caught-up inline SSE must promptly end without another frame: {ended:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_direct_delete_sse_terminates_caught_up_reactor_socket() {
+    use tokio::io::AsyncReadExt;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-reactor");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", "text/plain").await;
+    append_acked(&h.store, "stream", "text/plain", b"baseline|").await;
+    let response = handlers::handle(
+        h.store.clone(),
+        Req {
+            method: Method::Get,
+            path: "stream".into(),
+            query: Some("offset=now&live=sse".into()),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        },
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let crate::api::Body::Sse(source) = response.body else {
+        panic!("expected real SSE source");
+    };
+    let registration = source.reactor_reg().expect("root stream must exercise reactor serving");
+    drop(source);
+    let stream = h.store.get("stream").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = semaphore.clone().acquire_owned().await.unwrap();
+    crate::sse_reactor::register(server, Vec::new(), registration, permit);
+    let mut bytes = Vec::new();
+    let initial =
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_buf(&mut bytes)).await.unwrap().unwrap();
+    assert!(initial > 0, "reactor must seat the caught-up subscriber before DELETE");
+    let deleted = handlers::handle(
+        h.store.clone(),
+        Req { method: Method::Delete, path: "stream".into(), query: None, headers: Vec::new(), body: Bytes::new() },
+    )
+    .await;
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(500), client.read_to_end(&mut bytes)).await;
+    // Even on the expected red timeout, release the real socket and wait for
+    // unlink/permit cleanup before teardown. This cannot change ended's verdict.
+    drop(client);
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.clone().acquire_owned()).await;
+    let release_ok = matches!(&released, Ok(Ok(_)));
+    if let Ok(Ok(permit)) = released {
+        drop(permit);
+    }
+    let terminal = *stream.deletion_watch().borrow();
+    let tail = stream.tail();
+    let absent = h.store.get("stream").is_none();
+    drop(listener);
+    drop(stream);
+    h.crash();
+    assert_eq!(deleted.status, 204);
+    assert!(terminal && absent && !tail.closed, "direct DELETE is terminal but must not manufacture durable close");
+    assert!(release_ok && semaphore.available_permits() == 1, "reactor subscriber must release its permit");
+    let wire = String::from_utf8(bytes).unwrap();
+    assert!(!wire.contains("streamClosed"), "DELETE must not claim durable EOF: {wire:?}");
+    assert!(
+        matches!(ended, Ok(Ok(_))),
+        "deleted caught-up reactor SSE must promptly close its TCP body: result={ended:?}, wire={wire:?}"
+    );
+}
+
+async fn delete_stream(store: &Arc<Store>, path: &str) -> u16 {
+    handlers::handle(
+        store.clone(),
+        Req { method: Method::Delete, path: path.into(), query: None, headers: Vec::new(), body: Bytes::new() },
+    )
+    .await
+    .status
+}
+
+#[tokio::test]
+async fn e2e_direct_delete_sse_inline_late_and_behind_sources_keep_old_incarnation() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-inline-late");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", "text/plain").await;
+    let fork = put_req(
+        "stream",
+        "text/plain",
+        b"old-body|",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), fork).await.status, 201);
+    // Admitted real GETs, but neither body has been polled. One is caught-up;
+    // the other would read retained old bytes if deletion were not sticky.
+    let mut late = inline_sse_source(&h.store, "stream", "now").await;
+    let mut behind = inline_sse_source(&h.store, "stream", &fork_offset(0)).await;
+    let old = h.store.get("stream").unwrap();
+    let deleted = delete_stream(&h.store, "stream").await;
+    let replacement = put_req(
+        "stream",
+        "text/plain",
+        b"new-body|",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))],
+    );
+    let recreated = handlers::handle(h.store.clone(), replacement).await.status;
+    let new = h.store.get("stream").unwrap();
+    let late_end = tokio::time::timeout(std::time::Duration::from_millis(500), late.next_chunk()).await;
+    let behind_end = tokio::time::timeout(std::time::Duration::from_millis(500), behind.next_chunk()).await;
+    let mut fresh = inline_sse_source(&h.store, "stream", &fork_offset(0)).await;
+    let fresh_frame = fresh.next_chunk().await;
+    drop(late);
+    drop(behind);
+    drop(fresh);
+    let old_id = old.id;
+    let new_id = new.id;
+    drop(old);
+    drop(new);
+    h.crash();
+    assert_eq!((deleted, recreated), (204, 201));
+    assert_ne!(old_id, new_id, "path reuse must create a fresh incarnation");
+    assert!(
+        matches!(late_end, Ok(None)) && matches!(behind_end, Ok(None)),
+        "old sources must terminate: late={late_end:?}, behind={behind_end:?}"
+    );
+    let fresh_frame =
+        String::from_utf8(fresh_frame.expect("new source must deliver the replacement").to_vec()).unwrap();
+    assert!(fresh_frame.contains("data:new-body|") && !fresh_frame.contains("old-body"), "replacement={fresh_frame:?}");
+}
+
+#[tokio::test]
+async fn e2e_direct_delete_sse_inline_soft_failure_and_pinned_parent_preserve_fork_data() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-inline-soft");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "ancestor", "text/plain").await;
+    let parent = put_req(
+        "parent",
+        "text/plain",
+        b"retained|",
+        &[("stream-forked-from", "ancestor"), ("stream-fork-offset", &fork_offset(0))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), parent).await.status, 201);
+    let child = put_req(
+        "child",
+        "text/plain",
+        b"child|",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(9))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), child).await.status, 201);
+    let parent = h.store.get("parent").unwrap();
+    let mut source = inline_sse_source(&h.store, "parent", "now").await;
+    source.next_chunk().await.expect("initial parent control");
+    parent.set_soft_delete_meta_failure(true);
+    let failed = delete_stream(&h.store, "parent").await;
+    parent.set_soft_delete_meta_failure(false);
+    let false_terminal = *parent.deletion_watch().borrow();
+    let waiting = tokio::time::timeout(std::time::Duration::from_millis(100), source.next_chunk()).await;
+    let appended = handlers::handle(h.store.clone(), post_req("parent", "text/plain", b"still-live|")).await.status;
+    let live = tokio::time::timeout(std::time::Duration::from_secs(2), source.next_chunk()).await;
+    let deleted = delete_stream(&h.store, "parent").await;
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(500), source.next_chunk()).await;
+    let retained_file = parent.file_path.exists();
+    let soft_deleted = parent.shared.read().unwrap().soft_deleted;
+    let parent_tail = parent.tail();
+    let mut fork = inline_sse_source(&h.store, "child", &fork_offset(0)).await;
+    let inherited = fork.next_chunk().await;
+    drop(source);
+    drop(fork);
+    drop(parent);
+    h.crash();
+    assert_eq!((failed, appended, deleted), (500, 204, 204));
+    assert!(!false_terminal && waiting.is_err(), "failed soft metadata must leave SSE live");
+    let live = live.unwrap().expect("restored parent must publish its append");
+    assert!(String::from_utf8_lossy(&live).contains("data:still-live|"));
+    assert!(matches!(ended, Ok(None)), "successful soft deletion must terminate the parent: {ended:?}");
+    assert!(
+        retained_file && soft_deleted && !parent_tail.closed,
+        "pinned bytes survive deletion without durable close"
+    );
+    let inherited = String::from_utf8(inherited.expect("fork must retain inherited parent data").to_vec()).unwrap();
+    assert!(inherited.contains("data:retained|child|") && !inherited.contains("still-live"), "fork={inherited:?}");
+}
+
+#[cfg(target_os = "linux")]
+async fn reactor_sse_registration(store: &Arc<Store>, path: &str, offset: &str) -> crate::api::SseReg {
+    let response = handlers::handle(
+        store.clone(),
+        Req {
+            method: Method::Get,
+            path: path.into(),
+            query: Some(format!("offset={offset}&live=sse")),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        },
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let crate::api::Body::Sse(source) = response.body else { panic!("expected real SSE source") };
+    source.reactor_reg().expect("root stream must be reactor-eligible")
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_direct_delete_sse_reactor_late_registration_keeps_old_incarnation() {
+    use tokio::io::AsyncReadExt;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-reactor-late");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", "text/plain").await;
+    append_acked(&h.store, "stream", "text/plain", b"old-body|").await;
+    let old = h.store.get("stream").unwrap();
+    let registrations = [
+        reactor_sse_registration(&h.store, "stream", "now").await,
+        reactor_sse_registration(&h.store, "stream", &fork_offset(0)).await,
+    ];
+    let deleted = delete_stream(&h.store, "stream").await;
+    let recreated = handlers::handle(h.store.clone(), put_req("stream", "text/plain", b"new-body|", &[])).await.status;
+    let new_id = h.store.get("stream").unwrap().id;
+    let old_id = old.id;
+    let mut outcomes = Vec::new();
+    for registration in registrations {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        crate::sse_reactor::register(server, Vec::new(), registration, permit);
+        let mut bytes = Vec::new();
+        let ended = tokio::time::timeout(std::time::Duration::from_millis(500), client.read_to_end(&mut bytes)).await;
+        drop(client);
+        let released = tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.clone().acquire_owned()).await;
+        let release_ok = matches!(&released, Ok(Ok(_)));
+        if let Ok(Ok(permit)) = released {
+            drop(permit);
+        }
+        outcomes.push((matches!(ended, Ok(Ok(_))), release_ok, bytes));
+        drop(listener);
+    }
+    drop(old);
+    h.crash();
+    assert_eq!((deleted, recreated), (204, 201));
+    assert_ne!(old_id, new_id);
+    assert!(
+        outcomes.iter().all(|(eof, release, bytes)| *eof && *release && bytes == b"0\r\n\r\n"),
+        "late registrations must terminate without either incarnation's data: {outcomes:?}"
+    );
+}
+
+struct PausedReadBlob {
+    inner: crate::blobstore::LocalFsBlobStore,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl crate::blobstore::BlobStore for PausedReadBlob {
+    fn put<'a>(&'a self, key: &'a str, body: Bytes) -> crate::blobstore::BoxFuture<'a, io::Result<()>> {
+        self.inner.put(key, body)
+    }
+
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        start: u64,
+        len: u64,
+    ) -> crate::blobstore::BoxFuture<'a, io::Result<Bytes>> {
+        Box::pin(async move {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner.get_range(key, start, len).await
+        })
+    }
+
+    fn head<'a>(&'a self, key: &'a str) -> crate::blobstore::BoxFuture<'a, io::Result<Option<u64>>> {
+        self.inner.head(key)
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> crate::blobstore::BoxFuture<'a, io::Result<()>> {
+        self.inner.delete(key)
+    }
+}
+
+#[tokio::test]
+async fn e2e_direct_delete_sse_cancels_waiting_cold_read_preparation() {
+    let _guard = DurabilityGuard::memory_with_max_chunk(16);
+    let dir = temp_dir("direct-delete-sse-cold-read");
+    let tier = TierConfig {
+        kind: crate::tier::TierKind::Local,
+        segment_bytes: 8,
+        local_dir: Some(dir.path().join("cold")),
+        ..Default::default()
+    };
+    let mut store = Store::new_with_tier(dir.path().to_path_buf(), tier).unwrap();
+    let backend = Arc::new(PausedReadBlob {
+        inner: crate::blobstore::LocalFsBlobStore::new(dir.path().join("cold")).unwrap(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    store.blobstore = Some(backend.clone());
+    let store = Arc::new(store);
+    create_stream(&store, "stream", "text/plain").await;
+    append_acked(&store, "stream", "text/plain", b"0123456789abcdefgh|").await;
+    let stream = store.get("stream").unwrap();
+    store.maybe_seal(&stream).await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let sealed = {
+                let manifest = stream.tier.manifest.lock().unwrap();
+                manifest.sealed_offset >= 16 && !manifest.offloading && manifest.segments.iter().all(|s| s.remote)
+            };
+            if sealed {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Replace the resident tail chunk, forcing offset0 through the actual
+    // remotely placed, sealed data rather than the memory cache.
+    append_acked(&store, "stream", "text/plain", b"hot|").await;
+    let mut source = inline_sse_source(&store, "stream", &fork_offset(0)).await;
+    let mut next = Box::pin(source.next_chunk());
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            _ = backend.entered.notified() => {}
+            frame = next.as_mut() => panic!("cold fixture must pause before producing a frame: {frame:?}"),
+        }
+    })
+    .await
+    .unwrap();
+    let deleted = delete_stream(&store, "stream").await;
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(500), next.as_mut()).await;
+    // Release even if the regression remains red; no backend work may be
+    // stranded by an assertion. Dropping the SSE preparation is sufficient
+    // here, not a promise to cancel already-dispatched storage IO in general.
+    backend.release.notify_waiters();
+    drop(next);
+    drop(source);
+    drop(stream);
+    drop(store);
+    assert_eq!(deleted, 204);
+    assert!(matches!(ended, Ok(None)), "a paused cold read must not hold a deleted SSE source: {ended:?}");
+}
+
+#[cfg(target_os = "linux")]
+async fn read_reactor_frame(client: &mut tokio::net::TcpStream, bytes: &mut Vec<u8>) -> io::Result<usize> {
+    use tokio::io::AsyncReadExt;
+
+    let start = bytes.len();
+    loop {
+        if client.read_buf(bytes).await? == 0 {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "reactor ended before completing its SSE frame"));
+        }
+        // These fixtures send one data/control event at a time. Its SSE blank
+        // line followed by the HTTP chunk's CRLF proves complete delivery;
+        // one TCP read can stop anywhere inside that framing.
+        if bytes.ends_with(b"\n\n\r\n") {
+            return Ok(bytes.len() - start);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_direct_delete_sse_reactor_soft_failure_remains_live_until_successful_delete() {
+    use tokio::io::AsyncReadExt;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-reactor-soft");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", "text/plain").await;
+    append_acked(&h.store, "parent", "text/plain", b"retained|").await;
+    let child = put_req(
+        "child",
+        "text/plain",
+        b"child|",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(9))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), child).await.status, 201);
+    let parent = h.store.get("parent").unwrap();
+    let registration = reactor_sse_registration(&h.store, "parent", "now").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = semaphore.clone().acquire_owned().await.unwrap();
+    crate::sse_reactor::register(server, Vec::new(), registration, permit);
+    let mut bytes = Vec::new();
+    let initial = tokio::time::timeout(std::time::Duration::from_secs(2), read_reactor_frame(&mut client, &mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(initial > 0, "parent subscriber must be seated before the failing DELETE");
+    parent.set_soft_delete_meta_failure(true);
+    let failed = delete_stream(&h.store, "parent").await;
+    parent.set_soft_delete_meta_failure(false);
+    let false_terminal = *parent.deletion_watch().borrow();
+    let mut probe = [0u8; 1];
+    let waiting = tokio::time::timeout(std::time::Duration::from_millis(100), client.read(&mut probe)).await;
+    let appended = handlers::handle(h.store.clone(), post_req("parent", "text/plain", b"still-live|")).await.status;
+    let live =
+        tokio::time::timeout(std::time::Duration::from_secs(2), read_reactor_frame(&mut client, &mut bytes)).await;
+    let deleted = delete_stream(&h.store, "parent").await;
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(500), client.read_to_end(&mut bytes)).await;
+    drop(client);
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.clone().acquire_owned()).await;
+    let release_ok = matches!(&released, Ok(Ok(_)));
+    if let Ok(Ok(permit)) = released {
+        drop(permit);
+    }
+    let retained = parent.file_path.exists() && parent.shared.read().unwrap().soft_deleted && !parent.tail().closed;
+    let mut fork = inline_sse_source(&h.store, "child", &fork_offset(0)).await;
+    let inherited = fork.next_chunk().await;
+    drop(fork);
+    drop(listener);
+    drop(parent);
+    h.crash();
+    assert_eq!((failed, appended, deleted), (500, 204, 204));
+    assert!(!false_terminal && waiting.is_err(), "failed soft DELETE cannot produce false reactor EOF: terminal={false_terminal}, read={waiting:?}, probe={probe:?}");
+    assert!(matches!(live, Ok(Ok(n)) if n > 0), "reactor must remain able to deliver data: {live:?}");
+    assert!(
+        matches!(ended, Ok(Ok(_))) && release_ok,
+        "successful soft delete must release the actual socket/permit: {ended:?}"
+    );
+    let wire = String::from_utf8(bytes).unwrap();
+    assert!(wire.contains("data:still-live|") && !wire.contains("streamClosed"), "parent wire={wire:?}");
+    assert!(retained, "a soft-deleted pinned parent keeps its data for the fork");
+    let inherited = String::from_utf8(inherited.expect("fork must read its pinned prefix").to_vec()).unwrap();
+    assert!(inherited.contains("data:retained|child|") && !inherited.contains("still-live"), "fork={inherited:?}");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_direct_delete_sse_reactor_releases_backpressured_socket_before_client_drains() {
+    use std::os::fd::AsRawFd;
+    use tokio::io::AsyncReadExt;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("direct-delete-sse-reactor-backpressure");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", "text/plain").await;
+    append_acked(&h.store, "stream", "text/plain", &vec![b'x'; 1024 * 1024]).await;
+    let registration = reactor_sse_registration(&h.store, "stream", &fork_offset(0)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let size: libc::c_int = 4096;
+    let configured = unsafe {
+        libc::setsockopt(
+            server.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &size as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&size) as libc::socklen_t,
+        )
+    };
+    assert_eq!(configured, 0, "constrain the real socket's send queue");
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = semaphore.clone().acquire_owned().await.unwrap();
+    crate::sse_reactor::register(server, Vec::new(), registration, permit);
+    // Read only a prefix, leaving almost all of the 1MiB frame queued. The
+    // permit must be released after DELETE while this peer is still not reading.
+    let mut prefix = [0u8; 8];
+    let initial = tokio::time::timeout(std::time::Duration::from_secs(2), client.read_exact(&mut prefix)).await;
+    let deleted = delete_stream(&h.store, "stream").await;
+    let released = tokio::time::timeout(std::time::Duration::from_millis(500), semaphore.clone().acquire_owned()).await;
+    let release_ok = matches!(&released, Ok(Ok(_)));
+    if let Ok(Ok(permit)) = released {
+        drop(permit);
+    }
+    let mut rest = Vec::new();
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_end(&mut rest)).await;
+    let stopped = match &ended {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => error.kind() == io::ErrorKind::ConnectionReset,
+        Err(_) => false,
+    };
+    drop(client);
+    // Cleanup a red case as well, without changing the measured pre-drain result.
+    let cleanup = tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.clone().acquire_owned()).await;
+    let cleanup_ok = matches!(&cleanup, Ok(Ok(_)));
+    if let Ok(Ok(permit)) = cleanup {
+        drop(permit);
+    }
+    drop(listener);
+    h.crash();
+    assert!(matches!(initial, Ok(Ok(_))), "real behind-tail reactor must begin its frame: {initial:?}");
+    assert_eq!(deleted, 204);
+    assert!(release_ok, "DELETE must release a backpressured socket before the client drains");
+    assert!(stopped && cleanup_ok, "deleted transport must end without waiting out SSE lifetime: {ended:?}");
+    assert!(rest.len() < 1024 * 1024, "DELETE must not drain the remaining unread frame");
+    assert!(!String::from_utf8_lossy(&rest).contains("streamClosed"));
+}
+
 fn append_meta_image(meta: &crate::store::Meta) -> serde_json::Value {
     serde_json::json!({
         "closed": meta.closed,
