@@ -870,15 +870,13 @@ fn publish_durable_tail(st: &StreamState, tail: u64, wire: &Bytes) {
         s.durable_tail = tail;
         closed = s.closed_durable;
     }
+    #[cfg(test)]
+    st.run_tail_publish_hook(tail);
     // Publish the resident chunk BEFORE waking subscribers, so a long-poll/SSE
     // reader woken by the tail update reliably hits the cache (one shared copy)
     // instead of racing ahead and falling back to a file read. The chunk spans
     // [tail - wire.len(), tail).
-    st.set_last_chunk(tail - wire.len() as u64, wire.clone());
-    st.tail_tx.send_replace(Tail { bytes: tail, closed });
-    // Wake any reactor-served subscribers of this stream (no-op when none).
-    #[cfg(target_os = "linux")]
-    crate::sse_reactor::wake_stream(st);
+    st.publish_tail(Tail { bytes: tail, closed }, Some((tail - wire.len() as u64, wire.clone())));
 }
 
 // ---------- POST (append) ----------

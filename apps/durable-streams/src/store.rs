@@ -360,6 +360,10 @@ pub struct StreamState {
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     append_commit_hook: StdMutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
+    /// Test-only seam after Shared frontier promotion, before cache/watch publication.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    tail_publish_hook: StdMutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
     /// Most recently appended wire chunk, kept resident so caught-up live
     /// readers (SSE / long-poll) and immediate catch-up reads are served from
     /// memory — one read+encode shared across all subscribers — instead of a
@@ -538,6 +542,19 @@ impl StreamState {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_tail_publish_hook(&self, hook: Box<dyn Fn(u64) + Send + Sync>) {
+        *self.tail_publish_hook.lock().unwrap() = Some(Arc::from(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_tail_publish_hook(&self, tail: u64) {
+        let hook = self.tail_publish_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(tail);
+        }
+    }
+
     pub(crate) fn wal_retired(&self) -> bool {
         self.wal_retired.load(Ordering::Acquire)
     }
@@ -561,6 +578,50 @@ impl StreamState {
         let cap = tail_cache_bytes();
         let mut g = self.last_chunk.write().unwrap();
         *g = if cap > 0 && bytes.len() <= cap { Some((start, bytes)) } else { None };
+    }
+
+    /// Publish runtime tail/cache state through the watch's existing value
+    /// lock. Some(chunk) is an append; None is durable EOF and preserves the
+    /// cache. Shared promotion happens before this call, without nesting locks.
+    /// Startup recovery publishes separately because it may lower a torn tail.
+    /// The watch retains the accepted state even with zero receivers, so a new
+    /// subscriber inherits the latest frontier and durable closure.
+    pub(crate) fn publish_tail(&self, candidate: Tail, chunk: Option<(u64, bytes::Bytes)>) {
+        debug_assert!(chunk.is_some() || candidate.closed, "a publication without bytes must be durable EOF");
+        debug_assert!(
+            chunk
+                .as_ref()
+                .map_or(true, |(start, bytes)| start.checked_add(bytes.len() as u64) == Some(candidate.bytes)),
+            "a published chunk must end at the candidate tail"
+        );
+        let changed = self.tail_tx.send_if_modified(|current| {
+            if let Some((start, bytes)) = chunk {
+                // A delayed callback must not regress either cache or watch,
+                // nor reopen a durable close. Closed initial PUT bodies may
+                // advance a closed watch with another closed candidate.
+                if candidate.bytes <= current.bytes || (current.closed && !candidate.closed) {
+                    return false;
+                }
+                // Install bytes before the watch update wakes any consumer.
+                self.set_last_chunk(start, bytes);
+                *current = candidate;
+            } else {
+                let next = Tail { bytes: current.bytes.max(candidate.bytes), closed: true };
+                if *current == next {
+                    return false;
+                }
+                *current = next;
+            }
+            true
+        });
+        // Reactor delivery reads Shared directly. Its locks/wake IO must never
+        // nest inside the watch/cache publication boundary above.
+        #[cfg(target_os = "linux")]
+        if changed {
+            crate::sse_reactor::wake_stream(self);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = changed;
     }
 
     /// Return the resident bytes for `[want_start, want_end)` iff the cached
@@ -1303,6 +1364,8 @@ impl Store {
             close_meta_hook: StdMutex::new(None),
             #[cfg(test)]
             append_commit_hook: StdMutex::new(None),
+            #[cfg(test)]
+            tail_publish_hook: StdMutex::new(None),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::from_meta(&meta.segments, meta.sealed_offset, &self.segments_dir()),
             blobstore: self.blobstore.clone(),
@@ -1647,6 +1710,8 @@ impl Store {
             close_meta_hook: StdMutex::new(None),
             #[cfg(test)]
             append_commit_hook: StdMutex::new(None),
+            #[cfg(test)]
+            tail_publish_hook: StdMutex::new(None),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::default(),
             blobstore: self.blobstore.clone(),
@@ -2053,9 +2118,7 @@ pub(crate) fn commit_close_sync(st: &StreamState, candidate: &CloseCandidate) ->
     };
     // Publication belongs to this owned worker rather than its cancellable
     // waiter. A later sweep cannot reopen the just-fsynced closure.
-    st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
-    #[cfg(target_os = "linux")]
-    crate::sse_reactor::wake_stream(st);
+    st.publish_tail(Tail { bytes: tail, closed: true }, None);
     Ok(())
 }
 

@@ -1310,6 +1310,404 @@ async fn e2e_recovery_retained_wal_repairs_short_file_with_overlap_and_adjacent_
     assert_eq!(recovered_again, recovered);
 }
 
+struct TailCacheGuard(usize);
+
+impl TailCacheGuard {
+    fn enabled() -> Self {
+        let guard = Self(crate::store::tail_cache_bytes());
+        crate::store::set_tail_cache_bytes(64);
+        guard
+    }
+}
+
+impl Drop for TailCacheGuard {
+    fn drop(&mut self) {
+        crate::store::set_tail_cache_bytes(self.0);
+    }
+}
+
+async fn inline_sse_source(store: &Arc<Store>, path: &str, offset: &str) -> Box<dyn crate::api::EventSource> {
+    let response = handlers::handle(
+        store.clone(),
+        Req {
+            method: Method::Get,
+            path: path.into(),
+            query: Some(format!("offset={offset}&live=sse")),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        },
+    )
+    .await;
+    assert_eq!(response.status, 200);
+    let crate::api::Body::Sse(source) = response.body else {
+        panic!("expected real SSE body");
+    };
+    #[cfg(target_os = "linux")]
+    assert!(source.reactor_reg().is_none(), "the fixture must exercise the actual inline fork path");
+    source
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_tail_publication_reordering_delivers_inline_sse_and_waiting_long_poll() {
+    let _guard = DurabilityGuard::wal();
+    let _cache = TailCacheGuard::enabled();
+    let dir = temp_dir("tail-publication-reorder");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", "text/plain").await;
+    let fork = put_req(
+        "stream",
+        "text/plain",
+        b"",
+        &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))],
+    );
+    assert_eq!(handlers::handle(h.store.clone(), fork).await.status, 201);
+    let stream = h.store.get("stream").unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    stream.set_tail_publish_hook(Box::new(move |tail| {
+        if tail == 6 {
+            let entered = entered_tx.lock().unwrap().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let first = tokio::spawn(handlers::handle(h.store.clone(), post_req("stream", "text/plain", b"first|")));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+
+    // Register a real caught-up long-poll while the shared durable tail is 6,
+    // but the delayed append has not notified its watch. Leave it unpolled
+    // during the writes, modelling a connection task delayed by other work.
+    let request = Req {
+        method: Method::Get,
+        path: "stream".into(),
+        query: Some("offset=now&live=long-poll".into()),
+        headers: Vec::new(),
+        body: Bytes::new(),
+    };
+    let mut poll = Box::pin(handlers::handle(h.store.clone(), request));
+    let waiting =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(poll.as_mut(), cx).is_pending()))
+            .await;
+    let registered = stream.tail_tx.receiver_count();
+    let second = handlers::handle(h.store.clone(), post_req("stream", "text/plain", b"second|")).await;
+    let mut close = post_req("stream", "text/plain", b"");
+    close.headers.push(("stream-closed".into(), "true".into()));
+    let close = handlers::handle(h.store.clone(), close).await;
+    let before_release = *stream.tail_tx.borrow();
+    // Release and join every writer before assertions and consumer timeouts.
+    drop(pause);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), first).await.unwrap().unwrap();
+    stream.set_tail_publish_hook(Box::new(|_| {}));
+    let authoritative = stream.tail();
+    let watch = *stream.tail_tx.borrow();
+    let cached = stream.tail_chunk_slice(6, 13);
+    let polled = tokio::time::timeout(std::time::Duration::from_millis(100), &mut poll).await;
+    let long_poll = polled.as_ref().ok().map(|response| {
+        serde_json::json!({
+            "status": response.status,
+            "next_offset": response.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("stream-next-offset")).map(|(_, value)| value),
+            "closed": response.headers.iter().find(|(key, _)| key.eq_ignore_ascii_case("stream-closed")).map(|(_, value)| value),
+            "body_bytes": response.body.len(),
+        })
+    });
+    let long_poll_body = polled.as_ref().ok().and_then(|response| match &response.body {
+        crate::api::Body::Full(bytes) => Some(bytes.clone()),
+        _ => None,
+    });
+    drop(poll);
+
+    // A fork forces the actual inline SSE path on Linux as well as elsewhere.
+    // Opening AFTER the stale watch replacement must still deliver all bytes
+    // and durable EOF, then terminate without waiting for another append.
+    let response = handlers::handle(
+        h.store.clone(),
+        Req {
+            method: Method::Get,
+            path: "stream".into(),
+            query: Some(format!("offset={}&live=sse", fork_offset(0))),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        },
+    )
+    .await;
+    let status = response.status;
+    let crate::api::Body::Sse(mut source) = response.body else {
+        panic!("expected real inline SSE body");
+    };
+    #[cfg(target_os = "linux")]
+    let inline = source.reactor_reg().is_none();
+    #[cfg(not(target_os = "linux"))]
+    let inline = true;
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(2), source.next_chunk()).await.unwrap().unwrap();
+    let frame = String::from_utf8(frame.to_vec()).unwrap();
+    let ended =
+        matches!(tokio::time::timeout(std::time::Duration::from_millis(100), source.next_chunk()).await, Ok(None));
+    drop(source);
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let recovered_bytes = stream_file_bytes(&reopened.store, "stream");
+    let recovered_tail = reopened.store.get("stream").unwrap().tail();
+    reopened.crash();
+
+    assert!(waiting && registered > 0, "the real long-poll must be waiting before later publications");
+    assert_eq!((first.status, second.status, close.status, status), (204, 204, 204, 200));
+    assert_eq!(before_release, crate::store::Tail { bytes: 13, closed: true });
+    assert_eq!(authoritative, crate::store::Tail { bytes: 13, closed: true });
+    assert!(inline);
+    assert!(
+        frame.contains("data:first|second|") && frame.contains("\"streamClosed\":true") && ended && long_poll.is_some(),
+        "real consumers lost published bytes/EOF: SSE={frame:?}, terminated={ended}, long_poll={long_poll:?}, shared={authoritative:?}, watch={watch:?}"
+    );
+    assert_eq!(watch, authoritative, "tail notifications must not regress behind committed bytes or closure");
+    assert_eq!(cached, Some(Bytes::from_static(b"second|")), "a stale callback must preserve the newer resident chunk");
+    let long_poll = long_poll.unwrap();
+    assert_eq!(long_poll["status"], 200);
+    assert_eq!(long_poll["body_bytes"], 7);
+    assert_eq!(long_poll["closed"], "true");
+    assert_eq!(long_poll["next_offset"], fork_offset(13));
+    assert_eq!(long_poll_body, Some(Bytes::from_static(b"second|")));
+    assert_eq!(recovered_bytes, b"first|second|");
+    assert_eq!(recovered_tail, authoritative);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_tail_publication_close_before_delayed_callback_finishes_waiting_and_now_sse() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("tail-publication-close-first");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "parent", "text/plain").await;
+    create_stream(&h.store, "other", OCTET).await;
+    assert_eq!(
+        handlers::handle(
+            h.store.clone(),
+            put_req(
+                "stream",
+                "text/plain",
+                b"",
+                &[("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0)),]
+            )
+        )
+        .await
+        .status,
+        201
+    );
+    let mut waiting = inline_sse_source(&h.store, "stream", &fork_offset(0)).await;
+    let initial = waiting.next_chunk().await.unwrap();
+    let stream = h.store.get("stream").unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    stream.set_tail_publish_hook(Box::new(move |tail| {
+        if tail == 6 {
+            let entered = entered_tx.lock().unwrap().take();
+            if let Some(entered) = entered {
+                let _ = entered.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), post_req("stream", "text/plain", b"first|")));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    let other = handlers::handle(h.store.clone(), post_req("other", OCTET, b"other|")).await;
+    let mut close = post_req("stream", "text/plain", b"");
+    close.headers.push(("stream-closed".into(), "true".into()));
+    let close = handlers::handle(h.store.clone(), close).await;
+    let committed = *stream.tail_tx.borrow();
+    drop(pause);
+    let append = tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap();
+    stream.set_tail_publish_hook(Box::new(|_| {}));
+    let watch = *stream.tail_tx.borrow();
+    let frame = String::from_utf8(waiting.next_chunk().await.unwrap().to_vec()).unwrap();
+    let ended =
+        matches!(tokio::time::timeout(std::time::Duration::from_millis(100), waiting.next_chunk()).await, Ok(None));
+    let mut now = inline_sse_source(&h.store, "stream", "now").await;
+    let now_frame = String::from_utf8(now.next_chunk().await.unwrap().to_vec()).unwrap();
+    let now_ended =
+        matches!(tokio::time::timeout(std::time::Duration::from_millis(100), now.next_chunk()).await, Ok(None));
+    drop(waiting);
+    drop(now);
+    drop(stream);
+    h.crash();
+    assert!(String::from_utf8(initial.to_vec()).unwrap().contains("\"upToDate\":true"));
+    assert_eq!((append.status, close.status, other.status), (204, 204, 204));
+    assert_eq!(committed, crate::store::Tail { bytes: 6, closed: true });
+    assert_eq!(watch, committed, "a delayed equal/open callback must preserve EOF");
+    assert!(frame.contains("data:first|") && frame.contains("\"streamClosed\":true") && ended, "waiting SSE={frame:?}");
+    assert!(
+        now_frame.contains(&fork_offset(6)) && now_frame.contains("\"streamClosed\":true") && now_ended,
+        "now SSE={now_frame:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_tail_publication_cache_before_wake_and_initial_closed_put_in_both_modes() {
+    for wal in [false, true] {
+        let _guard = if wal { DurabilityGuard::wal() } else { DurabilityGuard::memory() };
+        let _cache = TailCacheGuard::enabled();
+        let dir = temp_dir("tail-publication-both-modes");
+        let harness = if wal { Some(Harness::boot(dir.path(), Some(1), 1).unwrap()) } else { None };
+        let store = harness.as_ref().map(|h| h.store.clone()).unwrap_or_else(|| {
+            Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap())
+        });
+        create_stream(&store, "parent", "text/plain").await;
+        let created = handlers::handle(
+            store.clone(),
+            put_req(
+                "closed",
+                "text/plain",
+                b"closed-body|",
+                &[("stream-closed", "true"), ("stream-forked-from", "parent"), ("stream-fork-offset", &fork_offset(0))],
+            ),
+        )
+        .await;
+        let closed = store.get("closed").unwrap();
+        assert_eq!(created.status, 201);
+        assert_eq!(closed.tail_tx.receiver_count(), 0, "publication must retain state without a subscriber");
+        assert_eq!(closed.tail(), crate::store::Tail { bytes: 12, closed: true });
+        assert_eq!(*closed.tail_tx.borrow(), closed.tail());
+        assert_eq!(closed.tail_chunk_slice(0, 12), Some(Bytes::from_static(b"closed-body|")));
+        let mut source = inline_sse_source(&store, "closed", &fork_offset(0)).await;
+        let frame = String::from_utf8(source.next_chunk().await.unwrap().to_vec()).unwrap();
+        assert!(frame.contains("data:closed-body|") && frame.contains("\"streamClosed\":true"));
+        assert!(source.next_chunk().await.is_none());
+        drop(source);
+
+        create_stream(&store, "hot", "text/plain").await;
+        append_acked(&store, "hot", "text/plain", b"first|").await;
+        let hot = store.get("hot").unwrap();
+        let mut poll = Box::pin(handlers::handle(
+            store.clone(),
+            Req {
+                method: Method::Get,
+                path: "hot".into(),
+                query: Some(format!("offset={}&live=long-poll", fork_offset(6))),
+                headers: Vec::new(),
+                body: Bytes::new(),
+            },
+        ));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(
+                std::future::Future::poll(poll.as_mut(), cx).is_pending()
+            ))
+            .await
+        );
+        let append = handlers::handle(store.clone(), post_req("hot", "text/plain", b"second|")).await;
+        let polled = tokio::time::timeout(std::time::Duration::from_secs(2), &mut poll).await.unwrap();
+        drop(poll);
+        assert_eq!(append.status, 204);
+        assert_eq!(polled.status, 200);
+        let crate::api::Body::Full(body) = polled.body else {
+            panic!("woken long-poll must use the already-installed resident chunk");
+        };
+        assert_eq!(body, Bytes::from_static(b"second|"));
+        let mut close = post_req("hot", "text/plain", b"");
+        close.headers.push(("stream-closed".into(), "true".into()));
+        assert_eq!(handlers::handle(store.clone(), close).await.status, 204);
+        assert_eq!(*hot.tail_tx.borrow(), crate::store::Tail { bytes: 13, closed: true });
+        assert_eq!(
+            hot.tail_chunk_slice(6, 13),
+            Some(Bytes::from_static(b"second|")),
+            "close preserves the newest cache"
+        );
+        drop(hot);
+        drop(closed);
+        drop(store);
+        let rebooted = if let Some(harness) = harness {
+            harness.crash();
+            Some(Harness::boot(dir.path(), None, 1).unwrap())
+        } else {
+            None
+        };
+        let store = rebooted.as_ref().map(|h| h.store.clone()).unwrap_or_else(|| {
+            Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap())
+        });
+        assert_eq!(stream_file_bytes(&store, "closed"), b"closed-body|");
+        assert_eq!(store.get("closed").unwrap().tail(), crate::store::Tail { bytes: 12, closed: true });
+        assert_eq!(stream_file_bytes(&store, "hot"), b"first|second|");
+        drop(store);
+        if let Some(rebooted) = rebooted {
+            rebooted.crash();
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn e2e_tail_publication_reactor_delivers_data_and_eof_without_watch_receivers() {
+    use tokio::io::AsyncReadExt;
+
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("tail-publication-reactor");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", "text/plain").await;
+    let response = handlers::handle(
+        h.store.clone(),
+        Req {
+            method: Method::Get,
+            path: "stream".into(),
+            query: Some(format!("offset={}&live=sse", fork_offset(0))),
+            headers: Vec::new(),
+            body: Bytes::new(),
+        },
+    )
+    .await;
+    let crate::api::Body::Sse(source) = response.body else {
+        panic!("expected reactor-eligible SSE body");
+    };
+    let registration = source.reactor_reg().expect("root live stream must be reactor-eligible");
+    drop(source);
+    let stream = h.store.get("stream").unwrap();
+    assert_eq!(stream.tail_tx.receiver_count(), 0);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = semaphore.clone().acquire_owned().await.unwrap();
+    // This is the real reactor handoff and raw chunked body over TCP. No global
+    // shutdown: EOF must close this subscriber and release its permit itself.
+    crate::sse_reactor::register(server, Vec::new(), registration, permit);
+    let mut bytes = Vec::new();
+    let initial =
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_buf(&mut bytes)).await.unwrap().unwrap();
+    assert!(initial > 0, "the subscriber must be seated and emit its initial control before the append");
+    let append = handlers::handle(h.store.clone(), post_req("stream", "text/plain", b"reactor|")).await;
+    let mut close = post_req("stream", "text/plain", b"");
+    close.headers.push(("stream-closed".into(), "true".into()));
+    let close = handlers::handle(h.store.clone(), close).await;
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_end(&mut bytes)).await;
+    let receiver_count = stream.tail_tx.receiver_count();
+    let tail = *stream.tail_tx.borrow();
+    drop(client);
+    // Socket EOF precedes unlinking the subscriber and dropping its permit.
+    // Wait for that cleanup explicitly before checking permit availability.
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), semaphore.clone().acquire_owned()).await;
+    let release_ok = matches!(&released, Ok(Ok(_)));
+    if let Ok(Ok(permit)) = released {
+        drop(permit);
+    }
+    drop(listener);
+    drop(stream);
+    h.crash();
+    assert!(matches!(read, Ok(Ok(_))), "the actual reactor must finish the TCP body successfully at durable EOF");
+    assert!(release_ok, "EOF must finish releasing the reactor subscriber permit");
+    assert_eq!((append.status, close.status, receiver_count), (204, 204, 0));
+    assert_eq!(tail, crate::store::Tail { bytes: 8, closed: true });
+    let wire = String::from_utf8(bytes).unwrap();
+    assert!(
+        wire.contains("data:reactor|") && wire.contains("\"streamClosed\":true") && wire.ends_with("0\r\n\r\n"),
+        "reactor body={wire:?}"
+    );
+    assert_eq!(semaphore.available_permits(), 1, "EOF must release the reactor subscriber");
+}
+
 fn append_meta_image(meta: &crate::store::Meta) -> serde_json::Value {
     serde_json::json!({
         "closed": meta.closed,
