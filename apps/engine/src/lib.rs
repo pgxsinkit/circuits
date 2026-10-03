@@ -26,6 +26,7 @@ pub mod heap_size;
 pub mod http;
 pub mod mem;
 pub mod metrics;
+pub mod pending_buffer;
 pub mod pg;
 pub mod pgoutput;
 pub mod pk_dict;

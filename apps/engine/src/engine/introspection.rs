@@ -690,6 +690,7 @@ pub(crate) fn exec_heap_bytes(exec: &TableExec) -> usize {
         + exec.families.heap_bytes()
         + exec.aggregates.heap_bytes()
         + exec.agg_index.heap_bytes()
+        + exec.pending.heap_bytes()
         // Library mode's per-key row view (empty in Postgres mode) — the one term here that grows
         // with the DATA rather than with the shape count, so it has to be visible on `GET /memory`.
         + exec.library_rows.heap_bytes()

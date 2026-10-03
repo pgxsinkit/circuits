@@ -1,6 +1,7 @@
 //! Shape lifecycle: creation (all strategies), sharing, and the retention state machine
 //! (release/touch/dormancy/eviction/sweep).
 
+use super::replay::{ReplayAttempt, replay_changes_until};
 use super::*;
 use crate::retention::{ReactivationOutcome, ReactivationUnavailable, ShapeReplayRetired};
 
@@ -13,6 +14,25 @@ pub(crate) const CREATE_RACE_ATTEMPTS: u32 = 3;
 /// Tries a join's stream check gets before an unanswered `HEAD` refuses the join
 /// (`DsClient::head_retrying`): a client is waiting on it, so the budget is short.
 const JOIN_HEAD_ATTEMPTS: u32 = 3;
+
+/// Dropping a detached replay after any failure/cancellation clears only its own pending state.
+/// The original dormant resume position remains the recovery source for a later attempt.
+struct PendingReplayRegistration {
+    cmd_tx: mpsc::UnboundedSender<SequencerCmd>,
+    table: TableRef,
+    shape_id: String,
+    attempt_id: u64,
+}
+
+impl Drop for PendingReplayRegistration {
+    fn drop(&mut self) {
+        let _ = self.cmd_tx.send(SequencerCmd::AbortShape {
+            table: self.table.clone(),
+            shape_id: self.shape_id.clone(),
+            attempt_id: Some(self.attempt_id),
+        });
+    }
+}
 
 /// A short, JITTERED pause between redo attempts.
 ///
@@ -434,6 +454,7 @@ impl Engine {
                 pred: pred.clone(),
                 out_cols: out_cols.clone(),
                 kind: CreateKind::Plain,
+                attempt: None,
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
@@ -788,6 +809,7 @@ impl Engine {
                 pred: pred.clone(),
                 out_cols: None,
                 kind: CreateKind::Aggregate { func, col: col_idx },
+                attempt: None,
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
@@ -1160,17 +1182,30 @@ impl Engine {
                                 let resume = resume.clone();
                                 let gate = gate.clone();
                                 let (tx, rx) = tokio::sync::watch::channel(None);
-                                life.state = LifeState::Reactivating { done: rx.clone(), resume: resume.clone() };
+                                let attempt = ReplayAttempt::new();
+                                life.state = LifeState::Reactivating {
+                                    done: rx.clone(),
+                                    resume: resume.clone(),
+                                    attempt: attempt.clone(),
+                                };
                                 let engine = self.clone();
                                 let id = id.to_string();
                                 tokio::spawn(async move {
-                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone()).await;
+                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone(), &attempt).await;
                                     let mut err = match res {
                                         Ok(()) => {
                                             let mut lives = engine.lives.lock().unwrap();
-                                            if let Some(life) = lives.get_mut(&id) {
+                                            if let Some(life) = lives.get_mut(&id)
+                                                && matches!(&life.state, LifeState::Reactivating { attempt: current, .. }
+                                                    if current.id() == attempt.id() && !attempt.is_cancelled())
+                                            {
                                                 life.state = LifeState::Active;
                                                 life.last_read = std::time::Instant::now();
+                                            } else {
+                                                let _ = tx.send(Some(ReactivationOutcome::Retry {
+                                                    cause: "shape was retired during replay".to_string(),
+                                                }));
+                                                return;
                                             }
                                             drop(lives);
                                             let _ = tx.send(Some(ReactivationOutcome::Active));
@@ -1180,14 +1215,16 @@ impl Engine {
                                     };
                                     // A GET's 404 can come from a proxy. HEAD must independently
                                     // confirm loss before an acknowledged subscription is destroyed.
-                                    let gone = match engine.confirmed_replay_loss(&err).await {
-                                        Ok(path) => path,
-                                        Err(e) => {
-                                            err =
-                                                e.context(format!("confirming shape '{id}' replay failure ({err:#})"));
-                                            None
-                                        }
-                                    };
+                                    let gone =
+                                        match attempt.run(&engine.shutdown, engine.confirmed_replay_loss(&err)).await {
+                                            Ok(path) => path,
+                                            Err(e) => {
+                                                err = e.context(format!(
+                                                    "confirming shape '{id}' replay failure ({err:#})"
+                                                ));
+                                                None
+                                            }
+                                        };
                                     if let Some(path) = gone {
                                         tracing::error!(
                                             "reactivating shape {id}: replay requires lost stream {path} ({err:#}); \
@@ -1208,7 +1245,10 @@ impl Engine {
                                     }
                                     tracing::warn!("reactivating shape {id} failed: {err:#}");
                                     // Restore the dormant resume state so a later touch retries.
-                                    if let Some(life) = engine.lives.lock().unwrap().get_mut(&id) {
+                                    if let Some(life) = engine.lives.lock().unwrap().get_mut(&id)
+                                        && matches!(&life.state, LifeState::Reactivating { attempt: current, .. }
+                                            if current.id() == attempt.id() && !attempt.is_cancelled())
+                                    {
                                         life.state =
                                             LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
                                     }
@@ -1268,6 +1308,19 @@ impl Engine {
         Ok(lost.then(|| gone.path.clone()))
     }
 
+    /// A fixed scan may emit nothing, so appends alone cannot discover that its retained
+    /// destination disappeared or closed. Refuse the attempt; the detached owner independently
+    /// confirms a terminal-looking answer before durably retiring the acknowledged shape.
+    async fn check_replay_destination(&self, path: &str, attempt: &ReplayAttempt) -> Result<()> {
+        let head = attempt.run(&self.shutdown, self.ds.head_retrying(path, JOIN_HEAD_ATTEMPTS)).await?;
+        let status = match head {
+            Some(head) if !head.closed => return Ok(()),
+            Some(_) => 409,
+            None => 404,
+        };
+        Err(crate::ds::StreamGone { path: path.to_string(), status }.into())
+    }
+
     /// The replay half of a reactivation: re-register the shape through the sequencer's two-phase
     /// pending-buffer handshake, but replay the change log from the dormant resume position instead
     /// of taking a Postgres snapshot (following rotation pointers across segments, ADR-0006). Live deltas arriving during the replay buffer in the pending
@@ -1279,7 +1332,13 @@ impl Engine {
         id: &str,
         resume: LogPosition,
         gate: crate::pg::SnapshotGate,
+        attempt: &ReplayAttempt,
     ) -> Result<()> {
+        // Admission precedes registration: queued wakes keep their dormant history pin but do
+        // not accumulate live envelopes while waiting for another replay to finish.
+        let shutdown = self.shutdown_token();
+        let permit = self.replay_controls.acquire(attempt, &shutdown).await?;
+        attempt.check()?;
         let (rec, ts, pred, out_cols, num_id, cmd_tx, gens) = {
             let mut st = self.state.lock().await;
             let rec =
@@ -1293,6 +1352,14 @@ impl Engine {
             let cmd_tx = self.ensure_sequencer(&mut st).cmd_tx.clone();
             (rec, ts, pred, out_cols, num_id, cmd_tx, gens)
         };
+        attempt.check()?;
+        self.check_replay_destination(&rec.stream_path, attempt).await?;
+        let _pending_cleanup = PendingReplayRegistration {
+            cmd_tx: cmd_tx.clone(),
+            table: rec.table.clone(),
+            shape_id: id.to_string(),
+            attempt_id: attempt.id(),
+        };
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(SequencerCmd::BeginShape {
@@ -1303,12 +1370,16 @@ impl Engine {
                 pred: pred.clone(),
                 out_cols: out_cols.clone(),
                 kind: CreateKind::Plain,
+                attempt: Some(attempt.clone()),
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ack_rx.await.map_err(|_| anyhow::anyhow!("sequencer dropped the begin-shape ack"))?;
-        // Replay everything the retained stream is missing (buffering live deltas meanwhile).
-        let emitted = match replay_changes_for_shape(
+        let until = attempt.run(&shutdown, ack_rx).await.context("sequencer dropped the begin-shape ack")?;
+        // This raw cursor is captured by the same command that installs pending buffering.
+        // Changes processed after admission enter that buffer, so replay cannot chase a growing
+        // head. A held prefix can overlap the buffer's eventual transaction; plain emission is
+        // absolute and the overlap is idempotent.
+        let emitted = replay_changes_until(
             &self.ds,
             &ts,
             &rec.table,
@@ -1317,17 +1388,18 @@ impl Engine {
             &gate,
             &rec.stream_path,
             &resume,
+            &until,
             self.pg_url.is_none(),
-            &self.shutdown_token(),
+            &shutdown,
+            attempt,
+            &permit,
         )
         .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = cmd_tx.send(SequencerCmd::AbortShape { table: rec.table.clone(), shape_id: id.to_string() });
-                return Err(e.context(format!("shape '{id}' reactivation replay failed")));
-            }
-        };
+        .with_context(|| format!("shape '{id}' reactivation replay failed"))?;
+        // Storage can lose the stream during a filtered or empty scan without any POST observing
+        // it. Check again before activation, preserving the same confirm-before-retirement rule.
+        self.check_replay_destination(&rec.stream_path, attempt).await?;
+        attempt.check()?;
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         cmd_tx
             .send(SequencerCmd::ActivateShape {
@@ -1338,12 +1410,14 @@ impl Engine {
                 // (and an aggregate never goes dormant, so this is always a plain shape).
                 agg_seed: None,
                 emitted_seed: emitted,
+                attempt: Some(attempt.clone()),
                 ready: ready_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        ready_rx
+        attempt
+            .run(&shutdown, ready_rx)
             .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
+            .context("sequencer dropped the ready channel")?
             .map_err(|e| anyhow::anyhow!("shape '{id}' reactivation failed: {e:#}"))?;
         // The replay read the change log through the schema captured above; if the table drifted
         // meanwhile the shape has been retired underneath us and must not be reported live.
@@ -1351,6 +1425,7 @@ impl Engine {
             let _ = cmd_tx.send(SequencerCmd::RemoveShape { table: rec.table.clone(), shape_id: id.to_string() });
             return Err(e.context(format!("shape '{id}' reactivation")));
         }
+        attempt.check()?;
         self.catalog_tx.send(CatalogEvent::Reactivated { id: id.to_string() });
         metrics().shapes_reactivated.fetch_add(1, Ordering::Relaxed);
         trace_lifecycle(

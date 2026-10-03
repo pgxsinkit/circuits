@@ -15,12 +15,12 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 
 ## Items
 
-The upstream-audit backlog resumed on 2026-10-03 with fixes for 0020 and 0022. Urgency describes
+The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0020 and 0022. Urgency describes
 the remaining local surface; parked leads need evidence before they become defect repairs.
 
 | Entries    | Urgency                      | Reason                                                                                                                            |
 | ---------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| 0017       | Medium                       | Engine pending/replay memory can grow with slow or large work; no OOM was reproduced.                                             |
+| 0017       | Fixed                        | Shared pending memory/spill budget, replay admission and a fixed endpoint; total process RSS and disk capacity remain separate.   |
 | 0018–0019  | Conditional medium           | Fork correctness concerns; the engine's ordinary read path does not use DS forks.                                                 |
 | 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.             |
 | 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
@@ -43,7 +43,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0014 — The log server's second-server test failed once under heavy load](0014-log-server-lock-test-failed-once-under-load.md) — parked
 - [0015 — Two dbsp settings are read, logged and do nothing](0015-two-dbsp-settings-are-read-and-do-nothing.md) — candidate
 - [0016 — IndexedLabs upstream audit and resolution ledger](0016-indexedlabs-audit-resolution-ledger.md) — parked
-- [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — candidate
+- [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — dropped (fixed)
 - [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — candidate
 - [0019 — Fork reference counts need graph-aware crash recovery](0019-fork-graph-and-reference-recovery.md) — candidate
 - [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — dropped (fixed)

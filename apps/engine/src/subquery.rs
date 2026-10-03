@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 
 use crate::ds::{DsClient, Envelope};
 use crate::heap_size::HeapSize;
+use crate::pending_buffer::{PendingBudget, PendingBufferConfig, PendingRecord, PendingRecordView, SpillQueue};
 use crate::pk_dict::PkDict;
 use crate::predicate::{CompiledPredicate, PredicateJson, SubqueryCollector, SubqueryEval, SubquerySig, subquery_sig};
 use crate::schema::TableSchema;
@@ -79,7 +80,7 @@ pub struct SubqueryNode {
     /// in flight for a node that is mid-seed — [`SubqueryRegistry::queue_node_deferred`] defers it,
     /// and only a freshly minted node ever gets a seed buffer — so the stamp makes the replay's
     /// freshness explicit instead of an unstated consequence of that ordering.
-    pub(crate) seed_buffer: Option<Vec<BufferedDelta>>,
+    pub(crate) seed_buffer: Option<SpillQueue<BufferedDelta>>,
     /// Re-derivations a CHILD node's flip aimed at this node while it was still seeding
     /// (`seed_buffer.is_some()`), replayed after the seed is installed — see
     /// [`SubqueryRegistry::queue_node_deferred`]. The parent-node analogue of
@@ -333,12 +334,125 @@ pub(crate) enum EmissionSource<'a> {
 /// query-back the moment the shape is installed — or a node re-derivation the moment the seed is —
 /// and that query-back must be able to tell that the replayed decision is newer than its own read.
 /// See [`EmissionSource::Replay`] for the shape half and [`SubqueryNode::recent`] for the node half.
+#[derive(Clone)]
 pub(crate) struct BufferedDelta {
     /// Commit LSN of the change (`0` = unknown).
     lsn: u64,
     /// Commit xid, when the source stamped one — the exact half of the visibility test.
     xid: Option<u64>,
     delta: Vec<Tup2<Row, ZWeight>>,
+}
+
+/// Borrowing the source transaction avoids cloning a whole weighted group merely to spill it.
+/// One group is decoded at a time on drain: splitting a group's old/new images would change the
+/// per-pk latest-row decision, so that temporary group is outside the retained queue RAM bound.
+struct BufferedDeltaRef<'a> {
+    lsn: u64,
+    xid: Option<u64>,
+    delta: &'a [Tup2<Row, ZWeight>],
+}
+
+impl PendingRecordView for BufferedDeltaRef<'_> {
+    type Record = BufferedDelta;
+    fn memory_bytes(&self) -> u64 {
+        (std::mem::size_of::<BufferedDelta>()
+            + std::mem::size_of_val(self.delta)
+            + self.delta.iter().map(|Tup2(row, _)| row.heap_bytes()).sum::<usize>()) as u64
+    }
+    fn clone_record(&self) -> BufferedDelta {
+        BufferedDelta { lsn: self.lsn, xid: self.xid, delta: self.delta.to_vec() }
+    }
+    fn encode(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        writer.write_all(&self.lsn.to_le_bytes())?;
+        writer.write_all(&[u8::from(self.xid.is_some())])?;
+        if let Some(xid) = self.xid {
+            writer.write_all(&xid.to_le_bytes())?;
+        }
+        writer.write_all(&(self.delta.len() as u64).to_le_bytes())?;
+        for Tup2(row, weight) in self.delta {
+            writer.write_all(&weight.to_le_bytes())?;
+            writer.write_all(&(row.0.len() as u64).to_le_bytes())?;
+            for value in &row.0 {
+                match value {
+                    Value::Null => writer.write_all(&[0])?,
+                    Value::Int(value) => {
+                        writer.write_all(&[1])?;
+                        writer.write_all(&value.to_le_bytes())?;
+                    }
+                    Value::Text(value) => {
+                        writer.write_all(&[2])?;
+                        writer.write_all(&(value.len() as u64).to_le_bytes())?;
+                        writer.write_all(value.as_bytes())?;
+                    }
+                    Value::Bool(value) => writer.write_all(&[3, u8::from(*value)])?,
+                    Value::Float(value) => {
+                        writer.write_all(&[4])?;
+                        writer.write_all(&value.0.to_bits().to_le_bytes())?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PendingRecord for BufferedDelta {
+    fn memory_bytes(&self) -> u64 {
+        PendingRecordView::memory_bytes(&BufferedDeltaRef { lsn: self.lsn, xid: self.xid, delta: &self.delta })
+    }
+    fn encode(&self, writer: &mut dyn std::io::Write) -> Result<()> {
+        PendingRecordView::encode(&BufferedDeltaRef { lsn: self.lsn, xid: self.xid, delta: &self.delta }, writer)
+    }
+    fn decode(reader: &mut dyn std::io::Read) -> Result<Self> {
+        use std::io::Read;
+        fn byte(reader: &mut dyn Read) -> Result<u8> {
+            let mut bytes = [0];
+            reader.read_exact(&mut bytes)?;
+            Ok(bytes[0])
+        }
+        fn uint(reader: &mut dyn Read) -> Result<u64> {
+            let mut bytes = [0; 8];
+            reader.read_exact(&mut bytes)?;
+            Ok(u64::from_le_bytes(bytes))
+        }
+        let lsn = uint(reader)?;
+        let xid = match byte(reader)? {
+            0 => None,
+            1 => Some(uint(reader)?),
+            value => anyhow::bail!("invalid pending delta xid tag {value}"),
+        };
+        // Never reserve from untrusted lengths: truncated/corrupt frames fail on read rather
+        // than allocating the claimed row/cell/string capacity before validating its bytes.
+        let rows = uint(reader)?;
+        let mut delta = Vec::new();
+        for _ in 0..rows {
+            let weight = uint(reader)? as i64;
+            let cells = uint(reader)?;
+            let mut row = Vec::new();
+            for _ in 0..cells {
+                row.push(match byte(reader)? {
+                    0 => Value::Null,
+                    1 => Value::Int(uint(reader)? as i64),
+                    2 => {
+                        let len = uint(reader)?;
+                        let mut text = String::new();
+                        let read = reader.take(len).read_to_string(&mut text)?;
+                        anyhow::ensure!(read as u64 == len, "truncated pending delta text");
+                        Value::Text(text)
+                    }
+                    3 => match byte(reader)? {
+                        0 => Value::Bool(false),
+                        1 => Value::Bool(true),
+                        value => anyhow::bail!("invalid pending delta boolean {value}"),
+                    },
+                    4 => Value::Float(ordered_float::OrderedFloat(f64::from_bits(uint(reader)?))),
+                    value => anyhow::bail!("invalid pending delta value tag {value}"),
+                });
+            }
+            delta.push(Tup2(Row(row), weight));
+        }
+        Ok(Self { lsn, xid, delta })
+    }
 }
 
 impl HeapSize for BufferedDelta {
@@ -434,7 +548,7 @@ pub struct PendingSubqueryShape {
     collect_log: Vec<SubquerySig>,
     /// Outer-table deltas buffered while the backfill runs; replayed through the gate at install,
     /// each with the commit stamp it arrived under (see [`BufferedDelta`]).
-    buffer: Vec<BufferedDelta>,
+    buffer: SpillQueue<BufferedDelta>,
     /// Flips that reached this shape's edges before it was installed, replayed at install.
     ///
     /// Phase A commits the shape's edges, so a flip on a node it SHARES with an already-live shape
@@ -546,6 +660,7 @@ pub struct SubqueryRegistry {
     /// streams asynchronously, covered by the `pendingFlips` barrier. `None` (unit tests)
     /// falls back to a direct reliable append.
     lanes: Option<crate::engine::emission::EmissionLanes>,
+    pending_budget: Arc<PendingBudget>,
 }
 
 impl HeapSize for SubqueryRegistry {
@@ -577,6 +692,10 @@ impl HeapSize for SubqueryRegistry {
 
 impl SubqueryRegistry {
     pub fn new(ds: DsClient, pg_url: Option<String>) -> Self {
+        Self::new_with_budget(ds, pg_url, PendingBudget::new(PendingBufferConfig::default()))
+    }
+
+    pub fn new_with_budget(ds: DsClient, pg_url: Option<String>, pending_budget: Arc<PendingBudget>) -> Self {
         SubqueryRegistry {
             nodes: HashMap::new(),
             edges: HashMap::new(),
@@ -598,6 +717,7 @@ impl SubqueryRegistry {
             pg_url,
             schemas: Arc::new(HashMap::new()),
             lanes: None,
+            pending_budget,
         }
     }
 
@@ -929,7 +1049,7 @@ impl SubqueryRegistry {
         let mut seeds = Vec::with_capacity(fresh.len());
         for sig in &fresh {
             if let Some(n) = self.nodes.get_mut(sig) {
-                n.seed_buffer = Some(Vec::new());
+                n.seed_buffer = Some(SpillQueue::new(self.pending_budget.clone()));
                 seeds.push((sig.clone(), n.inner_table.clone(), n.where_json.clone()));
             }
         }
@@ -956,7 +1076,7 @@ impl SubqueryRegistry {
             out_cols,
             changes_only,
             collect_log: log,
-            buffer: Vec::new(),
+            buffer: SpillQueue::new(self.pending_budget.clone()),
             deferred: VecDeque::new(),
         });
         Ok(BeginCreate { seeds, schemas: self.schemas.clone() })
@@ -1108,19 +1228,28 @@ impl SubqueryRegistry {
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.gate = gate;
             }
-            let buffered = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.take()).unwrap_or_default();
             // Replayed one buffered delta at a time, in arrival order, so each keeps its own
             // commit stamp and is recorded as the live decision it is (the outer buffer's replay
             // below does the same). Membership is re-evaluated by identity per pk and is
             // idempotent against the seed for snapshot-visible rows, so replaying every delta is
             // convergent — replaying per delta just also lands the intermediate states.
-            for b in buffered {
+            loop {
+                let buffered = self
+                    .nodes
+                    .get_mut(&sig)
+                    .context("finish_create: node vanished")?
+                    .seed_buffer
+                    .as_mut()
+                    .context("finish_create: node is no longer pending")?
+                    .try_pop()?;
+                let Some(b) = buffered else { break };
                 let evals = self.node_present_values(&sig, &ts, &b.delta);
                 self.record_node_recency(&sig, evals.iter().map(|(pk, _)| pk), b.lsn, b.xid);
                 for f in self.apply_node_evals(&sig, evals).await {
                     work.push_back((sig.clone(), f));
                 }
             }
+            self.nodes.get_mut(&sig).context("finish_create: node vanished")?.seed_buffer = None;
             // The node is live from here (its seed and its raw deltas are both in), so a child
             // flip that arrived while it was seeding can finally be re-derived against a set that
             // is not a lie. Taking the queue drains it for good: the node no longer defers.
@@ -1130,8 +1259,9 @@ impl SubqueryRegistry {
                 }
             }
         }
-        // 2. Everything that can still fail happens BEFORE the pending entry leaves the registry,
-        //    so a failure here returns with the create still exactly unwindable.
+        // 2. Keep the pending entry through installation and buffered replay. A disk read or an
+        //    append can still fail after installation; abort_create then drops the installed
+        //    shape and discards its remaining scratch without compensating node refs twice.
         let idx = self
             .pending_shapes
             .iter()
@@ -1142,11 +1272,11 @@ impl SubqueryRegistry {
             .get(&self.pending_shapes[idx].outer_table)
             .cloned()
             .context("finish_create: unknown outer table")?;
-        // The atomic tail: ONE synchronous `&mut self` step, no `.await` inside it — take the
-        // pending entry (and with it the deferred queue), register the shape, seed its feed. This
-        // is the step the deferred hand-off's losslessness rests on (see the doc comment).
-        let mut pending = self.pending_shapes.remove(idx);
-        let deferred = std::mem::take(&mut pending.deferred);
+        self.pending_shapes[idx].buffer.check()?;
+        // The installation step is synchronous: register the shape and seed its feed before any
+        // await. Retain the pending entry and its deferred queue until raw-buffer replay succeeds,
+        // so cancellation or a decode failure always leaves reachable cleanup ownership.
+        let pending = &self.pending_shapes[idx];
         let feed_id = self.next_feed_id;
         self.next_feed_id += 1;
         self.install_shape(SubqueryShape {
@@ -1177,7 +1307,9 @@ impl SubqueryRegistry {
         //    and a replayed decision it must not undo is recognisable only by its stamp. Per-pk
         //    emission is absolute, so replaying per delta rather than folding them into one
         //    verdict lands the same final state — it just also lands the intermediate ones.
-        for buffered in std::mem::take(&mut pending.buffer) {
+        loop {
+            let buffered = self.pending_shapes[idx].buffer.try_pop()?;
+            let Some(buffered) = buffered else { break };
             let candidates = crate::engine::membership::latest_rows_by_pk(&ts, &buffered.delta);
             self.emit_for_shapes(
                 &ts,
@@ -1187,6 +1319,10 @@ impl SubqueryRegistry {
             )
             .await?;
         }
+        // Keep the pending queue's failure/cleanup ownership through disk reads and appends.
+        // Cancellation after install is compensated by abort_create's installed branch.
+        let mut pending = self.pending_shapes.remove(idx);
+        let deferred = std::mem::take(&mut pending.deferred);
         Ok(FinishedCreate { work, deferred, node_work })
     }
 
@@ -1197,7 +1333,7 @@ impl SubqueryRegistry {
     /// step so no live delta can observe a half-installed shape. Registration is only reachable
     /// from `finish_create`, the atomic tail of shape creation: a create that fails or is cancelled
     /// earlier never got here, so [`abort_create`](Self::abort_create) unwinds its still-registered
-    /// pending entry — one abandoned after it undoes this install through
+    /// pending entry. After installation, including a failed buffered replay, it undoes the install through
     /// [`drop_subquery_shape`](Self::drop_subquery_shape).
     fn install_shape(&mut self, shape: SubqueryShape) {
         self.feed_by_id.insert(shape.feed_id, shape.shape_id.clone());
@@ -1231,6 +1367,11 @@ impl SubqueryRegistry {
     /// retracts nothing and the check would cost the same scan as the retraction.
     pub async fn abort_create(&mut self, shape_id: &str) {
         if self.shapes.contains_key(shape_id) {
+            if let Some(idx) = self.pending_shapes.iter().position(|p| p.shape_id == shape_id) {
+                // The installed drop path owns refcount compensation now. Discard only scratch
+                // queues here; replaying collect_log as well would decrement the same refs twice.
+                self.pending_shapes.remove(idx);
+            }
             self.drop_subquery_shape(shape_id).await;
             return;
         }
@@ -1439,7 +1580,13 @@ impl SubqueryRegistry {
                     // Keep this commit's stamp with the delta: the install replay is a live
                     // decision and has to be able to out-rank a node query-back's older read
                     // (see [`BufferedDelta`]).
-                    buf.push(BufferedDelta { lsn, xid, delta: delta.to_vec() });
+                    if !buf.is_failed()
+                        && let Err(error) = buf.push_borrowed(&BufferedDeltaRef { lsn, xid, delta })
+                    {
+                        // Only this unacknowledged create depends on the pending node. Retain
+                        // its latched failure for finish_create and the guard's exact rollback.
+                        tracing::error!(node = %sig, %error, "pending subquery seed buffering failed");
+                    }
                     hop(&mut trace, format!("node:{sig}"), "buffered");
                 } else if self.nodes.get(&sig).is_some_and(|n| n.gate.should_skip(lsn, xid)) {
                     hop(&mut trace, format!("node:{sig}"), "dropped");
@@ -1494,7 +1641,11 @@ impl SubqueryRegistry {
         // keeping this commit's stamp with it (the replay is a live decision — see
         // [`BufferedDelta`]).
         for p in self.pending_shapes.iter_mut().filter(|p| p.outer_table == table) {
-            p.buffer.push(BufferedDelta { lsn, xid, delta: delta.to_vec() });
+            if !p.buffer.is_failed()
+                && let Err(error) = p.buffer.push_borrowed(&BufferedDeltaRef { lsn, xid, delta })
+            {
+                tracing::error!(shape = %p.shape_id, %error, "pending subquery shape buffering failed");
+            }
         }
 
         // 3. Flip propagation (the Postgres query-backs) is deferred: the caller enqueues `work`
@@ -2848,6 +2999,124 @@ mod tests {
         reg.set_schemas(Arc::new(creating_schemas()));
         let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).unwrap();
         (reg, begin)
+    }
+
+    #[test]
+    fn pending_delta_codec_preserves_weights_stamps_and_float_bits() {
+        let bits =
+            [0, (-0.0f64).to_bits(), f64::INFINITY.to_bits(), f64::NEG_INFINITY.to_bits(), 0x7ff8_0000_0000_0123];
+        let delta = vec![Tup2(
+            Row(vec![
+                Value::Null,
+                Value::Int(i64::MIN),
+                Value::Int(i64::MAX),
+                Value::Text("é\0large".repeat(100)),
+                Value::Bool(true),
+                Value::Bool(false),
+            ]
+            .into_iter()
+            .chain(bits.into_iter().map(|bits| Value::Float(ordered_float::OrderedFloat(f64::from_bits(bits)))))
+            .collect()),
+            -3,
+        )];
+        let source = BufferedDeltaRef { lsn: u64::MAX, xid: Some(u64::MAX - 1), delta: &delta };
+        let mut bytes = Vec::new();
+        PendingRecordView::encode(&source, &mut bytes).unwrap();
+        let decoded = <BufferedDelta as PendingRecord>::decode(&mut bytes.as_slice()).unwrap();
+        assert_eq!((decoded.lsn, decoded.xid), (source.lsn, source.xid));
+        assert_eq!(decoded.delta, delta);
+        for (cell, bits) in decoded.delta[0].0.0[6..].iter().zip(bits) {
+            let Value::Float(value) = cell else { panic!("float lost its type") };
+            assert_eq!(value.0.to_bits(), bits);
+        }
+        // A fake enormous string length must fail without reserving its advertised capacity.
+        let mut corrupt = Vec::new();
+        for value in [0u64, 1, 1, 1] {
+            if corrupt.len() == 8 {
+                corrupt.push(0);
+            }
+            corrupt.extend_from_slice(&value.to_le_bytes());
+        }
+        corrupt.push(2);
+        corrupt.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert!(<BufferedDelta as PendingRecord>::decode(&mut corrupt.as_slice()).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_subquery_rows_share_a_budget_and_abort_removes_spill() {
+        let dir = crate::pending_buffer::tests::Scratch::new();
+        let budget = PendingBudget::new(PendingBufferConfig { memory_bytes: 512, spill_dir: dir.path().join("spill") });
+        let mut reg = SubqueryRegistry::new_with_budget(DsClient::new("http://unused"), None, budget.clone());
+        reg.set_schemas(Arc::new(creating_schemas()));
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).unwrap();
+        let inner = reg.schemas[&"inner_t".into()].clone();
+        let outer = reg.schemas[&"outer_t".into()].clone();
+        let mut legacy_bytes = 0;
+        for id in 0..128 {
+            let delta = [Tup2(Row(vec![Value::Int(7), Value::Int(id)]), 1)];
+            legacy_bytes +=
+                2 * PendingRecordView::memory_bytes(&BufferedDeltaRef { lsn: id as u64, xid: Some(42), delta: &delta });
+            reg.on_table_delta(&inner, &delta, id as u64, Some(42), None, None).await.unwrap();
+            reg.on_table_delta(&outer, &delta, id as u64, Some(42), None, None).await.unwrap();
+            assert!(budget.stats().memory_bytes <= 512);
+        }
+        assert_eq!(budget.stats().items, 256);
+        assert_eq!(reg.nodes[&begin.seeds[0].0].seed_buffer.as_ref().unwrap().len(), 128);
+        assert_eq!(reg.pending_shapes[0].buffer.len(), 128);
+        assert!(budget.stats().spill_bytes > 0);
+        assert!(legacy_bytes > 512 * 50, "the original vectors would retain {legacy_bytes} bytes");
+        eprintln!(
+            "0017 pending: legacy_retained_bytes={legacy_bytes} budget=512 retained_ram={} spill_bytes={}",
+            budget.stats().memory_bytes,
+            budget.stats().spill_bytes
+        );
+        reg.abort_create("s1").await;
+        assert_eq!(budget.stats(), crate::pending_buffer::PendingStats::default());
+        assert_eq!(std::fs::read_dir(dir.path().join("spill")).unwrap().count(), 0);
+        assert!(reg.nodes.is_empty());
+        assert!(reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).is_ok());
+        reg.abort_create("s1").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_pending_seed_and_outer_reads_reject_and_unwind_creation() {
+        for corrupt_inner in [true, false] {
+            let dir = crate::pending_buffer::tests::Scratch::new();
+            let budget =
+                PendingBudget::new(PendingBufferConfig { memory_bytes: 0, spill_dir: dir.path().join("spill") });
+            let mut reg = SubqueryRegistry::new_with_budget(DsClient::new("http://unused"), None, budget.clone());
+            reg.set_schemas(Arc::new(creating_schemas()));
+            let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).unwrap();
+            let ts = reg.schemas[&if corrupt_inner { "inner_t" } else { "outer_t" }.into()].clone();
+            reg.on_table_delta(&ts, &[Tup2(Row(vec![Value::Int(7), Value::Int(1)]), 1)], 20, Some(42), None, None)
+                .await
+                .unwrap();
+            let path = if corrupt_inner {
+                reg.nodes[&begin.seeds[0].0].seed_buffer.as_ref().unwrap().spill_path().unwrap()
+            } else {
+                reg.pending_shapes[0].buffer.spill_path().unwrap()
+            };
+            std::fs::OpenOptions::new().write(true).open(path).unwrap().set_len(8).unwrap();
+            let seeds =
+                begin.seeds.iter().map(|(sig, _, _)| (sig.clone(), crate::pg::SnapshotGate::passthrough())).collect();
+            assert!(
+                reg.finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(reg.pending_shapes.len(), 1, "failure retains cleanup ownership");
+            assert_eq!(reg.shapes.contains_key("s1"), !corrupt_inner, "outer read fails after install");
+            reg.abort_create("s1").await;
+            assert!(reg.pending_shapes.is_empty());
+            assert!(reg.shapes.is_empty());
+            assert!(reg.nodes.is_empty());
+            assert!(reg.templates.is_empty());
+            assert_eq!(reg.edges_count(), 0);
+            assert_eq!(budget.stats(), crate::pending_buffer::PendingStats::default());
+            assert_eq!(std::fs::read_dir(dir.path().join("spill")).unwrap().count(), 0);
+            assert!(reg.begin_create("s1", &"outer_t".into(), "shape/s1", &in_inner_t(), None, false).is_ok());
+            reg.abort_create("s1").await;
+        }
     }
 
     /// **A flip that arrives mid-create waits, it is not dropped.** Phase A commits the shape's

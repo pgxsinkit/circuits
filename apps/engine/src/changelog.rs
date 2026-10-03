@@ -14,7 +14,7 @@
 //! 4. records `ChangesRotated { segment: n+1, at }` in the durable catalog, and
 //! 5. continues in `changes/<n+1>`.
 //!
-//! Readers follow the pointer: the sequencer's live loop and `replay_changes_for_shape` both
+//! Readers follow the pointer: the sequencer's live loop and `replay_changes_until` both
 //! continue on the pointed-to segment from `"-1"`. Every position in the log is therefore a
 //! [`LogPosition`] — `(segment, offset)` — not a bare durable-streams offset: the sequencer's
 //! checkpoint, a dormant shape's resume state, and `GET /tables/{name}/offset` all carry the

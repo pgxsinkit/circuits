@@ -1382,6 +1382,7 @@ impl Engine {
                 pred: pred.clone(),
                 out_cols: out_cols.clone(),
                 kind,
+                attempt: None,
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
@@ -2709,7 +2710,7 @@ mod tests {
     }
 
     /// A dormant shape whose OWN stream storage lost while it slept: the touch that reactivates it
-    /// finds nothing to append its replay to, and the shape is retired — `Dropped`, close-then-delete
+    /// finds no retained destination, and the shape is retired — `Dropped`, close-then-delete
     /// — rather than parked back to fail the same way on every touch. The runtime form of the boot's
     /// `stream_missing`, told apart from a gone change-log segment by the stream that is gone.
     #[tokio::test(flavor = "multi_thread")]
@@ -2727,13 +2728,17 @@ mod tests {
             .expect("the stream is there at boot");
         assert_eq!(engine.shape_lifecycle("s1").await, Some("dormant"));
 
-        // While it is dormant, storage loses the stream; the change log holds a change to replay.
+        // While it is dormant, storage loses the stream. Even a zero-byte replay must verify its
+        // destination: there need not be a matching change whose append would detect the loss.
         server.mark_stream_missing("shape/s1");
+        // This page is beyond the live sequencer's captured cursor (the fixture refuses live
+        // reads). A wake must not scan it merely to discover that its own destination is gone.
         server.serve_page(
             &crate::changelog::segment_path(0),
             serde_json::json!([{ "type": "public.users", "key": "1", "value": { "id": 1, "name": "a" }, "headers": { "operation": "insert" } }]),
         );
         let err = engine.ensure_active("s1").await.expect_err("there is nothing to reactivate onto");
+        assert_eq!(engine.replay_controls.stats().pages, 0, "loss is found without a replay GET or append");
         let retired = err.downcast_ref::<crate::retention::ShapeReplayRetired>().expect("confirmed loss is terminal");
         assert_eq!(retired.shape, "s1");
         assert_eq!(retired.stream, "shape/s1");

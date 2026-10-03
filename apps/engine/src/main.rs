@@ -64,6 +64,16 @@ async fn main() -> Result<()> {
     if let Err(e) = config.txn.probe().context("checking the large-transaction spill directory") {
         refuse_boot("configuration", &e);
     }
+    if let Err(e) = config.pending.probe().context("checking the pending-buffer spill directory") {
+        refuse_boot("configuration", &e);
+    }
+    match circuits_engine::pending_buffer::sweep_spill_dir(&config.pending.spill_dir)
+        .context("cleaning stale pending-buffer spill files")
+    {
+        Ok(0) => {}
+        Ok(count) => tracing::info!(count, "removed stale pending-buffer spill files"),
+        Err(e) => refuse_boot("configuration", &e),
+    }
 
     // TEST-ONLY: surface an injected fault so a faulted run is never silent (no-op when unset).
     if circuits_engine::fault::active() != circuits_engine::fault::Fault::None {
@@ -79,7 +89,12 @@ async fn main() -> Result<()> {
     // backfill. Enabled by CIRCUITS_PG_URL.
     let engine = match &config.pg_url {
         Some(url) if !url.is_empty() => {
-            let engine = Engine::new_pg(DsClient::new(ds_url.clone()), url.clone());
+            let engine = Engine::new_pg_with_resources(
+                DsClient::new(ds_url.clone()),
+                url.clone(),
+                config.pending.clone(),
+                config.replay,
+            );
             // The dbsp arrangement circuit is mandatory infrastructure — always configured.
             tracing::info!("dbsp arrangements: dir {}", config.dbsp.dir.display());
             engine.set_dbsp_config(config.dbsp.clone());
@@ -91,7 +106,7 @@ async fn main() -> Result<()> {
         _ => {
             // Library mode: no Postgres source; the engine is `active` from construction. Shutdown
             // and readiness still apply — there is simply nothing Postgres-shaped to wait for.
-            Engine::new(DsClient::new(ds_url.clone()))
+            Engine::new_with_resources(DsClient::new(ds_url.clone()), config.pending.clone(), config.replay)
         }
     };
 

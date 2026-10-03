@@ -2,6 +2,7 @@
 //! envelope processing, activation/backfill, and the reliable flush.
 
 use super::*;
+use crate::pending_buffer::{PendingBudget, SpillQueue};
 
 /// Handle to the engine's single **sequencer** task — the LSN-ordered executor consuming the
 /// global `changes` stream (Electric's `ShapeLogCollector` pattern): one task processes every
@@ -35,7 +36,11 @@ pub(crate) enum SequencerCmd {
         /// Output projection (column indices to emit), or `None` for the full row.
         out_cols: Option<Arc<Vec<usize>>>,
         kind: CreateKind,
-        ack: tokio::sync::oneshot::Sender<()>,
+        /// Dormant replay owns a cancellable attempt; fresh creates use their create guard.
+        attempt: Option<super::replay::ReplayAttempt>,
+        /// Raw consumed position, including a held transaction prefix. Pending registration and
+        /// capturing this fixed replay endpoint are one sequencer step.
+        ack: tokio::sync::oneshot::Sender<LogPosition>,
     },
     /// Phase 2: the creator's backfill snapshot has been appended chunk by chunk (plain) or folded
     /// into `agg_seed` (aggregates); drain the buffered deltas through the shape's snapshot gate
@@ -52,6 +57,7 @@ pub(crate) enum SequencerCmd {
         agg_seed: Option<AggSeed>,
         /// Snapshot envelopes the creator appended (seeds the shape's emit counter).
         emitted_seed: u64,
+        attempt: Option<super::replay::ReplayAttempt>,
         /// The error travels typed, not formatted: the catalog restore hands it to the boot, which
         /// retries a storage outage and refuses a real refusal (`pg::boot_disposition`), and a
         /// string cannot say which it was.
@@ -61,6 +67,7 @@ pub(crate) enum SequencerCmd {
     AbortShape {
         table: TableRef,
         shape_id: String,
+        attempt_id: Option<u64>,
     },
     /// Retention: unregister a plain row shape's routing and hand back its resume state — the
     /// sequencer's fully-processed change-log position (the batch preceding this command was fully
@@ -205,6 +212,7 @@ pub(crate) fn spawn_sequencer(
     // Where an envelope the sequencer cannot process is recorded, and how the engine is latched
     // broken for it (ADR-0010).
     fail_closed: FailClosed,
+    pending_budget: Arc<PendingBudget>,
     shutdown: crate::shutdown::ShutdownToken,
 ) -> SequencerHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -232,6 +240,7 @@ pub(crate) fn spawn_sequencer(
         library_mode,
         hold_reads,
         fail_closed,
+        pending_budget,
         shutdown,
         party,
     ));
@@ -313,7 +322,7 @@ pub(crate) struct TableExec {
     /// mode has no catalog checkpoint to resume from (`apply_catalog` runs only on the Postgres
     /// boot), so a starting process replays the log from `LogPosition::start()` and rebuilds the
     /// whole view before it serves anything. The one reader this cannot serve is
-    /// `replay_changes_for_shape`, which reads the log at a DORMANT SHAPE's resume position while
+    /// `replay_changes_until`, which reads the log at a DORMANT SHAPE's resume position while
     /// the view is at the head; that path decides membership absolutely instead
     /// (`output::absolute_envelope`).
     pub(crate) library_rows: HashMap<String, serde_json::Value>,
@@ -371,7 +380,14 @@ pub(crate) struct PendingShape {
     pub(crate) pred: Arc<CompiledPredicate>,
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
     pub(crate) kind: CreateKind,
-    pub(crate) buffered: Vec<Envelope>,
+    pub(crate) buffered: SpillQueue<Envelope>,
+    pub(crate) attempt_id: Option<u64>,
+}
+
+impl crate::heap_size::HeapSize for PendingShape {
+    fn heap_bytes(&self) -> usize {
+        self.stream_path.heap_bytes() + self.buffered.heap_bytes()
+    }
 }
 
 /// Get (or lazily create) the executor for `table`; `None` if `table` is not a known table's
@@ -383,7 +399,7 @@ pub(crate) struct PendingShape {
 ///
 /// **Strict, deliberately.** A non-canonical spelling (a bare `users`) is refused rather than
 /// resolved, because resolving it here would be resolved in only HALF the engine: the live fan-out
-/// would route it while `replay_changes_for_shape` — the dormant-reactivation / retained-stream
+/// would route it while `replay_changes_until` — the dormant-reactivation / retained-stream
 /// catch-up — compares `env.type_ != table.as_str()` and would skip the very same envelopes, so a
 /// shape's live stream and its replayed stream would disagree. No legitimate writer produces a
 /// non-canonical `type`: the replication ingestor stamps `TableRef::to_string()`, and library-mode
@@ -431,6 +447,7 @@ pub(crate) async fn sequencer_loop(
     library_mode: bool,
     hold_reads: bool,
     fail_closed: FailClosed,
+    pending_budget: Arc<PendingBudget>,
     shutdown: crate::shutdown::ShutdownToken,
     // Held for the task's lifetime: dropping it is what tells the shutdown "the sequencer is done".
     _party: crate::shutdown::ShutdownParty,
@@ -501,31 +518,47 @@ pub(crate) async fn sequencer_loop(
         tokio::select! {
             biased;
             cmd = cmd_rx.recv() => match cmd {
-                Some(SequencerCmd::BeginShape { table, shape_id, num_id, stream_path, pred, out_cols, kind, ack }) => {
+                Some(SequencerCmd::BeginShape { table, shape_id, num_id, stream_path, pred, out_cols, kind, attempt, ack }) => {
+                    // A purge can overtake dispatch of a detached replay owner. Never register its
+                    // cancelled command after RemoveShape already removed the lifecycle record.
+                    if attempt.as_ref().is_some_and(|a| a.is_cancelled()) {
+                        continue;
+                    }
+                    let attempt_id = attempt.as_ref().map(|a| a.id());
                     match exec_for(&mut execs, &tables, table.as_str()) {
                         Some(exec) => {
-                            exec.pending.insert(
-                                shape_id,
-                                PendingShape { num_id, stream_path, pred, out_cols, kind, buffered: Vec::new() },
-                            );
+                            if exec.pending.contains_key(&shape_id) {
+                                tracing::error!(%shape_id, "begin_shape: shape already pending");
+                                continue;
+                            }
+                            exec.pending.insert(shape_id, PendingShape {
+                                num_id, stream_path, pred, out_cols, kind,
+                                buffered: SpillQueue::new(pending_budget.clone()), attempt_id,
+                            });
                         }
                         None => tracing::error!("begin_shape: unknown table '{table}'"),
                     }
-                    let _ = ack.send(());
+                    let _ = ack.send(pos.clone());
                 }
-                Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, ready }) => {
-                    let res = activate_shape(
+                Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, attempt, ready }) => {
+                    let res = if attempt.as_ref().is_some_and(|a| a.is_cancelled()) {
+                        Err(anyhow::anyhow!("replay attempt was cancelled"))
+                    } else if execs.get(table.as_str()).and_then(|e| e.pending.get(&shape_id))
+                        .is_some_and(|p| p.attempt_id != attempt.as_ref().map(|a| a.id())) {
+                        Err(anyhow::anyhow!("stale replay activation"))
+                    } else { activate_shape(
                         &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
-                        &shutdown,
-                    ).await;
+                        &shutdown, attempt.as_ref(),
+                    ).await };
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
                     }
                     let _ = ready.send(res);
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
-                Some(SequencerCmd::AbortShape { table, shape_id }) => {
-                    if let Some(exec) = execs.get_mut(table.as_str()) {
+                Some(SequencerCmd::AbortShape { table, shape_id, attempt_id }) => {
+                    if let Some(exec) = execs.get_mut(table.as_str())
+                        && exec.pending.get(&shape_id).is_some_and(|p| p.attempt_id == attempt_id) {
                         exec.pending.remove(&shape_id);
                     }
                 }
@@ -952,7 +985,13 @@ pub(crate) async fn sequencer_loop(
                             // acknowledged before the creator's snapshot, so everything the
                             // snapshot cannot contain lands in the buffer.
                             for pending in exec.pending.values_mut() {
-                                pending.buffered.push(env.clone());
+                                if !pending.buffered.is_failed()
+                                    && let Err(e) = pending.buffered.push(env) {
+                                    // The create/replay owner observes this latched refusal at
+                                    // activation and rolls back. Live shapes remain maintainable;
+                                    // a dormant retry retains its original history resume pin.
+                                    tracing::error!(stream = %pending.stream_path, error = %e, "pending shape buffering failed");
+                                }
                             }
                             if let Err(e) = process_envelope(
                                 &exec.ts, &exec.shapes, &exec.shape_index, &exec.families,
@@ -1392,16 +1431,47 @@ pub(crate) async fn activate_shape(
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
+    attempt: Option<&super::replay::ReplayAttempt>,
 ) -> Result<()> {
     let exec = execs.get_mut(table.as_str()).with_context(|| format!("no executor for table '{table}'"))?;
-    let p = exec.pending.remove(shape_id).with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
+    let mut p = exec.pending.remove(shape_id).with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
+    p.buffered.check()?;
     if emitted_seed > 0 {
         emitted.insert(shape_id.to_string(), emitted_seed);
     }
     match p.kind {
         CreateKind::Plain => {
-            // Register routing first (an equality template joins/creates its family's KeyRouter;
-            // everything else is a standalone indexed filter)...
+            // Drain the buffer through the gate before publishing routing. `matches()` evaluates equality templates
+            // and standalone predicates alike, so one replay path covers both placements.
+            let mut outs = ActivationOutput::default();
+            while let Some(env) = p.buffered.try_pop()? {
+                // The same fence the live loop applies (ADR-0010): an envelope from before a drift is
+                // skipped (its shapes are retired), and one this schema DOES describe that still will
+                // not decode fails the activation — the create is refused rather than quietly serving
+                // a shape that is missing a change. The same envelope reaches the main loop, which is
+                // what parks the engine.
+                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, &env)? else { continue };
+                if delta.is_empty() {
+                    continue;
+                }
+                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
+                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+                if gate.should_skip(lsn_u64, xid) {
+                    continue;
+                }
+                let matched = eval_standalone(&p.pred, &delta);
+                if matched.is_empty() {
+                    continue;
+                }
+                for out in translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)) {
+                    outs.push(ds, &p.stream_path, out, shutdown, attempt).await?;
+                }
+            }
+            outs.flush(ds, &p.stream_path, shutdown, attempt).await?;
+            *emitted.entry(shape_id.to_string()).or_insert(0) += outs.emitted;
+            check_replay_attempt(attempt)?;
+            // Publish routing after buffered output has landed: equality templates join their
+            // family's KeyRouter; other predicates become standalone indexed filters.
             match p.pred.equality_template() {
                 Some(pairs) => {
                     let key_cols: Vec<usize> = pairs.iter().map(|(c, _)| *c).collect();
@@ -1431,34 +1501,6 @@ pub(crate) async fn activate_shape(
                     );
                 }
             }
-            // ...then drain the buffer through the gate. `matches()` evaluates equality templates
-            // and standalone predicates alike, so one replay path covers both placements.
-            let mut outs: Vec<Envelope> = Vec::new();
-            for env in &p.buffered {
-                // The same fence the live loop applies (ADR-0010): an envelope from before a drift is
-                // skipped (its shapes are retired), and one this schema DOES describe that still will
-                // not decode fails the activation — the create is refused rather than quietly serving
-                // a shape that is missing a change. The same envelope reaches the main loop, which is
-                // what parks the engine.
-                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, env)? else { continue };
-                if delta.is_empty() {
-                    continue;
-                }
-                let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-                let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-                if gate.should_skip(lsn_u64, xid) {
-                    continue;
-                }
-                let matched = eval_standalone(&p.pred, &delta);
-                if matched.is_empty() {
-                    continue;
-                }
-                outs.extend(translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)));
-            }
-            if !outs.is_empty() {
-                *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
-                ds.append_reliable(&p.stream_path, &outs).await;
-            }
         }
         CreateKind::Aggregate { func, col } => {
             // Adopt the fold the creator built while STREAMING the backfill (no backfill rows ever
@@ -1477,11 +1519,12 @@ pub(crate) async fn activate_shape(
                 multiset: seed.multiset,
                 last: None,
             };
-            let mut outs = vec![agg.envelope(&exec.ts, None, None)];
+            let mut outs = ActivationOutput::default();
+            outs.push(ds, &p.stream_path, agg.envelope(&exec.ts, None, None), shutdown, attempt).await?;
             agg.last = Some(agg.value());
-            for env in &p.buffered {
+            while let Some(env) = p.buffered.try_pop()? {
                 // The fence, as in the plain branch above (ADR-0010).
-                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, env)? else { continue };
+                let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, &env)? else { continue };
                 if delta.is_empty() {
                     continue;
                 }
@@ -1494,15 +1537,16 @@ pub(crate) async fn activate_shape(
                     let val = agg.value();
                     if agg.last.as_ref() != Some(&val) {
                         agg.last = Some(val.clone());
-                        outs.push(agg.envelope(&exec.ts, txid, lsn));
+                        outs.push(ds, &p.stream_path, agg.envelope(&exec.ts, txid, lsn), shutdown, attempt).await?;
                     }
                 }
             }
-            *emitted.entry(shape_id.to_string()).or_insert(0) += outs.len() as u64;
             // Retried, not propagated on the first failure: at RESTORE this append's error fails the
             // whole restore (ADR-0009), and one transient 503 must not cost a boot attempt — it once
             // cost the acknowledged aggregate itself.
-            ds.append_retrying(&p.stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await?;
+            outs.flush(ds, &p.stream_path, shutdown, attempt).await?;
+            *emitted.entry(shape_id.to_string()).or_insert(0) += outs.emitted;
+            check_replay_attempt(attempt)?;
             exec.agg_index.insert(shape_id, &agg.pred);
             exec.aggregates.insert(shape_id.to_string(), agg);
         }
@@ -1510,153 +1554,69 @@ pub(crate) async fn activate_shape(
     Ok(())
 }
 
-/// Replay the global change log from `from` for one dormant shape: apply each of its table's
-/// envelopes through the shape's snapshot gate + predicate + projection and append the matches to
-/// the retained stream. Pages until the log reports up-to-date on the OPEN segment, following each
-/// closed segment's rotation pointer on the way (ADR-0006) exactly as the live loop does. Appends
-/// are direct (`ds.append`): a retired stream (404/410/closed) means it vanished (evicted/purged
-/// mid-replay) and must fail the resume.
-///
-/// A resume segment that is GONE (the sweeper deleted it — which it only does once nothing can
-/// resume inside it, so this should be unreachable) surfaces as a read error, which fails the
-/// resume and drops the shape. That is the right outcome: a shape whose replay start no longer
-/// exists can never be brought up to date, and its subscribers must recreate it.
-///
-/// It deliberately does NOT hold back an unterminated transaction the way the live loop does
-/// (ADR-0003). Nothing here depends on transaction boundaries: it filters by table through the
-/// shape's snapshot gate and appends **absolute per-pk** rows (`upsert`/`delete` by key), so a
-/// partly-appended commit produces a prefix of the same absolute rows and the next page produces
-/// the rest — no delta is counted twice and no intermediate state is wrong, only briefly
-/// incomplete, on a stream the shape is not live on yet. The live loop's rule is what governs from
-/// the moment the shape is registered.
-///
-/// It does apply the schema fence (ADR-0010), and a failure here is LOUD for a reason particular to
-/// this path: the replay runs from the shape's resume position to the **head of the open segment**, so
-/// it can reach an envelope the live loop has not processed yet and will park on. Skipping one would
-/// report the shape live and serve it short of that change until the live loop caught up — the exact
-/// silent gap the fence exists to prevent. An envelope from before a drift is still skipped (its
-/// dependents are retired either way); one this schema DESCRIBES and that will not decode fails the
-/// reactivation, which leaves the shape dormant and refuses the read that touched it, exactly as a
-/// storage failure on the append below does.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn replay_changes_for_shape(
-    ds: &DsClient,
-    ts: &TableSchema,
-    table: &TableRef,
-    pred: &CompiledPredicate,
-    out_cols: Option<&Arc<Vec<usize>>>,
-    gate: &crate::pg::SnapshotGate,
-    stream_path: &str,
-    from: &LogPosition,
-    library_mode: bool,
-    shutdown: &crate::shutdown::ShutdownToken,
-) -> Result<u64> {
-    let mut pos = from.clone();
-    let mut rotate_to: Option<u32> = None;
-    let mut emitted = 0u64;
-    // Pre-drift schemas already reported by this replay (see the fence below): one line per schema,
-    // not one per envelope, because a migration the shape slept through orphaned every change in it.
-    let mut stale_schema_reported: HashSet<u64> = HashSet::new();
-    loop {
-        let rr = ds
-            .read(&pos.path(), &pos.offset, false)
-            .await
-            .with_context(|| format!("replaying the change log from {pos}"))?;
-        if let Some(n) = crate::changelog::rotation_target_in(&rr.envelopes) {
-            rotate_to = Some(n);
-        }
-        let delivered = rr.envelopes.len();
-        let mut outs: Vec<Envelope> = Vec::new();
-        for env in &rr.envelopes {
-            // The change log's `type` is the canonical `schema.name`; a control envelope's never
-            // is, so it is skipped by TYPE here as everywhere else.
-            if env.type_ != table.as_str() {
-                continue;
-            }
-            // THE SCHEMA FENCE (ADR-0010), in the same narrowed form `decode_buffered` uses: this path
-            // holds one compiled schema and cannot refresh it from the shared view.
-            if !schema_describes(ts, env) {
-                metrics().sequencer_stale_schema_skipped.fetch_add(1, Ordering::Relaxed);
-                if let Some(digest) = stamped_digest(env)
-                    && stale_schema_reported.insert(digest)
-                {
-                    tracing::warn!(
-                        "shape replay on '{table}': skipping changes decoded under schema {} — a drift has \
-                         replaced it (ADR-0005), so they belong to shapes that are already retired",
-                        crate::schema::digest_hex(digest)
-                    );
-                }
-                continue;
-            }
-            // ...and a failure on an envelope this schema DOES describe fails the reactivation rather
-            // than leaving the shape live one change short of the log (see the fn docs).
-            let (delta, txid, lsn) = apply_envelope(ts, env).with_context(|| {
-                format!(
-                    "replaying the change log at {pos} for a shape on '{table}': the change with key '{}' was \
-                     decoded under this table's current schema and still cannot be applied, so the shape cannot \
-                     be brought up to date (ADR-0010)",
-                    env.key
-                )
-            })?;
-            // Library mode replays RAW change-log envelopes: nothing stamped a before-image on
-            // them (the sequencer's per-key view is the state at the log's HEAD, not at this
-            // replay position), so membership is decided ABSOLUTELY per pk — matches now ⇒
-            // `upsert`, otherwise ⇒ `delete <key>`. Without this a shape coming back from
-            // dormancy would never learn about the deletes it slept through.
-            let absolute = library_mode && needs_absolute_emission(env);
-            if delta.is_empty() && !absolute {
-                continue;
-            }
-            let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
-            let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
-            if gate.should_skip(lsn_u64, xid) {
-                continue;
-            }
-            if absolute {
-                let held = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| pred.matches(r));
-                if let Some(e) = absolute_envelope(ts, &env.key, held, txid, lsn, out_cols.map(|c| c.as_slice())) {
-                    outs.push(e);
-                }
-                continue;
-            }
-            let matched = eval_standalone(pred, &delta);
-            if matched.is_empty() {
-                continue;
-            }
-            outs.extend(translate_output(ts, matched, txid, lsn, out_cols.map(|c| c.as_slice())));
-        }
-        if !outs.is_empty() {
-            emitted += outs.len() as u64;
-            // A reactivation that fails is EVICTED (its subscribers lose the shape), so a transient
-            // storage failure is retried rather than propagated — same rule as the aggregate re-seed.
-            ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown)
-                .await
-                .context("append replay to retained stream")?;
-        }
-        let advanced = rr.next_offset.as_deref().is_some_and(|n| n != pos.offset);
-        if let Some(n) = rr.next_offset {
-            pos.offset = n;
-        }
-        if rr.closed && (delivered == 0 || !advanced) {
-            // The segment is drained AND closed: follow the pointer, exactly as the live loop does.
-            let next = match rotate_to.take() {
-                Some(n) => n,
-                // No pointer seen on this page: step to EXACTLY the next segment (verified to
-                // exist). A walk to the first open segment would skip the closed ones in between,
-                // and this replay is precisely what has to read them.
-                None => crate::changelog::next_segment_for_reader(ds, pos.segment).await?,
-            };
-            pos = LogPosition::start_of(next);
-            continue;
-        }
-        if !advanced {
-            break; // the segment stopped advancing and is still open: nothing more to replay
-        }
-        if rr.up_to_date && !rr.closed {
-            break;
-        }
+fn check_replay_attempt(attempt: Option<&super::replay::ReplayAttempt>) -> Result<()> {
+    if attempt.is_some_and(|a| a.is_cancelled()) {
+        bail!("replay attempt was cancelled");
     }
-    Ok(emitted)
+    Ok(())
+}
+
+/// The buffered input can be arbitrarily long on disk, so activation cannot expand it into one
+/// output vector. Each append holds at most 256 envelopes / 256 KiB estimated owned memory,
+/// except for one oversized envelope. The source envelope and one decoded delta remain separate.
+#[derive(Default)]
+struct ActivationOutput {
+    envelopes: Vec<Envelope>,
+    bytes: u64,
+    emitted: u64,
+}
+
+impl ActivationOutput {
+    async fn push(
+        &mut self,
+        ds: &DsClient,
+        path: &str,
+        env: Envelope,
+        shutdown: &crate::shutdown::ShutdownToken,
+        attempt: Option<&super::replay::ReplayAttempt>,
+    ) -> Result<()> {
+        check_replay_attempt(attempt)?;
+        let bytes = crate::ds::envelope_memory_bytes(&env);
+        if !self.envelopes.is_empty() && (self.envelopes.len() >= 256 || self.bytes.saturating_add(bytes) > 256 * 1024)
+        {
+            self.flush(ds, path, shutdown, attempt).await?;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.envelopes.push(env);
+        Ok(())
+    }
+
+    async fn flush(
+        &mut self,
+        ds: &DsClient,
+        path: &str,
+        shutdown: &crate::shutdown::ShutdownToken,
+        attempt: Option<&super::replay::ReplayAttempt>,
+    ) -> Result<()> {
+        check_replay_attempt(attempt)?;
+        if self.envelopes.is_empty() {
+            return Ok(());
+        }
+        let append = ds.append_retrying(path, &self.envelopes, DsClient::RESTORE_APPEND_BUDGET, shutdown);
+        if let Some(attempt) = attempt {
+            tokio::select! {
+                biased;
+                _ = attempt.cancelled() => bail!("replay attempt was cancelled"),
+                result = append => result?,
+            }
+        } else {
+            append.await?;
+        }
+        self.emitted += self.envelopes.len() as u64;
+        self.envelopes.clear();
+        self.bytes = 0;
+        Ok(())
+    }
 }
 
 /// Creator-side half of the two-phase shape creation: await the pending-buffer ack, **stream** the
@@ -1687,10 +1647,14 @@ pub(crate) async fn backfill_and_activate(
     // than appended as snapshot envelopes.
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
-    ack_rx: tokio::sync::oneshot::Receiver<()>,
+    ack_rx: tokio::sync::oneshot::Receiver<LogPosition>,
 ) -> Result<()> {
     let abort = || {
-        let _ = cmd_tx.send(SequencerCmd::AbortShape { table: table.clone(), shape_id: shape_id.to_string() });
+        let _ = cmd_tx.send(SequencerCmd::AbortShape {
+            table: table.clone(),
+            shape_id: shape_id.to_string(),
+            attempt_id: None,
+        });
     };
     if ack_rx.await.is_err() {
         bail!("sequencer dropped the begin-shape ack");
@@ -1719,6 +1683,7 @@ pub(crate) async fn backfill_and_activate(
             gate,
             agg_seed,
             emitted_seed,
+            attempt: None,
             ready: ready_tx,
         })
         .is_err()
@@ -2315,6 +2280,198 @@ mod schema_fence_tests {
         }
     }
 
+    #[tokio::test]
+    async fn spilled_plain_and_aggregate_activation_append_in_bounded_chunks() {
+        use axum::extract::{Request, State};
+        use axum::http::StatusCode;
+        type Captured = Arc<std::sync::Mutex<Vec<Vec<Envelope>>>>;
+        async fn capture(State(captured): State<Captured>, request: Request) -> StatusCode {
+            let body = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            captured.lock().unwrap().push(serde_json::from_slice(&body).unwrap());
+            StatusCode::OK
+        }
+        let captured = Captured::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ds = DsClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let app = axum::Router::new().fallback(axum::routing::any(capture)).with_state(captured.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ts = items(None);
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        for kind in [CreateKind::Plain, CreateKind::Aggregate { func: AggFn::Count, col: None }] {
+            let aggregate = matches!(kind, CreateKind::Aggregate { .. });
+            captured.lock().unwrap().clear();
+            let dir = crate::pending_buffer::tests::Scratch::new();
+            let budget = PendingBudget::new(crate::pending_buffer::PendingBufferConfig {
+                memory_bytes: 0,
+                spill_dir: dir.path().join("spill"),
+            });
+            let mut buffered = SpillQueue::new(budget.clone());
+            for id in 0..1000 {
+                let mut value = env(None);
+                value.key = id.to_string();
+                value.value = Some(serde_json::json!({"id": id, "n": id}));
+                buffered.push(&value).unwrap();
+            }
+            let mut exec = TableExec::new(ts.clone());
+            exec.pending.insert(
+                "s1".into(),
+                PendingShape {
+                    num_id: 1,
+                    stream_path: "shape/s1".into(),
+                    pred: Arc::new(CompiledPredicate::MatchAll),
+                    out_cols: None,
+                    kind,
+                    buffered,
+                    attempt_id: None,
+                },
+            );
+            let mut execs = [(ts.table.to_string(), exec)].into_iter().collect();
+            let mut emitted = HashMap::new();
+            activate_shape(
+                &ds,
+                &mut execs,
+                &ts.table,
+                "s1",
+                crate::pg::SnapshotGate::passthrough(),
+                None,
+                0,
+                &mut emitted,
+                &shutdown,
+                None,
+            )
+            .await
+            .unwrap();
+            let captured = captured.lock().unwrap();
+            assert!(captured.len() >= 4);
+            assert!(captured.iter().all(|append| append.len() <= 256));
+            assert_eq!(captured.iter().map(Vec::len).sum::<usize>(), if aggregate { 1001 } else { 1000 });
+            assert_eq!(emitted["s1"], if aggregate { 1001 } else { 1000 });
+            if aggregate {
+                assert_eq!(execs[ts.table.as_str()].aggregates["s1"].count, 1000);
+            }
+            assert_eq!(budget.stats(), crate::pending_buffer::PendingStats::default());
+            assert!(execs[ts.table.as_str()].pending.is_empty());
+            assert_eq!(std::fs::read_dir(dir.path().join("spill")).unwrap().count(), 0);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn begin_replay_ack_captures_raw_cursor_and_cancelled_commands_cannot_resurrect() {
+        use axum::extract::{Request, State};
+        use axum::http::{Method, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        let mut complete = env(None);
+        complete.headers.lsn = Some("0/10".into());
+        let mut held = env(None);
+        held.headers.lsn = Some("0/20".into());
+        held.headers.txid = Some("8".into());
+        held.headers.last = None;
+        let body = serde_json::to_string(&[complete, held]).unwrap();
+        let offset = format!("{:016}_{:016}", 0, body.len() - 1);
+        type Page = (String, String, Arc<tokio::sync::Notify>);
+        async fn handler(State((body, offset, consumed)): State<Page>, request: Request) -> Response {
+            let at = request
+                .uri()
+                .query()
+                .unwrap_or("")
+                .split('&')
+                .find_map(|kv| kv.strip_prefix("offset="))
+                .unwrap_or("-1");
+            if request.method() == Method::GET && request.uri().path().starts_with("/changes") {
+                if at == "-1" {
+                    return ([("stream-next-offset", offset.as_str()), ("stream-up-to-date", "1")], body)
+                        .into_response();
+                }
+                consumed.notify_one();
+                return ([("stream-next-offset", offset.as_str()), ("stream-up-to-date", "1")], "[]").into_response();
+            }
+            StatusCode::OK.into_response()
+        }
+        let consumed = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let engine = Engine::new(DsClient::new(format!("http://{}", listener.local_addr().unwrap())));
+        let app = axum::Router::new().fallback(axum::routing::any(handler)).with_state((
+            body,
+            offset.clone(),
+            consumed.clone(),
+        ));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ts = items(None);
+        engine.tables_shared.write().unwrap().insert(ts.table.clone(), ts.clone());
+        let sequencer = engine.spawn_sequencer_task(false);
+        tokio::time::timeout(std::time::Duration::from_secs(2), consumed.notified()).await.unwrap();
+        assert_eq!(
+            *sequencer.processed.lock().unwrap(),
+            LogPosition::start(),
+            "held transaction pins published progress"
+        );
+        let attempt = super::super::replay::ReplayAttempt::new();
+        let begin = |attempt: Option<super::super::replay::ReplayAttempt>| {
+            let (ack, rx) = tokio::sync::oneshot::channel();
+            sequencer
+                .cmd_tx
+                .send(SequencerCmd::BeginShape {
+                    table: ts.table.clone(),
+                    shape_id: "s1".into(),
+                    num_id: 1,
+                    stream_path: "shape/s1".into(),
+                    pred: Arc::new(CompiledPredicate::MatchAll),
+                    out_cols: None,
+                    kind: CreateKind::Plain,
+                    attempt,
+                    ack,
+                })
+                .unwrap();
+            rx
+        };
+        let horizon = begin(Some(attempt.clone())).await.unwrap();
+        assert_eq!(horizon.offset, offset, "the ack includes completed rows after the published pin");
+        let stale = super::super::replay::ReplayAttempt::new();
+        sequencer
+            .cmd_tx
+            .send(SequencerCmd::AbortShape {
+                table: ts.table.clone(),
+                shape_id: "s1".into(),
+                attempt_id: Some(stale.id()),
+            })
+            .unwrap();
+        let (ready, rx) = tokio::sync::oneshot::channel();
+        sequencer
+            .cmd_tx
+            .send(SequencerCmd::ActivateShape {
+                table: ts.table.clone(),
+                shape_id: "s1".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                agg_seed: None,
+                emitted_seed: 0,
+                attempt: Some(attempt.clone()),
+                ready,
+            })
+            .unwrap();
+        rx.await.unwrap().expect("stale abort must preserve the current pending attempt");
+        sequencer.cmd_tx.send(SequencerCmd::RemoveShape { table: ts.table.clone(), shape_id: "s1".into() }).unwrap();
+        attempt.cancel();
+        assert!(begin(Some(attempt)).await.is_err(), "cancelled queued begin must drop its ack without registering");
+        let (ready, rx) = tokio::sync::oneshot::channel();
+        sequencer
+            .cmd_tx
+            .send(SequencerCmd::ActivateShape {
+                table: ts.table.clone(),
+                shape_id: "s1".into(),
+                gate: crate::pg::SnapshotGate::passthrough(),
+                agg_seed: None,
+                emitted_seed: 0,
+                attempt: None,
+                ready,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap().is_err(), "removed shape cannot be activated by the cancelled begin");
+        engine.shutdown_token().begin();
+        assert!(engine.shutdown_token().wait_for_parties(std::time::Duration::from_secs(2)).await);
+        server.abort();
+    }
+
     /// The live loop's wrapper resolves the same three answers off real state: the executor map for
     /// what a table is compiled under, and the shared view for what it is compiled under NOW.
     #[test]
@@ -2423,7 +2580,7 @@ mod schema_fence_tests {
     }
 
     /// A durable-streams stand-in serving ONE page of `changes/0` (swappable between calls) and 200
-    /// for everything else — enough to drive the real [`replay_changes_for_shape`].
+    /// for everything else — enough to drive the production fixed-horizon replay.
     async fn serve_one_page(body: Arc<std::sync::Mutex<String>>) -> String {
         use axum::extract::{Request, State};
         use axum::http::{Method, StatusCode};
@@ -2434,10 +2591,15 @@ mod schema_fence_tests {
             let at =
                 req.uri().query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("offset=")).unwrap_or("-1");
             match *req.method() {
+                Method::HEAD if path.starts_with("changes") => {
+                    let offset = format!("{:016}_{:016}", 0, body.lock().unwrap().len() - 1);
+                    ([("stream-next-offset", offset.as_str())], "").into_response()
+                }
                 // The page, once: `up-to-date` ends the replay after it.
                 Method::GET if path.starts_with("changes") && at == "-1" => {
                     let body = body.lock().unwrap().clone();
-                    ([("stream-next-offset", "01"), ("stream-up-to-date", "1")], body).into_response()
+                    let offset = format!("{:016}_{:016}", 0, body.len() - 1);
+                    ([("stream-next-offset", offset.as_str()), ("stream-up-to-date", "1")], body).into_response()
                 }
                 Method::GET => ([("stream-next-offset", at), ("stream-up-to-date", "1")], "[]").into_response(),
                 _ => StatusCode::OK.into_response(),
@@ -2473,8 +2635,11 @@ mod schema_fence_tests {
         let pred = CompiledPredicate::compile_opt(None, &ts).unwrap();
         let gate = crate::pg::SnapshotGate::passthrough();
         let shutdown = crate::shutdown::ShutdownToken::new();
-        let replay = |ds: DsClient, ts: TableSchema, pred: CompiledPredicate, gate, shutdown| async move {
-            replay_changes_for_shape(
+        let replay = |ds: DsClient, ts: TableSchema, pred: CompiledPredicate, gate, shutdown, until| async move {
+            let controls = Arc::new(super::super::replay::ReplayControls::new(Default::default()));
+            let attempt = super::super::replay::ReplayAttempt::new();
+            let permit = controls.acquire(&attempt, &shutdown).await.unwrap();
+            super::super::replay::replay_changes_until(
                 &ds,
                 &ts,
                 &ts.table.clone(),
@@ -2483,15 +2648,20 @@ mod schema_fence_tests {
                 &gate,
                 "shape/s1",
                 &LogPosition::start(),
+                &until,
                 false,
                 &shutdown,
+                &attempt,
+                &permit,
             )
             .await
         };
 
         // Pre-drift: consumed, nothing emitted, counted.
         let before = metrics().sequencer_stale_schema_skipped.load(Ordering::Relaxed);
-        let emitted = replay(ds.clone(), ts.clone(), pred.clone(), gate.clone(), shutdown.clone())
+        let horizon =
+            || LogPosition { segment: 0, offset: format!("{:016}_{:016}", 0, body.lock().unwrap().len() - 1) };
+        let emitted = replay(ds.clone(), ts.clone(), pred.clone(), gate.clone(), shutdown.clone(), horizon())
             .await
             .expect("skipped, not failed");
         assert_eq!(emitted, 0, "a pre-drift envelope emits nothing");
@@ -2500,8 +2670,9 @@ mod schema_fence_tests {
         // The same body, stamped with the schema the replay holds: the reactivation fails instead of
         // reporting the shape live one change short.
         *body.lock().unwrap() = page(digest).lock().unwrap().clone();
-        let err =
-            replay(ds, ts, pred, gate, shutdown).await.expect_err("a decodable-by-claim envelope must fail loudly");
+        let err = replay(ds, ts, pred, gate, shutdown, horizon())
+            .await
+            .expect_err("a decodable-by-claim envelope must fail loudly");
         let chain = format!("{err:#}");
         assert!(chain.contains("cannot be applied"), "unexpected error: {chain}");
         assert!(chain.contains("expected an integer"), "the cause must survive: {chain}");

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
+use crate::engine::replay::ReplayConfig;
+use crate::pending_buffer::PendingBufferConfig;
 use crate::table_ref::{TableRef, TableSelector};
 use crate::txn_buffer::TxnBufferConfig;
 
@@ -43,6 +45,10 @@ pub struct Config {
     /// Large-transaction handling on the ingest path (ADR-0003): the per-transaction memory cap
     /// before the buffer spills to disk, the spill directory, and the byte budget for one append.
     pub txn: TxnBufferConfig,
+    /// Shared RAM budget and spill directory for shapes and subquery nodes waiting for a seed.
+    pub pending: PendingBufferConfig,
+    /// Admission limit for concurrent dormant shape change-log scans.
+    pub replay: ReplayConfig,
     /// Backfill streaming: the byte budget for one backfill append and the off-by-default
     /// slow-backfill `statement_timeout`.
     pub backfill: crate::pg::BackfillConfig,
@@ -232,6 +238,8 @@ impl Config {
         // Large transactions (ADR-0003). Boot-fatal on an unusable setting: a memory cap or append
         // budget that was meant to be applied and silently was not is the worst of both worlds.
         let txn = TxnBufferConfig::resolve(g).context("large-transaction configuration")?;
+        let pending = PendingBufferConfig::resolve(g).context("pending-buffer configuration")?;
+        let replay = ReplayConfig::resolve(g).context("dormant-replay configuration")?;
 
         // Streamed backfills. Same stance as the large-transaction knobs: a budget that was meant
         // to be applied and silently was not is worse than a refused boot.
@@ -292,6 +300,8 @@ impl Config {
             trace,
             dbsp,
             txn,
+            pending,
+            replay,
             backfill,
             shutdown_grace,
             shutdown_ready_drain,
@@ -308,7 +318,8 @@ impl Config {
         format!(
             "bind={} pg_url={} ds_url={} slot={} trace={} log={} \
              txn_memory_bytes={} changes_append_bytes={} txn_spill_dir={} backfill_append_bytes={} \
-             backfill_statement_timeout_ms={} shutdown_grace={:?} shutdown_ready_drain={:?}",
+             backfill_statement_timeout_ms={} pending_memory_bytes={} pending_spill_dir={} \
+             replay_concurrency={} shutdown_grace={:?} shutdown_ready_drain={:?}",
             self.bind,
             self.pg_url.as_deref().map(redact_url).unwrap_or_else(|| "<none>".into()),
             self.ds_url.as_deref().unwrap_or("<none>"),
@@ -320,6 +331,9 @@ impl Config {
             self.txn.spill_dir.display(),
             self.backfill.append_bytes,
             self.backfill.statement_timeout_ms,
+            self.pending.memory_bytes,
+            self.pending.spill_dir.display(),
+            self.replay.concurrency,
             self.shutdown_grace,
             self.shutdown_ready_drain,
         )
@@ -347,6 +361,35 @@ fn redact_url(url: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn pending_and_replay_limits_resolve_once() {
+        let defaults = cfg(&[]);
+        assert_eq!(defaults.pending.memory_bytes, 128 * 1024 * 1024);
+        assert_eq!(defaults.replay.concurrency, 4);
+        let forced_spill = cfg(&[
+            ("CIRCUITS_PENDING_MEMORY_BYTES", "0"),
+            ("CIRCUITS_PENDING_SPILL_DIR", "/private/pending"),
+            ("CIRCUITS_REPLAY_CONCURRENCY", "1"),
+        ]);
+        assert_eq!(forced_spill.pending.memory_bytes, 0);
+        assert_eq!(forced_spill.pending.spill_dir, std::path::PathBuf::from("/private/pending"));
+        assert_eq!(forced_spill.replay.concurrency, 1);
+        for (name, bad) in [
+            ("CIRCUITS_PENDING_MEMORY_BYTES", "-1"),
+            ("CIRCUITS_PENDING_MEMORY_BYTES", "many"),
+            ("CIRCUITS_PENDING_MEMORY_BYTES", "18446744073709551616"),
+            ("CIRCUITS_REPLAY_CONCURRENCY", "0"),
+            ("CIRCUITS_REPLAY_CONCURRENCY", "-1"),
+            ("CIRCUITS_REPLAY_CONCURRENCY", "many"),
+        ] {
+            let error = try_cfg(&[(name, bad)]).expect_err("invalid resource configuration refused");
+            assert!(format!("{error:#}").contains(name), "names the invalid knob: {error:#}");
+        }
+        let log = forced_spill.redacted();
+        assert!(log.contains("pending_memory_bytes=0"));
+        assert!(log.contains("replay_concurrency=1"));
+    }
 
     /// The settle knobs: defaults, explicit values, and refusals of values that would silently not
     /// apply (a bound below 2^20 — overflowing must take a pathological poller outage — or above

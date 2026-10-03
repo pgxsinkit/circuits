@@ -162,7 +162,11 @@ pub enum LifeState {
     /// `resume` is the position the replay is running FROM: it keeps pinning its change-log segment
     /// for the whole replay, so the sweeper cannot delete the segment out from under a
     /// reactivation that outlives one sweep tick (ADR-0006).
-    Reactivating { done: tokio::sync::watch::Receiver<Option<ReactivationOutcome>>, resume: LogPosition },
+    Reactivating {
+        done: tokio::sync::watch::Receiver<Option<ReactivationOutcome>>,
+        resume: LogPosition,
+        attempt: crate::engine::replay::ReplayAttempt,
+    },
 }
 
 impl HeapSize for LifeState {
@@ -172,7 +176,7 @@ impl HeapSize for LifeState {
     fn heap_bytes(&self) -> usize {
         match self {
             LifeState::Dormant { since: _, resume, gate } => resume.heap_bytes() + gate.heap_bytes(),
-            LifeState::Reactivating { done: _, resume } => resume.heap_bytes(),
+            LifeState::Reactivating { resume, .. } => resume.heap_bytes(),
             LifeState::Active | LifeState::Deactivating { .. } => 0,
         }
     }
@@ -185,6 +189,16 @@ pub struct ShapeLife {
     /// subscription (refcount ≥ 1), which also blocks dormancy.
     pub last_read: Instant,
     pub state: LifeState,
+}
+
+impl Drop for ShapeLife {
+    fn drop(&mut self) {
+        // Every retirement path removes this entry, including schema drift and catalog undo.
+        // Cancelling here covers queued scans as well as readers already in flight.
+        if let LifeState::Reactivating { attempt, .. } = &self.state {
+            attempt.cancel();
+        }
+    }
 }
 
 impl HeapSize for ShapeLife {

@@ -65,6 +65,11 @@ pub struct HeapBytes {
 /// Engine-internal cardinalities, computed from in-memory state by [`crate::engine::Engine::mem_cardinalities`].
 #[derive(Clone, Default, serde::Serialize)]
 pub struct Cardinalities {
+    /// Maintained payload accounting across all pending queues (RAM and process-local spill).
+    /// A diagnostic breakdown of executor/registry RAM, not an additional heap total.
+    pub pending: crate::pending_buffer::PendingStats,
+    /// Maintained admission and scan-work counters for dormant shape replay.
+    pub replay: crate::engine::replay::ReplayStats,
     pub shapes: usize,
     /// Shapes currently dormant (retention lifecycle: stream retained, engine state dropped).
     pub shapes_dormant: usize,
@@ -138,6 +143,14 @@ impl Cardinalities {
 /// Lock-free snapshot the OTel gauge callbacks and `/memory` read. Updated by the sampler and on demand.
 #[derive(Default)]
 struct Gauges {
+    pending_memory_bytes: AtomicU64,
+    pending_items: AtomicU64,
+    pending_spill_bytes: AtomicU64,
+    replay_active: AtomicU64,
+    replay_queued: AtomicU64,
+    replay_peak: AtomicU64,
+    replay_pages: AtomicU64,
+    replay_bytes: AtomicU64,
     rss_bytes: AtomicU64,
     virtual_bytes: AtomicU64,
     shapes: AtomicU64,
@@ -175,6 +188,14 @@ pub fn process_memory() -> (u64, u64) {
 /// the background sampler and by `/memory` so the JSON read and the OTel scrape agree.
 pub fn publish(card: &Cardinalities) {
     let g = gauges();
+    g.pending_memory_bytes.store(card.pending.memory_bytes, Ordering::Relaxed);
+    g.pending_items.store(card.pending.items, Ordering::Relaxed);
+    g.pending_spill_bytes.store(card.pending.spill_bytes, Ordering::Relaxed);
+    g.replay_active.store(card.replay.active, Ordering::Relaxed);
+    g.replay_queued.store(card.replay.queued, Ordering::Relaxed);
+    g.replay_peak.store(card.replay.peak, Ordering::Relaxed);
+    g.replay_pages.store(card.replay.pages, Ordering::Relaxed);
+    g.replay_bytes.store(card.replay.bytes, Ordering::Relaxed);
     let (rss, virt) = process_memory();
     g.rss_bytes.store(rss, Ordering::Relaxed);
     g.virtual_bytes.store(virt, Ordering::Relaxed);
@@ -209,6 +230,20 @@ pub fn snapshot_json(card: &Cardinalities) -> serde_json::Value {
             "rss_bytes": rss,
             "rss_mib": rss / (1024 * 1024),
             "virtual_bytes": virt,
+        },
+        "resources": {
+            "pending": {
+                "memory_bytes": card.pending.memory_bytes,
+                "items": card.pending.items,
+                "spill_bytes": card.pending.spill_bytes,
+            },
+            "replay": {
+                "active": card.replay.active,
+                "queued": card.replay.queued,
+                "peak": card.replay.peak,
+                "pages": card.replay.pages,
+                "bytes": card.replay.bytes,
+            },
         },
         "cardinalities": {
             "shapes": g.shapes.load(Ordering::Relaxed),
@@ -269,6 +304,21 @@ pub fn init_otel() -> SdkMeterProvider {
     }
     gauge!("engine_process_resident_memory", "Resident set size of the engine process", rss_bytes, "By");
     gauge!("engine_process_virtual_memory", "Virtual memory of the engine process", virtual_bytes, "By");
+    gauge!("engine_pending_memory", "RAM reserved by pending payload queues", pending_memory_bytes, "By");
+    gauge!("engine_pending_items", "Records retained by pending payload queues", pending_items, "");
+    gauge!("engine_pending_spill", "Bytes in process-local pending spill files", pending_spill_bytes, "By");
+    gauge!("engine_replay_active", "Dormant replay scans currently admitted", replay_active, "");
+    gauge!("engine_replay_queued", "Dormant wakes waiting for replay admission", replay_queued, "");
+    gauge!("engine_replay_peak", "Peak concurrent dormant replay scans", replay_peak, "");
+    macro_rules! replay_counter {
+        ($name:expr, $desc:expr, $field:ident, $unit:expr) => {{
+            let b = meter.u64_observable_counter($name).with_description($desc);
+            let b = if $unit.is_empty() { b } else { b.with_unit($unit) };
+            b.with_callback(|obs| obs.observe(gauges().$field.load(Ordering::Relaxed), &[])).build();
+        }};
+    }
+    replay_counter!("engine_replay_pages", "Actual change-log pages fetched for dormant replay", replay_pages, "");
+    replay_counter!("engine_replay_read", "Actual response bytes fetched for dormant replay", replay_bytes, "By");
     gauge!("engine_shapes", "Registered shapes (all kinds)", shapes, "");
     gauge!(
         "engine_shapes_dormant",
@@ -440,4 +490,28 @@ pub fn spawn_sampler(engine: crate::engine::Engine, interval: Duration) {
             tokio::time::sleep(interval).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_snapshot_reads_fresh_maintained_counters() {
+        let card = Cardinalities {
+            pending: crate::pending_buffer::PendingStats { memory_bytes: 17, items: 3, spill_bytes: 29 },
+            replay: crate::engine::replay::ReplayStats { active: 2, queued: 5, peak: 4, pages: 11, bytes: 101 },
+            ..Default::default()
+        };
+        let snapshot = snapshot_json(&card);
+        assert_eq!(snapshot["resources"]["pending"], serde_json::json!({"memory_bytes":17,"items":3,"spill_bytes":29}));
+        assert_eq!(
+            snapshot["resources"]["replay"],
+            serde_json::json!({"active":2,"queued":5,"peak":4,"pages":11,"bytes":101})
+        );
+        assert!(snapshot["process"]["rss_bytes"].is_u64());
+        // Resource accounting is a breakdown of the RAM already owned by executor/registry terms.
+        assert_eq!(snapshot["cardinalities"]["bytes_executors"], 0);
+        assert_eq!(snapshot["cardinalities"]["bytes_subquery_registry"], 0);
+    }
 }

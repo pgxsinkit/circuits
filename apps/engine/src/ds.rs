@@ -123,6 +123,71 @@ pub struct ReadResult {
     pub closed: bool,
 }
 
+/// A replay page, including the actual response bytes fetched (before horizon trimming).
+pub(crate) struct ReplayRead {
+    pub page: ReadResult,
+    pub bytes: u64,
+}
+
+/// The local log server's byte offsets. Other providers' opaque tokens cannot be trimmed.
+pub(crate) fn replay_offset_bytes(offset: &str) -> Result<u64> {
+    if offset == "-1" {
+        return Ok(0);
+    }
+    let (seq, bytes) = offset.split_once('_').context("replay requires a local byte offset")?;
+    if seq != "0000000000000000" || bytes.len() != 16 || !bytes.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("replay requires a local byte offset, got '{offset}'");
+    }
+    bytes.parse().context("replay byte offset overflow")
+}
+
+fn decode_replay_page(body: String, offset: &str, next: &str, until: Option<&str>) -> Result<ReplayRead> {
+    let start = replay_offset_bytes(offset)?;
+    let next_bytes = replay_offset_bytes(next)?;
+    let delta = next_bytes.checked_sub(start).context("replay page moved backwards")?;
+    let bytes = body.len() as u64;
+    if delta == 0 {
+        if body != "[]" {
+            bail!("nonempty replay page did not advance its byte offset");
+        }
+        return Ok(ReplayRead {
+            page: ReadResult {
+                envelopes: Vec::new(),
+                next_offset: Some(next.to_string()),
+                up_to_date: false,
+                closed: false,
+            },
+            bytes,
+        });
+    }
+    if bytes != delta.checked_add(1).context("replay page length overflow")?
+        || !body.starts_with('[')
+        || !body.ends_with(']')
+    {
+        bail!("replay page framing disagrees with its byte offsets");
+    }
+    let mut body = body;
+    let mut next_offset = next.to_string();
+    if let Some(end) = until {
+        let end_bytes = replay_offset_bytes(end)?;
+        let keep = end_bytes.checked_sub(start).context("replay horizon precedes its page")?;
+        if end_bytes < next_bytes {
+            let cut = usize::try_from(keep).context("replay prefix does not fit in memory")?;
+            if cut == 0 || body.as_bytes().get(cut) != Some(&b',') {
+                bail!("replay horizon is not a complete value boundary");
+            }
+            body.truncate(cut);
+            body.push(']');
+            next_offset = end.to_string();
+        }
+    }
+    let envelopes = serde_json::from_str(&body).context("parsing bounded replay page")?;
+    Ok(ReplayRead {
+        page: ReadResult { envelopes, next_offset: Some(next_offset), up_to_date: false, closed: false },
+        bytes,
+    })
+}
+
 /// What a `HEAD` found: the stream's tail offset and whether it is closed. `None` from
 /// [`DsClient::head`] means the stream is not there (404) or soft-deleted (410).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -980,6 +1045,55 @@ impl DsClient {
         };
         Ok(ReadResult { envelopes, next_offset, up_to_date, closed })
     }
+
+    /// Read a local change-log page and stop at an admission-time byte boundary. The response may
+    /// contain later writes; trim its original wire bytes before decoding, never reserialize items
+    /// to infer offsets. A malformed boundary or provider response fails the replay explicitly.
+    pub(crate) async fn read_until(&self, path: &str, offset: &str, until: Option<&str>) -> Result<ReplayRead> {
+        let start = replay_offset_bytes(offset)?;
+        if let Some(end) = until {
+            let end_bytes = replay_offset_bytes(end)?;
+            if start > end_bytes {
+                bail!("replay start is past its fixed horizon");
+            }
+            if start == end_bytes {
+                return Ok(ReplayRead {
+                    page: ReadResult {
+                        envelopes: Vec::new(),
+                        next_offset: Some(end.to_string()),
+                        up_to_date: true,
+                        closed: false,
+                    },
+                    bytes: 0,
+                });
+            }
+        }
+        let res = self.store.read(path, offset, false).await?;
+        if res.status == 404 || res.status == 410 {
+            return Err(anyhow::Error::new(StreamGone { path: path.to_string(), status: res.status }));
+        }
+        if !(200..300).contains(&res.status) {
+            return Err(status_error("GET", path, res.status, ""));
+        }
+        let next = res.next_offset.clone().context("replay page omitted its next offset")?;
+        let up_to_date = res.up_to_date;
+        let closed = res.closed;
+        let status = res.status;
+        let mut result = if status == 204 {
+            if replay_offset_bytes(&next)? != start {
+                bail!("empty replay response advanced its byte offset");
+            }
+            ReplayRead {
+                page: ReadResult { envelopes: Vec::new(), next_offset: Some(next), up_to_date, closed },
+                bytes: 0,
+            }
+        } else {
+            decode_replay_page(res.required_body()?, offset, &next, until)?
+        };
+        result.page.up_to_date = up_to_date;
+        result.page.closed = closed;
+        Ok(result)
+    }
 }
 
 fn header(res: &reqwest::Response, name: &str) -> Option<String> {
@@ -990,6 +1104,63 @@ fn header(res: &reqwest::Response, name: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn byte_offset(bytes: usize) -> String {
+        format!("0000000000000000_{bytes:016}")
+    }
+
+    fn replay_envelope(key: &str) -> Envelope {
+        Envelope {
+            type_: "public.items".to_string(),
+            key: key.to_string(),
+            value: Some(serde_json::json!({ "id": key, "text": "comma, quote\" and 雪" })),
+            old: None,
+            headers: EnvelopeHeaders {
+                operation: "upsert".to_string(),
+                txid: None,
+                offset: None,
+                lsn: None,
+                seq: None,
+                last: Some(true),
+                schema: None,
+            },
+        }
+    }
+
+    #[test]
+    fn bounded_replay_preserves_raw_byte_boundaries_on_a_crossing_page() {
+        let first = replay_envelope("first");
+        let second = replay_envelope("later");
+        let first_json = serde_json::to_string(&first).unwrap();
+        let second_json = serde_json::to_string(&second).unwrap();
+        let body = format!("[{first_json},{second_json}]");
+        let tail = byte_offset(body.len() - 1);
+        let horizon = byte_offset(first_json.len() + 1);
+        let page = decode_replay_page(body.clone(), "-1", &tail, Some(&horizon)).unwrap();
+        assert_eq!(page.page.envelopes.len(), 1);
+        assert_eq!(page.page.envelopes[0].key, "first");
+        assert_eq!(page.page.next_offset.as_deref(), Some(horizon.as_str()));
+        assert_eq!(page.bytes, body.len() as u64);
+        let remainder = format!("[{second_json}]");
+        let page = decode_replay_page(remainder, &horizon, &tail, Some(&tail)).unwrap();
+        assert_eq!(page.page.envelopes[0].key, "later");
+    }
+
+    #[test]
+    fn bounded_replay_refuses_malformed_framing_offsets_and_mid_value_horizons() {
+        let json = serde_json::to_string(&replay_envelope("one")).unwrap();
+        let body = format!("[{json}]");
+        let tail = byte_offset(body.len() - 1);
+        for end in ["opaque".to_string(), byte_offset(1), byte_offset(json.len() / 2)] {
+            assert!(decode_replay_page(body.clone(), "-1", &tail, Some(&end)).is_err());
+        }
+        assert!(decode_replay_page(body.clone(), "-1", &byte_offset(body.len()), None).is_err());
+        assert!(decode_replay_page(body.clone(), &tail, &byte_offset(0), None).is_err());
+        assert!(decode_replay_page(body.replace('[', " "), "-1", &tail, None).is_err());
+        assert!(replay_offset_bytes("0000000000000001_0000000000000000").is_err());
+        assert!(decode_replay_page("[]".to_string(), "-1", &byte_offset(0), None).is_ok());
+        assert!(decode_replay_page(body, "-1", &byte_offset(0), None).is_err());
+    }
 
     /// Keep the connection open after the selected chunks, even when the advertised body is
     /// incomplete. Dropping the server aborts its task and closes the socket on every test path.

@@ -359,14 +359,47 @@ restart resumes in the right stream. A closed segment whose pointer this process
 checkpoint it booted from was already past it) steps to **exactly** the next segment, verified to
 exist; jumping to the first open segment would skip the closed ones in between, which are unread
 changes. A closed segment with **no** successor is refused — logged and backed off, never skipped
-past. `replay_changes_for_shape` — the dormant reactivation path — follows the same pointers, one
-segment at a time, until it reaches the tail of the open segment.
+past. Dormant reactivation follows the same pointers, one segment at a time, to a fixed endpoint
+captured by the sequencer when pending buffering starts. The endpoint is the raw read cursor,
+including a held transaction prefix: a published checkpoint pinned before that prefix can also
+precede completed transactions already processed on the same page. The final read is trimmed at
+the captured wire boundary before decoding, so replay cannot apply newer changes ahead of older
+pending changes. Later deltas arrive through pending buffering and normal live routing.
+Even a replay with no bytes to scan verifies the retained input and destination streams. A closed
+endpoint segment also verifies its required successor, including a segment that closed after
+admission. Confirmed loss follows durable retirement rather than reporting a live shape that cannot
+resume.
 
 Shape creation is **two-phase** so a Postgres backfill never stalls the pipeline: `BeginShape`
 registers a pending shape that buffers its table's deltas; the creator runs the backfill on a
 pooled connection concurrently; `ActivateShape` replays the buffer through the shape's snapshot
 gate and goes live. The buffer is registered before the snapshot is taken, so no change can fall
 between them.
+
+Pending plain/aggregate envelopes and subquery seed/outer deltas share one retained-payload RAM
+budget (`CIRCUITS_PENDING_MEMORY_BYTES`, 128 MiB). Reservation never waits: overflow switches the
+queue to a private process-owned FIFO spill file, preserving stamps and complete delta groups.
+Activation drains incrementally and bounds its output appends. Failed spill writes or reads poison
+the attempt; creation rolls back, while a retryable dormant attempt retains its original resume
+position and history pin. Scratch files are removed on drain or cleanup and are not recovery state.
+Spill encoding and I/O are synchronous to avoid cloning oversized borrowed records; a slow disk can
+occupy the sequencer or registry owner during that operation.
+
+Dormant wakes coalesce per shape before taking one of `CIRCUITS_REPLAY_CONCURRENCY` scan permits
+(default four). Queued wakes keep their retention pin without registering a pending buffer. Purge
+cancels queued or running attempts; attempt identity guards sequencer registration, activation and
+abort so old work cannot resurrect a retired shape. Request disconnection still leaves the detached
+owner responsible for completing or undoing its attempt.
+
+`GET /memory` reports maintained pending RAM/item/disk counters and replay active/queued/peak,
+page and byte counters under `resources`, alongside actual process RSS. The pending budget does not
+bound source pages, a held transaction, transaction output, a decoded oversized delta group,
+query-back candidates, deferred distinct-value flips, derived membership/aggregate state, codec
+scratch or allocator slack. Disk capacity and synchronous spill latency remain separate operating
+constraints; large transactions are accepted rather than invalidated for their size.
+Spill bytes include consumed file prefixes until the queue drains completely. Replay work counters
+count completed GET pages and their full response bytes before endpoint trimming; HEAD checks and
+failed requests are separate from those counters.
 
 **Nothing it reads is ever skipped quietly** (ADR-0010). Each envelope carries the digest of the schema
 it was decoded under, so the sequencer — which is behind the ingestor — can recognise the two envelopes
@@ -820,7 +853,7 @@ stream, and client, including live replication, batched mutations, NULLs, and co
 | sequencer (all tables) | 1 task                                      | commit-ordered change processing; per-txn atomic flush (holds a trailing run until its transaction-end marker arrives) |
 | shapes (any kind)      | **0**                                       | no per-shape thread or circuit                                                                                         |
 | replication ingestor   | 1 task                                      | stream pgoutput/decode/buffer (spilling past the memory cap)/append in chunks/acknowledge                              |
-| subquery registry      | 0 (a mutex)                                 | eval + emission-lane enqueue under it (in-memory only; no network under the lock)                                      |
+| subquery registry      | 0 (a mutex)                                 | eval + emission-lane enqueue and pending FIFO spill I/O; no network under the lock                                     |
 | flip workers           | ≤ `CIRCUITS_FLIP_WORKERS` tasks (default 8) | concurrent deferred query-backs; PG round-trips never hold the registry lock                                           |
 | emission lanes         | `CIRCUITS_EMIT_LANES` tasks (default 8)     | per-stream FIFO writers: append order = eval order per shape                                                           |
 | circuit (counts)       | 1 OS thread                                 | owns the `DBSPHandle`; blocking steps, fed by a bounded channel (backpressure to the sequencer)                        |

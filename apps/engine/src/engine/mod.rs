@@ -34,6 +34,7 @@ mod lifecycle;
 pub(crate) mod membership;
 mod output;
 mod planning;
+pub mod replay;
 mod retirement;
 mod sequencer;
 #[cfg(test)]
@@ -227,6 +228,10 @@ pub struct Engine {
     /// outer subquery shapes that depend on them. Every tailer routes its deltas here so an inner-table
     /// change moves outer rows. `None`-free; empty until a subquery shape is created.
     subqueries: Arc<Mutex<SubqueryRegistry>>,
+    /// One nonblocking RAM budget for all pending shape and subquery payload queues.
+    pending_budget: Arc<crate::pending_buffer::PendingBudget>,
+    /// Limits actual replay scans; queued wakes retain their original history pin.
+    replay_controls: Arc<replay::ReplayControls>,
     /// Serializes subquery initialization through completion or owned rollback.
     subquery_init: Arc<Mutex<()>>,
     /// Best-effort per-envelope trace broadcast (see [`crate::trace`]). Events are serialized once
@@ -910,20 +915,47 @@ fn sid_of_path(stream_path: &str) -> &str {
 
 impl Engine {
     pub fn new(ds: DsClient) -> Self {
-        Self::new_inner(ds, None)
+        Self::new_with_resources(ds, Default::default(), Default::default())
+    }
+
+    /// Library-mode engine with explicitly resolved pending-buffer and replay limits.
+    pub fn new_with_resources(
+        ds: DsClient,
+        pending: crate::pending_buffer::PendingBufferConfig,
+        replay: replay::ReplayConfig,
+    ) -> Self {
+        Self::new_inner(ds, None, pending, replay)
     }
 
     /// Engine in Postgres mode: data lives in Postgres, ingested via logical replication and read
     /// back for backfill. Call [`setup_postgres`](Self::setup_postgres) before serving.
     pub fn new_pg(ds: DsClient, pg_url: String) -> Self {
-        let e = Self::new_inner(ds, Some(pg_url));
+        Self::new_pg_with_resources(ds, pg_url, Default::default(), Default::default())
+    }
+
+    /// Postgres-mode engine using resource settings resolved once by the caller.
+    pub fn new_pg_with_resources(
+        ds: DsClient,
+        pg_url: String,
+        pending: crate::pending_buffer::PendingBufferConfig,
+        replay: replay::ReplayConfig,
+    ) -> Self {
+        let e = Self::new_inner(ds, Some(pg_url), pending, replay);
         // Postgres mode starts `waiting` until the connection + introspection + slot + ingest are up.
         e.health.store(HEALTH_WAITING, std::sync::atomic::Ordering::Relaxed);
         e
     }
 
-    fn new_inner(ds: DsClient, pg_url: Option<String>) -> Self {
-        let subqueries = Arc::new(Mutex::new(SubqueryRegistry::new(ds.clone(), pg_url.clone())));
+    fn new_inner(
+        ds: DsClient,
+        pg_url: Option<String>,
+        pending: crate::pending_buffer::PendingBufferConfig,
+        replay: replay::ReplayConfig,
+    ) -> Self {
+        let pending_budget = crate::pending_buffer::PendingBudget::new(pending);
+        let replay_controls = Arc::new(replay::ReplayControls::new(replay));
+        let subqueries =
+            Arc::new(Mutex::new(SubqueryRegistry::new_with_budget(ds.clone(), pg_url.clone(), pending_budget.clone())));
         let trace_tx = tokio::sync::broadcast::channel(crate::trace::CHANNEL_CAP).0;
         let (flip_tx, flip_rx) = mpsc::unbounded_channel();
         let pending_flips = Arc::new(std::sync::atomic::AtomicI64::new(0));
@@ -977,6 +1009,8 @@ impl Engine {
             // Library mode: no Postgres to wait on, so report `active` immediately.
             health: Arc::new(std::sync::atomic::AtomicU8::new(HEALTH_ACTIVE)),
             subqueries,
+            pending_budget,
+            replay_controls,
             subquery_init: Arc::new(Mutex::new(())),
             trace_tx,
             flip_tx,
@@ -1267,6 +1301,7 @@ impl Engine {
             hold_reads,
             // Two std-locked handles, not an `Engine`: see `FailClosed`.
             FailClosed { failure: self.change_log_failure.clone(), epoch: self.epoch.clone() },
+            self.pending_budget.clone(),
             self.shutdown.clone(),
         )
     }
@@ -1928,6 +1963,8 @@ impl Engine {
             subquery_shapes: sq.shapes,
             subquery_edges: sq.edges,
             subquery_feed_entries: sq.feed_entries,
+            pending: self.pending_budget.stats(),
+            replay: self.replay_controls.stats(),
             ..Default::default()
         }
     }
