@@ -101,6 +101,10 @@ pub struct Shared {
     pub producers: HashMap<String, ProducerEntry>,
     pub last_seq_header: Option<String>,
     pub committed_last_seq_header: Option<String>,
+    /// Latest successfully staged body sequence, captured with the accepted
+    /// tail by checkpoint. Distinct from a tentative writer/close intent and
+    /// from a durability callback which may not have run yet.
+    pub(crate) accepted_last_seq_header: Option<String>,
     pub last_access: SystemTime,
     /// Number of live forks reading through this stream.
     pub ref_count: u32,
@@ -309,6 +313,9 @@ pub struct StreamState {
     pub(crate) checkpoint_capture: StdMutex<()>,
     pub shared: RwLock<Shared>,
     pub tail_tx: watch::Sender<Tail>,
+    /// Ordinary Stream-Seq conflicts wait for request-owned metadata promotion.
+    /// Separate from tail publication, which can wake before sequence commit.
+    pub(crate) append_committed: Notify,
     /// Sticky terminal identity state, distinct from durable stream EOF. A
     /// direct DELETE wakes waiting readers even when no tail bytes changed.
     deleted_tx: watch::Sender<bool>,
@@ -1345,6 +1352,7 @@ impl Store {
                     .collect(),
                 last_seq_header: meta.last_seq_header.clone(),
                 committed_last_seq_header: meta.last_seq_header.clone(),
+                accepted_last_seq_header: meta.last_seq_header.clone(),
                 last_access: UNIX_EPOCH
                     .checked_add(Duration::from_secs(meta.last_access_unix))
                     .expect("validated deadline"),
@@ -1361,6 +1369,7 @@ impl Store {
             lifecycle: StdMutex::new(StreamLifecycle::default()),
             lifecycle_idle: Condvar::new(),
             lifecycle_notify: Notify::new(),
+            append_committed: Notify::new(),
             delete_gate: AsyncMutex::new(()),
             retirement_lock: StdMutex::new(()),
             hard_delete: AtomicBool::new(false),
@@ -1693,6 +1702,7 @@ impl Store {
                 producers: HashMap::new(),
                 last_seq_header: None,
                 committed_last_seq_header: None,
+                accepted_last_seq_header: None,
                 last_access: SystemTime::now(),
                 ref_count: 0,
                 soft_deleted: false,
@@ -1707,6 +1717,7 @@ impl Store {
             lifecycle: StdMutex::new(StreamLifecycle::default()),
             lifecycle_idle: Condvar::new(),
             lifecycle_notify: Notify::new(),
+            append_committed: Notify::new(),
             delete_gate: AsyncMutex::new(()),
             retirement_lock: StdMutex::new(()),
             hard_delete: AtomicBool::new(false),
@@ -1918,8 +1929,9 @@ pub use crate::tier::{into_local_segments, resolve_range, ResolvedSlice};
 
 /// On-disk metadata sidecar (`<data file>.meta`). Create/close/delete write it
 /// synchronously with fsync; producer/access updates flush debounced without
-/// fsync (documented guarantee: after a crash, producer dedup state may lag the
-/// data file — producers should bump their epoch on restart, per PROTOCOL.md).
+/// fsync (producer dedup state may lag the data file). Stream-Seq can also lag
+/// here, but its association with bytes is durable in the sequenced WAL record
+/// or paired checkpoint proof; recovery transfers it here before resetting WAL.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct Meta {
     pub id: u64,
@@ -2133,6 +2145,7 @@ pub(crate) fn commit_close_sync(st: &StreamState, candidate: &CloseCandidate) ->
     // Publication belongs to this owned worker rather than its cancellable
     // waiter. A later sweep cannot reopen the just-fsynced closure.
     st.publish_tail(Tail { bytes: tail, closed: true }, None);
+    st.append_committed.notify_waiters();
     Ok(())
 }
 

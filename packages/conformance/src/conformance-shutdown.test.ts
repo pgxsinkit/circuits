@@ -19,6 +19,8 @@
 //      no duplicates either — the ingestor either finished the chunked append (and acknowledged) or
 //      finished nothing (and Postgres re-delivers).
 
+import { createServer, request } from "node:http";
+
 import type { Row, Schema, StreamEnvelope } from "@circuits/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -56,9 +58,9 @@ async function readyStatus(url: string): Promise<{ code: number; status: string 
 }
 
 /** Every envelope on a stream, in order — so a duplicate is visible as a repeated key, not folded away. */
-async function streamEnvelopes(streamUrl: string): Promise<StreamEnvelope[]> {
+async function streamEnvelopes(streamUrl: string, start = "-1"): Promise<StreamEnvelope[]> {
   const all: StreamEnvelope[] = [];
-  let offset = "-1";
+  let offset = start;
   for (let i = 0; i < 500; i++) {
     const res = await fetch(`${streamUrl}?offset=${encodeURIComponent(offset)}`);
     if (res.status === 204) break;
@@ -72,6 +74,120 @@ async function streamEnvelopes(streamUrl: string): Promise<StreamEnvelope[]> {
     if (upToDate) break;
   }
   return all;
+}
+
+interface CatalogEvent {
+  t: string;
+  id?: string;
+  seed?: {
+    source_floor: { lsn: number; seq: number } | null;
+    gate: { lsn: number; horizon: number; xmin: number; xmax: number; xip: number[] };
+  };
+  pos?: { segment: number; offset: string };
+  highwater?: [number, number];
+}
+
+/** Hold only actual Offset POSTs before storage; every other request uses the real log server. */
+async function startCheckpointHold(upstreamUrl: string) {
+  const upstream = new URL(upstreamUrl);
+  let holdOffsets = false;
+  const held = new Set<() => void>();
+  const blocked: CatalogEvent[] = [];
+  const server = createServer((incoming, outgoing) => {
+    const target = new URL(incoming.url ?? "/", upstream);
+    let forwarded: ReturnType<typeof request> | undefined;
+    let cancel: (() => void) | undefined;
+    outgoing.once("close", () => {
+      if (cancel) held.delete(cancel);
+      forwarded?.destroy();
+    });
+    const forward = (body?: Buffer) => {
+      if (outgoing.destroyed) return;
+      forwarded = request(
+        target,
+        { method: incoming.method, headers: { ...incoming.headers, host: upstream.host } },
+        (response) => {
+          outgoing.writeHead(response.statusCode ?? 502, response.headers);
+          response.pipe(outgoing);
+        },
+      );
+      forwarded.on("error", (error) => {
+        if (outgoing.destroyed) return;
+        if (!outgoing.headersSent) outgoing.writeHead(502);
+        outgoing.end(String(error));
+      });
+      if (body) forwarded.end(body);
+      else incoming.pipe(forwarded);
+    };
+    if (incoming.method !== "POST" || target.pathname !== "/meta/catalog") {
+      forward();
+      return;
+    }
+    const chunks: Buffer[] = [];
+    incoming.on("data", (chunk: Buffer) => chunks.push(chunk));
+    incoming.once("end", () => {
+      const body = Buffer.concat(chunks);
+      const events = JSON.parse(body.toString()) as CatalogEvent[];
+      if (holdOffsets && events.some((event) => event.t === "offset")) {
+        blocked.push(...events);
+        cancel = () => outgoing.destroy();
+        held.add(cancel);
+      } else forward(body);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("checkpoint proxy did not bind");
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    arm: () => {
+      blocked.length = 0;
+      holdOffsets = true;
+    },
+    blocked: () => [...blocked],
+    // Called only after SIGKILL. Never forward the dead process's held Offset:
+    // that would strengthen its restart point after the crash being tested.
+    release: () => {
+      holdOffsets = false;
+      for (const cancel of held) cancel();
+      held.clear();
+    },
+    close: async () => {
+      for (const cancel of held) cancel();
+      held.clear();
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    },
+  };
+}
+
+async function persistedCatalog(dsUrl: string): Promise<CatalogEvent[]> {
+  const events: CatalogEvent[] = [];
+  let offset = "-1";
+  for (let i = 0; i < 100; i++) {
+    const response = await fetch(`${dsUrl}/meta/catalog?offset=${encodeURIComponent(offset)}`);
+    if (response.status === 204) break;
+    if (!response.ok) throw new Error(`GET meta/catalog -> ${response.status}`);
+    const body = (await response.text()).trim();
+    if (body) events.push(...(JSON.parse(body) as CatalogEvent[]));
+    const next = response.headers.get("stream-next-offset");
+    if (!next || next === offset || response.headers.has("stream-up-to-date")) break;
+    offset = next;
+  }
+  return events;
+}
+
+async function persistedCheckpoints(dsUrl: string): Promise<CatalogEvent[]> {
+  return (await persistedCatalog(dsUrl)).filter((event) => event.t === "offset");
+}
+
+function sourceToken(event: StreamEnvelope): string {
+  const [hi, lo] = event.headers.lsn!.split("/");
+  const lsn = (BigInt(`0x${hi}`) << 32n) | BigInt(`0x${lo}`);
+  return lsn.toString(16).padStart(16, "0") + BigInt(event.headers.seq!).toString(16).padStart(16, "0");
 }
 
 /**
@@ -121,6 +237,197 @@ async function expectNothingLostAndOnlyReplays(streamUrl: string, expectedKeys: 
 }
 
 describe("graceful shutdown (SIGTERM)", () => {
+  it("a hard stop must not replay an older same-key value onto a caught-up consumer", async () => {
+    let checkpoint: Awaited<ReturnType<typeof startCheckpointHold>> | undefined;
+    await boot({
+      durableStreamsDurability: "wal",
+      wrapEngineDs: async (upstream) => (checkpoint = await startCheckpointHold(upstream)),
+    });
+    await pg("INSERT INTO items (id, n, label) VALUES (1, 1, 'baseline')");
+    await pg("INSERT INTO items (id, n, label) VALUES ($1, $2, $3)", [2, -1, "checkpoint-marker"]);
+    await drainEngine(h!);
+    const shape = await createShape(h!, { table: "items", where: matchAll });
+    await waitFor(async () => (await foldStream(shape.streamUrl)).get("1")?.n === 1, "baseline backfill");
+    checkpoint!.arm();
+    const beforeCheckpoint = await persistedCheckpoints(h!.dsUrl);
+
+    await pg("UPDATE items SET n = 2, label = 'older' WHERE id = 1");
+    await drainEngine(h!);
+    await waitFor(async () => (await foldStream(shape.streamUrl)).get("1")?.n === 2, "acknowledged older version");
+    await pg("UPDATE items SET n = 3, label = 'newer' WHERE id = 1");
+    await drainEngine(h!);
+    await waitFor(async () => (await foldStream(shape.streamUrl)).get("1")?.n === 3, "acknowledged newer version");
+    // The lazy checkpoint needs tracked change-log movement after its 2s
+    // interval. The drain sentinel alone is not table data; change a real row
+    // outside this shape until the proxy observes an actual Offset POST.
+    let markerVersion = 0;
+    await waitFor(async () => {
+      if (checkpoint!.blocked().length > 0) return true;
+      await pg("UPDATE items SET label = $1 WHERE id = $2", [`checkpoint-marker-${++markerVersion}`, 2]);
+      await drainEngine(h!);
+      return checkpoint!.blocked().length > 0;
+    }, "an actual checkpoint append to be held before persistence");
+    const preKill = await streamEnvelopes(shape.streamUrl);
+    const seen = preKill.filter((event) => event.key === "1").map((event) => event.value?.n);
+    const tail = await fetch(shape.streamUrl, { method: "HEAD" });
+    const consumerOffset = tail.headers.get("stream-next-offset");
+    await tail.text();
+    const afterCheckpoint = await persistedCheckpoints(h!.dsUrl);
+    expect(seen, "both real SQL updates reached the shape before the hard stop").toEqual([1, 2, 3]);
+    expect(checkpoint!.blocked().length, "the proxy saw a real sequencer checkpoint").toBeGreaterThan(0);
+    expect(afterCheckpoint, "the held Offset never reached durable catalog storage").toEqual(beforeCheckpoint);
+    expect(consumerOffset, "the caught-up consumer records its acknowledged DS byte offset").not.toBeNull();
+
+    let killedCheckpoint: CatalogEvent[] = [];
+    await h!.restartEngine(async () => {
+      killedCheckpoint = await persistedCheckpoints(h!.dsUrl);
+      checkpoint!.release();
+    });
+    expect(
+      killedCheckpoint,
+      "the catalog frontier stays unchanged after SIGKILL and before the new engine boots",
+    ).toEqual(beforeCheckpoint);
+    await drainEngine(h!);
+    const replayed = await streamEnvelopes(shape.streamUrl, consumerOffset!);
+    const wire = replayed.filter((event) => event.key === "1");
+    const versions = [3, ...wire.map((event) => event.value?.n)];
+    const finalRows = await foldStream(shape.streamUrl);
+    const oracle = await pg("SELECT id, n, label FROM items WHERE n >= $1 ORDER BY id", [0]);
+    expect(finalRows.get("1"), "no loss: the full fold converges to Postgres after restart").toMatchObject(oracle[0]!);
+    expect(finalRows.size).toBe(oracle.length);
+    expect(
+      wire,
+      `a caught-up consumer must not receive replayed old/duplicate versions at new DS offsets; values=${JSON.stringify(versions)}`,
+    ).toEqual([]);
+  });
+
+  it.each(["routed equality", "changes-only", "empty snapshot"] as const)(
+    "plain delivery coverage survives a hard stop for %s",
+    async (kind) => {
+      let checkpoint: Awaited<ReturnType<typeof startCheckpointHold>> | undefined;
+      await boot({
+        durableStreamsDurability: "wal",
+        wrapEngineDs: async (upstream) => (checkpoint = await startCheckpointHold(upstream)),
+      });
+      await pg("INSERT INTO items (id, n, label) VALUES ($1, $2, $3)", [2, -1, "marker"]);
+      if (kind !== "empty snapshot")
+        await pg("INSERT INTO items (id, n, label) VALUES ($1, $2, $3)", [1, 1, "before-create"]);
+      await drainEngine(h!);
+      const shape = await createShape(h!, {
+        table: "items",
+        where: kind === "routed equality" ? { col: "id", op: "eq", value: 1 } : matchAll,
+        changesOnly: kind === "changes-only",
+      });
+      const witness = (await persistedCatalog(h!.dsUrl)).find(
+        (event) => event.t === "seeded" && event.id === shape.shapeId,
+      );
+      expect(
+        witness?.seed,
+        "the actual seed coverage is durable before create ACK, including no-output seeds",
+      ).toBeDefined();
+      expect(witness!.seed!.source_floor, "registration captured previously sequenced source history").not.toBeNull();
+      if (kind === "changes-only") expect(witness!.seed!.gate.xmax).toBe(0);
+      else {
+        expect(witness!.seed!.gate.xmax).toBeGreaterThan(0);
+        expect(witness!.seed!.gate.horizon).toBeGreaterThan(0);
+      }
+      const initialHead = await fetch(shape.streamUrl, { method: "HEAD" });
+      expect(initialHead.headers.get("stream-seq-guard")).toBe("durable-v1");
+      expect(
+        initialHead.headers.get("stream-seq"),
+        "a backfill/empty seed has no invented live output origin",
+      ).toBeNull();
+      await initialHead.text();
+      const expectedInitial = kind === "routed equality" ? [1] : [];
+      expect((await streamEnvelopes(shape.streamUrl)).map((event) => event.value?.n)).toEqual(expectedInitial);
+
+      checkpoint!.arm();
+      const before = await persistedCheckpoints(h!.dsUrl);
+      if (kind === "changes-only") {
+        const source = (await streamEnvelopes(`${h!.dsUrl}/changes/0`)).find(
+          (event) => event.key === "1" && event.value?.n === 1,
+        )!;
+        expect(source.headers.lsn, "the excluded pre-create value really exists in source history").toBeDefined();
+        const checkpointHighwater = before.at(-1)?.highwater;
+        if (checkpointHighwater) {
+          const token =
+            BigInt(checkpointHighwater[0]).toString(16).padStart(16, "0") +
+            BigInt(checkpointHighwater[1]).toString(16).padStart(16, "0");
+          expect(token < sourceToken(source), "setup retains pre-create history beyond the durable checkpoint").toBe(
+            true,
+          );
+        }
+      }
+      if (kind === "routed equality") {
+        for (const n of [2, 3]) {
+          await pg("UPDATE items SET n = $1, label = $2 WHERE id = $3", [n, `version-${n}`, 1]);
+          await drainEngine(h!);
+          await waitFor(async () => (await foldStream(shape.streamUrl)).get("1")?.n === n, `routed version ${n}`);
+        }
+      }
+      const waitCheckpoint = async (phase: number) => {
+        let version = 0;
+        await waitFor(async () => {
+          if (checkpoint!.blocked().length) return true;
+          await pg("UPDATE items SET label = $1 WHERE id = $2", [`marker-${phase}-${++version}`, 2]);
+          await drainEngine(h!);
+          return checkpoint!.blocked().length > 0;
+        }, "an actual catalog Offset to be intercepted");
+      };
+      await waitCheckpoint(1);
+      expect(await persistedCheckpoints(h!.dsUrl)).toEqual(before);
+      const tail = await fetch(shape.streamUrl, { method: "HEAD" });
+      const offset = tail.headers.get("stream-next-offset")!;
+      await tail.text();
+      let afterKill: CatalogEvent[] = [];
+      await h!.restartEngine(async () => {
+        afterKill = await persistedCheckpoints(h!.dsUrl);
+        checkpoint!.release();
+      });
+      expect(afterKill).toEqual(before);
+      await drainEngine(h!);
+      expect(
+        await streamEnvelopes(shape.streamUrl, offset),
+        "no pre-create value or delivered prefix is appended at a new offset",
+      ).toEqual([]);
+
+      // A no-output seed must still allow its first genuinely new effect after restoration.
+      // The routed variant also proves the stream remains maintained after receipt filtering.
+      checkpoint!.arm();
+      const secondBefore = await persistedCheckpoints(h!.dsUrl);
+      const n = kind === "routed equality" ? 4 : 2;
+      if (kind === "empty snapshot")
+        await pg("INSERT INTO items (id, n, label) VALUES ($1, $2, $3)", [1, n, "after-restart"]);
+      else await pg("UPDATE items SET n = $1, label = $2 WHERE id = $3", [n, "after-restart", 1]);
+      await drainEngine(h!);
+      await waitFor(
+        async () => (await foldStream(shape.streamUrl)).get("1")?.n === n,
+        "new output after seed restoration",
+      );
+      const wire = await streamEnvelopes(shape.streamUrl);
+      expect(wire.map((event) => event.value?.n)).toEqual(kind === "routed equality" ? [1, 2, 3, 4] : [2]);
+      const head = await fetch(shape.streamUrl, { method: "HEAD" });
+      const secondOffset = head.headers.get("stream-next-offset")!;
+      expect(head.headers.get("stream-seq"), "the receipt is the actual final source origin").toBe(
+        sourceToken(wire.at(-1)!),
+      );
+      await head.text();
+      await waitCheckpoint(2);
+      expect(await persistedCheckpoints(h!.dsUrl)).toEqual(secondBefore);
+      await h!.restartEngine(async () => {
+        afterKill = await persistedCheckpoints(h!.dsUrl);
+        checkpoint!.release();
+      });
+      expect(afterKill).toEqual(secondBefore);
+      await drainEngine(h!);
+      expect(
+        await streamEnvelopes(shape.streamUrl, secondOffset),
+        "a second hard stop preserves the same receipt",
+      ).toEqual([]);
+      expect((await foldStream(shape.streamUrl)).get("1")?.n).toBe(n);
+    },
+  );
+
   it("drains readiness, exits 0 without waiting on storage long-polls, and keeps the shape maintained", async () => {
     await boot();
     const shape = await createShape(h!, { table: "items", where: matchAll });

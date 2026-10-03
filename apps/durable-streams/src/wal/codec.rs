@@ -6,7 +6,7 @@
 //! u32  len            // payload length
 //! u32  header_crc32c   // crc32c over [lsn, kind, stream_id, stream_offset, len, flags, payload_crc]
 //! u64  lsn            // monotonic within the shard
-//! u8   kind           // 1=Append 2=StreamCreate 3=StreamClose 4=StreamDelete
+//! u8   kind           // 1=Append 2=StreamCreate 3=StreamClose 4=StreamDelete 5=SequencedAppend
 //! u64  stream_id      // stable per-stream id
 //! u64  stream_offset  // logical Stream-Next-Offset before this append
 //! u8   flags          // bit 0 = PAYLOAD_CHECKSUMMED; other bits reserved (0)
@@ -51,6 +51,8 @@ pub enum RecordKind {
     StreamCreate = 2,
     StreamClose = 3,
     StreamDelete = 4,
+    /// Payload is a length-prefixed UTF-8 Stream-Seq followed by stream wire bytes.
+    SequencedAppend = 5,
 }
 
 impl RecordKind {
@@ -63,9 +65,35 @@ impl RecordKind {
             2 => Some(RecordKind::StreamCreate),
             3 => Some(RecordKind::StreamClose),
             4 => Some(RecordKind::StreamDelete),
+            5 => Some(RecordKind::SequencedAppend),
             _ => None,
         }
     }
+
+    pub(crate) fn is_append(self) -> bool {
+        matches!(self, Self::Append | Self::SequencedAppend)
+    }
+}
+
+/// Keep accepted identity and wire bytes inside one checksummed WAL record.
+/// The wrapper is never written to the stream and never contributes to offsets.
+pub(crate) fn encode_sequenced_append(sequence: &str, wire: &[u8]) -> std::io::Result<Vec<u8>> {
+    let len = u32::try_from(sequence.len())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Stream-Seq is too long"))?;
+    let mut payload = Vec::with_capacity(4 + sequence.len() + wire.len());
+    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(sequence.as_bytes());
+    payload.extend_from_slice(wire);
+    Ok(payload)
+}
+
+pub(crate) fn decode_sequenced_append(payload: &[u8]) -> std::io::Result<(&str, &[u8])> {
+    let malformed = || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid sequenced WAL append");
+    let len_bytes = payload.get(..4).ok_or_else(malformed)?;
+    let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+    let end = 4usize.checked_add(len).ok_or_else(malformed)?;
+    let sequence = std::str::from_utf8(payload.get(4..end).ok_or_else(malformed)?).map_err(|_| malformed())?;
+    Ok((sequence, payload.get(end..).ok_or_else(malformed)?))
 }
 
 /// A WAL record to encode. Borrows its payload (zero-copy on the encode side).

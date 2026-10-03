@@ -3,8 +3,8 @@
 //!
 //! Runs AFTER the non-sharded sidecar pass (`Store::recover`), which owns stream
 //! identity (`stream_id`/`next_id`) and reconstructs every `StreamState` from its
-//! `.meta`. Recovery here **only repairs file-tail bytes** — it never allocates
-//! ids and never creates/deletes streams.
+//! `.meta`. Recovery repairs file-tail bytes and their committed Stream-Seq
+//! frontier — it never allocates ids and never creates/deletes streams.
 //!
 //! # Algorithm (per shard, in parallel)
 //!
@@ -51,6 +51,7 @@ use std::sync::Arc;
 
 use crate::store::{Store, StreamState};
 use crate::wal::codec::RecordKind;
+use crate::wal::shard::DurableFrontier;
 use crate::wal::walset::WalSet;
 
 /// Test-only counter of per-stream `sync_data` calls made during tail reconcile.
@@ -72,14 +73,26 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     let quarantined = store.quarantined_stream_ids()?;
     let mut durable_tails = Vec::with_capacity(wal.shards().len());
     for shard in wal.shards() {
-        let tails = shard.read_durable_tails()?;
+        let tails = shard.read_durable_frontiers()?;
         let mut unresolved = quarantined.iter().find(|id| tails.contains_key(id)).copied();
-        if unresolved.is_none() && !quarantined.is_empty() {
-            shard.replay_from_checkpoint(0, |kind, id, _, _| {
-                if kind == RecordKind::Append && quarantined.contains(&id) {
-                    unresolved = Some(id);
+        let mut malformed_sequence = None;
+        shard.replay_from_checkpoint(0, |kind, id, _, payload| {
+            // Validate semantic wrappers serially before ANY repair writer
+            // starts, even when their stream identity was deleted or unknown.
+            if kind == RecordKind::SequencedAppend && malformed_sequence.is_none() {
+                if let Err(error) = crate::wal::codec::decode_sequenced_append(payload) {
+                    malformed_sequence = Some(io::Error::new(
+                        error.kind(),
+                        format!("WAL recovery refused: stream {id}: {error} (WAL left intact)"),
+                    ));
                 }
-            })?;
+            }
+            if kind.is_append() && quarantined.contains(&id) {
+                unresolved = Some(id);
+            }
+        })?;
+        if let Some(error) = malformed_sequence {
+            return Err(error);
         }
         if let Some(id) = unresolved {
             return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
@@ -102,7 +115,7 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
     // reconcile loop below skips streams whose file already sits exactly at
     // their frontier, so the seeding adds no boot I/O for untouched streams.
     let mut index: HashMap<u64, Arc<StreamState>> = HashMap::new();
-    let mut seeds: Vec<HashMap<u64, u64>> = vec![HashMap::new(); wal.shards().len()];
+    let mut seeds: Vec<HashMap<u64, DurableFrontier>> = vec![HashMap::new(); wal.shards().len()];
     let shard_pos: HashMap<*const crate::wal::shard::Shard, usize> =
         wal.shards().iter().enumerate().map(|(i, s)| (Arc::as_ptr(s), i)).collect();
     for entry in store.streams.iter() {
@@ -111,7 +124,10 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
             let s = st.shared.read().unwrap();
             // `s.tail` at boot is file_base + on-disk file size (the sidecar
             // pass's trust-the-file seed).
-            st.boot_meta_durable_tail.unwrap_or(s.tail)
+            DurableFrontier {
+                tail: st.boot_meta_durable_tail.unwrap_or(s.tail),
+                sequence: s.committed_last_seq_header.clone(),
+            }
         };
         let pos = shard_pos[&Arc::as_ptr(wal.shard_for(st.id))];
         seeds[pos].insert(st.id, proof);
@@ -146,8 +162,8 @@ pub fn recover(store: &Arc<Store>, wal: &Arc<WalSet>) -> io::Result<()> {
 fn recover_shard(
     shard: &crate::wal::shard::Shard,
     index: &HashMap<u64, Arc<StreamState>>,
-    seed: HashMap<u64, u64>,
-    mut frontier: HashMap<u64, u64>,
+    seed: HashMap<u64, DurableFrontier>,
+    mut frontier: HashMap<u64, DurableFrontier>,
 ) -> io::Result<()> {
     // `checkpoint_lsn` is a WRITE-SKIP optimization ONLY — NOT the boundary for
     // which streams get reconciled. We replay from the OLDEST RETAINED record so
@@ -190,8 +206,7 @@ fn recover_shard(
     // Fold in the per-stream sidecar proof (every stream of this shard gets an
     // entry; max keeps the strongest proof).
     for (id, proof) in seed {
-        let slot = frontier.entry(id).or_insert(0);
-        *slot = (*slot).max(proof);
+        frontier.entry(id).or_default().merge(proof.tail, proof.sequence.as_deref());
     }
     // Actual contiguous logical EOF after each successful replay write. Seed
     // from physical file length, NEVER a sidecar/checkpoint proof: an old bad
@@ -206,19 +221,42 @@ fn recover_shard(
         if replay_err.is_some() {
             return;
         }
-        // v1 replay repairs file-tail bytes for `Append` only. Create/Close/Delete
-        // are reconstructed by the sidecar pass (identity is not ours to own).
-        if kind != RecordKind::Append {
+        // Create/Close/Delete are reconstructed by the sidecar pass. Append
+        // records repair bytes and sequenced appends also restore their receipt.
+        if !kind.is_append() {
             return;
         }
         // Deleted/unknown stream: no StreamState → skip (never resurrect identity).
         let Some(st) = index.get(&stream_id) else {
             return;
         };
+        let (sequence, payload) = if kind == RecordKind::SequencedAppend {
+            match crate::wal::codec::decode_sequenced_append(payload) {
+                Ok((sequence, wire)) => (Some(sequence), wire),
+                Err(error) => {
+                    replay_err = Some(error);
+                    return;
+                }
+            }
+        } else {
+            (None, payload)
+        };
+        let Some(end) = stream_offset.checked_add(payload.len() as u64) else {
+            replay_err = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("WAL recovery refused: stream {stream_id} record end overflows at offset {stream_offset}"),
+            ));
+            return;
+        };
         let file_base = st.shared.read().unwrap().file_base;
         // Frontier invariant: a record below `file_base` is already sealed into a
         // chunk — re-applying would be out of range / a double apply. Skip it.
         if stream_offset < file_base {
+            // Identity remains relevant after wire bytes were sealed/offloaded.
+            // A sequence wrapper is not stream data and never changes offsets.
+            if sequence.is_some() {
+                frontier.entry(stream_id).or_default().merge(end, sequence);
+            }
             return;
         }
         let file_pos = stream_offset - file_base;
@@ -251,20 +289,12 @@ fn recover_shard(
             ));
             return;
         }
-        let Some(end) = stream_offset.checked_add(payload.len() as u64) else {
-            replay_err = Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("WAL recovery refused: stream {stream_id} record end overflows at offset {stream_offset}"),
-            ));
-            return;
-        };
         if let Err(e) = write_at(st, file_pos, payload) {
             replay_err = Some(e);
             return;
         }
         replayed_end.insert(stream_id, actual_end.max(end));
-        let slot = frontier.entry(stream_id).or_insert(0);
-        *slot = (*slot).max(end);
+        frontier.entry(stream_id).or_default().merge(end, sequence);
     })?;
 
     if let Some(e) = replay_err {
@@ -274,7 +304,8 @@ fn recover_shard(
     // Reconcile each stream's file tail to its durable frontier (the max of the
     // sidecar durable-tail seed, the checkpoint-persisted tails, and the
     // replayed WAL frontier, already folded into `frontier`).
-    for (stream_id, &logical_tail) in &frontier {
+    for (stream_id, proof) in &frontier {
+        let logical_tail = proof.tail;
         let st = match index.get(stream_id) {
             Some(st) => st,
             None => continue,
@@ -290,6 +321,9 @@ fn recover_shard(
             (s.file_base, s.tail)
         };
         if logical_tail < file_base {
+            if restore_sequence(st, proof.sequence.as_deref()) {
+                write_meta_durable(st)?;
+            }
             continue;
         }
         // Fast path (keeps 1M-stream boots cheap): the replay never wrote this
@@ -304,12 +338,13 @@ fn recover_shard(
         // file-size trust rather than paying a boot-time meta rewrite per
         // stream (the proof materializes on their next natural meta write).
         if !replayed_end.contains_key(stream_id) && boot_tail == logical_tail {
-            if st.boot_meta_durable_tail.is_some_and(|d| d < logical_tail) {
+            let sequence_changed = restore_sequence(st, proof.sequence.as_deref());
+            if sequence_changed || st.boot_meta_durable_tail.is_some_and(|d| d < logical_tail) {
                 write_meta_durable(st)?;
             }
             continue;
         }
-        reconcile_tail(st, logical_tail)?;
+        reconcile_tail(st, logical_tail, proof.sequence.as_deref())?;
     }
     Ok(())
 }
@@ -345,7 +380,19 @@ fn write_at(st: &StreamState, file_pos: u64, payload: &[u8]) -> io::Result<()> {
 /// update `Shared.tail` and the appender `written` so reads/appends are
 /// consistent. Truncates a longer (torn page-cache) tail to the durable
 /// frontier; a shorter file was already extended by the replay writes.
-fn reconcile_tail(st: &StreamState, logical_tail: u64) -> io::Result<()> {
+fn restore_sequence(st: &StreamState, sequence: Option<&str>) -> bool {
+    let Some(sequence) = sequence else { return false };
+    let mut shared = st.shared.write().unwrap();
+    if shared.committed_last_seq_header.as_deref().is_some_and(|old| old >= sequence) {
+        return false;
+    }
+    shared.committed_last_seq_header = Some(sequence.to_owned());
+    shared.last_seq_header = Some(sequence.to_owned());
+    shared.accepted_last_seq_header = Some(sequence.to_owned());
+    true
+}
+
+fn reconcile_tail(st: &StreamState, logical_tail: u64, sequence: Option<&str>) -> io::Result<()> {
     let file_base = st.shared.read().unwrap().file_base;
     // The frontier is always ≥ file_base (we only insert in-range Appends), so
     // this never underflows.
@@ -377,6 +424,7 @@ fn reconcile_tail(st: &StreamState, logical_tail: u64) -> io::Result<()> {
     // un-truncated again. fdatasync the per-stream file so the repaired,
     // whole-record-boundary file is crash-durable BEFORE we publish the tail.
     crate::store::barrier_fsync(&f)?;
+    restore_sequence(st, sequence);
     #[cfg(test)]
     RECOVERY_FSYNCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 

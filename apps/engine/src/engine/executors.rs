@@ -40,6 +40,8 @@ pub(crate) struct StandaloneShape {
     /// This shape's backfill-snapshot fence: replicated changes already visible to the backfill are
     /// skipped by xid visibility (LSN fallback) — see [`crate::pg::SnapshotGate`].
     pub(crate) gate: crate::pg::SnapshotGate,
+    /// Immutable source cut at original registration, including a changes-only/empty seed.
+    pub(crate) source_floor: Option<crate::ds::SourcePosition>,
     /// Output projection (column indices), or `None` to emit the full row.
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
 }
@@ -198,6 +200,7 @@ pub(crate) struct RoutedShape {
     pub(crate) stream_path: String,
     /// THIS shape's own backfill-snapshot fence (see [`crate::pg::SnapshotGate`]).
     pub(crate) gate: crate::pg::SnapshotGate,
+    pub(crate) source_floor: Option<crate::ds::SourcePosition>,
     /// Output projection (column indices), or `None` to emit the full row.
     pub(crate) out_cols: Option<Arc<Vec<usize>>>,
 }

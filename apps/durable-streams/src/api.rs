@@ -206,10 +206,12 @@ pub fn status_reason(status: u16) -> &'static str {
         405 => "Method Not Allowed",
         409 => "Conflict",
         410 => "Gone",
+        412 => "Precondition Failed",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         501 => "Not Implemented",
+        503 => "Service Unavailable",
         _ => "",
     }
 }

@@ -177,6 +177,7 @@ pub(crate) async fn replay_changes_until(
     pred: &CompiledPredicate,
     out_cols: Option<&Arc<Vec<usize>>>,
     gate: &crate::pg::SnapshotGate,
+    source_floor: Option<crate::ds::SourcePosition>,
     stream_path: &str,
     from: &LogPosition,
     until: &LogPosition,
@@ -195,6 +196,7 @@ pub(crate) async fn replay_changes_until(
     let mut rotate_to = None;
     let mut emitted = 0;
     let mut stale_schema_reported = HashSet::new();
+    let mut source_highwater = source_floor;
     loop {
         attempt.check()?;
         if pos.segment == until.segment && crate::ds::replay_offset_bytes(&pos.offset)? == end_bytes {
@@ -215,6 +217,13 @@ pub(crate) async fn replay_changes_until(
         for env in &rr.envelopes {
             if env.type_ != table.as_str() {
                 continue;
+            }
+            if !library_mode {
+                let origin = crate::ds::SourcePosition::from_envelope(env)?;
+                if source_highwater.is_some_and(|floor| origin <= floor) {
+                    continue;
+                }
+                source_highwater = Some(origin);
             }
             if !schema_describes(ts, env) {
                 metrics().sequencer_stale_schema_skipped.fetch_add(1, Ordering::Relaxed);
@@ -240,6 +249,7 @@ pub(crate) async fn replay_changes_until(
             if gate.should_skip(lsn_u64, xid) {
                 continue;
             }
+            let group_start = outs.len();
             if absolute {
                 let held = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r).filter(|r| pred.matches(r));
                 if let Some(env) = absolute_envelope(ts, &env.key, held, txid, lsn, out_cols.map(|c| c.as_slice())) {
@@ -249,13 +259,20 @@ pub(crate) async fn replay_changes_until(
                 let matched = eval_standalone(pred, &delta);
                 outs.extend(translate_output(ts, matched, txid, lsn, out_cols.map(|c| c.as_slice())));
             }
+            if !library_mode {
+                super::output::stamp_plain_effect(env, &mut outs[group_start..])?;
+            }
         }
         if !outs.is_empty() {
             emitted += outs.len() as u64;
-            attempt
-                .run(shutdown, ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown))
-                .await
-                .context("append replay to retained stream")?;
+            let append = async {
+                if library_mode {
+                    ds.append_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+                } else {
+                    ds.append_plain_retrying(stream_path, &outs, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+                }
+            };
+            attempt.run(shutdown, append).await.context("append replay to retained stream")?;
         }
         let advanced = rr.next_offset.as_deref().is_some_and(|next| next != pos.offset);
         if let Some(next) = rr.next_offset {
@@ -307,6 +324,7 @@ mod tests {
         segments: Arc<std::sync::Mutex<HashMap<u32, (String, bool)>>>,
         appended: Arc<std::sync::Mutex<Vec<Envelope>>>,
         reads: Arc<AtomicU64>,
+        sequence: Arc<std::sync::Mutex<Option<String>>>,
     }
 
     struct ReplayServer {
@@ -339,6 +357,14 @@ mod tests {
 
         async fn handler(State(store): State<ReplayStore>, req: Request) -> Response {
             let path = req.uri().path().trim_start_matches('/').to_string();
+            if *req.method() == Method::HEAD && path.starts_with("shape/") {
+                let mut res = StatusCode::OK.into_response();
+                res.headers_mut().insert("stream-seq-guard", "durable-v1".parse().unwrap());
+                if let Some(sequence) = store.sequence.lock().unwrap().as_ref() {
+                    res.headers_mut().insert("stream-seq", sequence.parse().unwrap());
+                }
+                return res;
+            }
             if *req.method() == Method::HEAD && path.starts_with("changes/") {
                 let segment = path.strip_prefix("changes/").unwrap().parse::<u32>().unwrap();
                 let segments = store.segments.lock().unwrap();
@@ -374,8 +400,19 @@ mod tests {
                     .into_response();
             }
             if *req.method() == Method::POST {
+                let sequence = req.headers().get("stream-seq").map(|h| h.to_str().unwrap().to_string());
+                if let Some(desired) = &sequence {
+                    let expected: Option<String> =
+                        serde_json::from_str(req.headers()["stream-expected-seq"].to_str().unwrap()).unwrap();
+                    assert_eq!(expected, *store.sequence.lock().unwrap());
+                    *store.sequence.lock().unwrap() = Some(desired.clone());
+                }
                 let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
                 store.appended.lock().unwrap().extend(serde_json::from_slice::<Vec<Envelope>>(&body).unwrap());
+                if let Some(sequence) = sequence {
+                    return ([("stream-seq-guard", "durable-v1".to_string()), ("stream-seq", sequence)], "")
+                        .into_response();
+                }
             }
             StatusCode::OK.into_response()
         }
@@ -383,6 +420,7 @@ mod tests {
             segments: Arc::new(std::sync::Mutex::new(HashMap::new())),
             appended: Arc::new(std::sync::Mutex::new(Vec::new())),
             reads: Arc::new(AtomicU64::new(0)),
+            sequence: Arc::new(std::sync::Mutex::new(None)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ds = DsClient::new(format!("http://{}", listener.local_addr().unwrap()));
@@ -433,6 +471,7 @@ mod tests {
             &pred,
             None,
             &crate::pg::SnapshotGate::passthrough(),
+            None,
             "shape/s1",
             from,
             until,
@@ -443,6 +482,47 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pg_dormant_replay_deduplicates_source_effects_across_raw_pages() {
+        let server = replay_server().await;
+        server.store.append(0, change(2, true), true);
+        server.store.append(1, change(3, true), false);
+        server.store.append(1, change(2, true), false);
+        server.store.append(1, change(3, true), false);
+        let until = server.store.append(1, change(4, true), false);
+        let ts = items();
+        let pred = CompiledPredicate::compile_opt(None, &ts).unwrap();
+        let controls = Arc::new(ReplayControls::new(ReplayConfig { concurrency: 1 }));
+        let attempt = ReplayAttempt::new();
+        let shutdown = crate::shutdown::ShutdownToken::new();
+        let permit = controls.acquire(&attempt, &shutdown).await.unwrap();
+        let result = replay_changes_until(
+            &server.ds,
+            &ts,
+            &ts.table,
+            &pred,
+            None,
+            &crate::pg::SnapshotGate::passthrough(),
+            None,
+            "shape/s1",
+            &LogPosition::start(),
+            &until,
+            false,
+            &shutdown,
+            &attempt,
+            &permit,
+        )
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        assert!(server.store.reads.load(Ordering::Relaxed) >= 3, "the duplicate source prefix crossed real read pages");
+        let wire = server.store.appended.lock().unwrap();
+        assert_eq!(
+            wire.iter().map(|env| env.value.as_ref().unwrap()["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert_eq!(wire.iter().map(|env| env.headers.seq.unwrap()).collect::<Vec<_>>(), [2, 3, 4]);
     }
 
     #[tokio::test]
@@ -491,8 +571,8 @@ mod tests {
         let gate = crate::pg::SnapshotGate::passthrough();
         let run = || {
             replay_changes_until(
-                &server.ds, &ts, &ts.table, &pred, None, &gate, "shape/s1", &until, &until, true, &shutdown, &attempt,
-                &permit,
+                &server.ds, &ts, &ts.table, &pred, None, &gate, None, "shape/s1", &until, &until, true, &shutdown,
+                &attempt, &permit,
             )
         };
         let error = run().await.expect_err("closed-tail replay requires the existing successor");
@@ -522,6 +602,7 @@ mod tests {
             &pred,
             None,
             &crate::pg::SnapshotGate::passthrough(),
+            None,
             "shape/s1",
             &LogPosition::start(),
             &until,

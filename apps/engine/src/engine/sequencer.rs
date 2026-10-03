@@ -1,8 +1,21 @@
 //! The LSN-ordered sequencer: command protocol, per-table executors, the main loop,
 //! envelope processing, activation/backfill, and the reliable flush.
 
+use super::output::stamp_plain_effect;
 use super::*;
 use crate::pending_buffer::{PendingBudget, SpillQueue};
+
+pub(crate) struct ShapeRegistration {
+    pub(crate) position: LogPosition,
+    /// The last fully processed source effect, never the raw held transaction prefix.
+    pub(crate) source_floor: Option<crate::ds::SourcePosition>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PlainSeed {
+    pub(crate) gate: crate::pg::SnapshotGate,
+    pub(crate) source_floor: Option<crate::ds::SourcePosition>,
+}
 
 /// Handle to the engine's single **sequencer** task — the LSN-ordered executor consuming the
 /// global `changes` stream (Electric's `ShapeLogCollector` pattern): one task processes every
@@ -40,7 +53,7 @@ pub(crate) enum SequencerCmd {
         attempt: Option<super::replay::ReplayAttempt>,
         /// Raw consumed position, including a held transaction prefix. Pending registration and
         /// capturing this fixed replay endpoint are one sequencer step.
-        ack: tokio::sync::oneshot::Sender<LogPosition>,
+        ack: tokio::sync::oneshot::Sender<ShapeRegistration>,
     },
     /// Phase 2: the creator's backfill snapshot has been appended chunk by chunk (plain) or folded
     /// into `agg_seed` (aggregates); drain the buffered deltas through the shape's snapshot gate
@@ -51,6 +64,7 @@ pub(crate) enum SequencerCmd {
         table: TableRef,
         shape_id: String,
         gate: crate::pg::SnapshotGate,
+        source_floor: Option<crate::ds::SourcePosition>,
         /// An aggregate's fold, already seeded by the creator from the streamed backfill (`None`
         /// for plain shapes — the creator appended their snapshot envelopes chunk by chunk — and
         /// for a reactivation, whose state comes from the change-log replay).
@@ -76,7 +90,9 @@ pub(crate) enum SequencerCmd {
     DeactivateShape {
         table: TableRef,
         shape_id: String,
-        resp: tokio::sync::oneshot::Sender<Option<(LogPosition, crate::pg::SnapshotGate)>>,
+        resp: tokio::sync::oneshot::Sender<
+            Option<(LogPosition, crate::pg::SnapshotGate, Option<crate::ds::SourcePosition>)>,
+        >,
     },
     RemoveShape {
         table: TableRef,
@@ -538,17 +554,18 @@ pub(crate) async fn sequencer_loop(
                         }
                         None => tracing::error!("begin_shape: unknown table '{table}'"),
                     }
-                    let _ = ack.send(pos.clone());
+                    let source_floor = highwater.map(|(lsn, seq)| crate::ds::SourcePosition { lsn, seq });
+                    let _ = ack.send(ShapeRegistration { position: pos.clone(), source_floor });
                 }
-                Some(SequencerCmd::ActivateShape { table, shape_id, gate, agg_seed, emitted_seed, attempt, ready }) => {
+                Some(SequencerCmd::ActivateShape { table, shape_id, gate, source_floor, agg_seed, emitted_seed, attempt, ready }) => {
                     let res = if attempt.as_ref().is_some_and(|a| a.is_cancelled()) {
                         Err(anyhow::anyhow!("replay attempt was cancelled"))
                     } else if execs.get(table.as_str()).and_then(|e| e.pending.get(&shape_id))
                         .is_some_and(|p| p.attempt_id != attempt.as_ref().map(|a| a.id())) {
                         Err(anyhow::anyhow!("stale replay activation"))
                     } else { activate_shape(
-                        &ds, &mut execs, &table, &shape_id, gate, agg_seed, emitted_seed, &mut emitted,
-                        &shutdown, attempt.as_ref(),
+                        &ds, &mut execs, &table, &shape_id, gate, source_floor, agg_seed, emitted_seed, &mut emitted,
+                        &shutdown, attempt.as_ref(), library_mode,
                     ).await };
                     if let Err(e) = &res {
                         tracing::error!("activate_shape failed: {e:#}");
@@ -574,13 +591,14 @@ pub(crate) async fn sequencer_loop(
                     let gate = execs.get_mut(table.as_str()).and_then(|exec| {
                         if let Some(shape) = exec.shapes.remove(&shape_id) {
                             exec.shape_index.remove(&shape_id);
-                            Some(shape.gate)
+                            Some((shape.gate, shape.source_floor))
                         } else if let Some((key_cols, num_id, key_tuple)) = exec.family_of.remove(&shape_id) {
                             let mut gate = None;
                             if let Some(router) = exec.families.get_mut(&key_cols) {
                                 if let Some(routed) = router.index.get_mut(&key_tuple) {
                                     if let Some(pos) = routed.iter().position(|rs| rs.num_id == num_id) {
-                                        gate = Some(routed.remove(pos).gate);
+                                        let shape = routed.remove(pos);
+                                        gate = Some((shape.gate, shape.source_floor));
                                     }
                                     if routed.is_empty() {
                                         router.index.remove(&key_tuple);
@@ -598,7 +616,7 @@ pub(crate) async fn sequencer_loop(
                     if gate.is_some() {
                         emitted.remove(&shape_id);
                     }
-                    let _ = resp.send(gate.map(|g| (published(&pos, &held_from), g)));
+                    let _ = resp.send(gate.map(|(g, floor)| (published(&pos, &held_from), g, floor)));
                     publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                 }
                 Some(SequencerCmd::RemoveShape { table, shape_id }) => {
@@ -1427,11 +1445,13 @@ pub(crate) async fn activate_shape(
     table: &TableRef,
     shape_id: &str,
     gate: crate::pg::SnapshotGate,
+    source_floor: Option<crate::ds::SourcePosition>,
     agg_seed: Option<AggSeed>,
     emitted_seed: u64,
     emitted: &mut HashMap<String, u64>,
     shutdown: &crate::shutdown::ShutdownToken,
     attempt: Option<&super::replay::ReplayAttempt>,
+    library_mode: bool,
 ) -> Result<()> {
     let exec = execs.get_mut(table.as_str()).with_context(|| format!("no executor for table '{table}'"))?;
     let mut p = exec.pending.remove(shape_id).with_context(|| format!("no pending shape '{shape_id}' (aborted?)"))?;
@@ -1451,6 +1471,12 @@ pub(crate) async fn activate_shape(
                 // a shape that is missing a change. The same envelope reaches the main loop, which is
                 // what parks the engine.
                 let Some((delta, txid, lsn)) = decode_buffered(&exec.ts, &env)? else { continue };
+                if !library_mode {
+                    let origin = crate::ds::SourcePosition::from_envelope(&env)?;
+                    if source_floor.is_some_and(|floor| origin <= floor) {
+                        continue;
+                    }
+                }
                 if delta.is_empty() {
                     continue;
                 }
@@ -1463,9 +1489,12 @@ pub(crate) async fn activate_shape(
                 if matched.is_empty() {
                     continue;
                 }
-                for out in translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice)) {
-                    outs.push(ds, &p.stream_path, out, shutdown, attempt).await?;
+                let mut group =
+                    translate_output(&exec.ts, matched, txid, lsn, p.out_cols.as_deref().map(Vec::as_slice));
+                if !library_mode {
+                    stamp_plain_effect(&env, &mut group)?;
                 }
+                outs.push_group(ds, &p.stream_path, group, shutdown, attempt).await?;
             }
             outs.flush(ds, &p.stream_path, shutdown, attempt).await?;
             *emitted.entry(shape_id.to_string()).or_insert(0) += outs.emitted;
@@ -1484,6 +1513,7 @@ pub(crate) async fn activate_shape(
                         num_id: p.num_id,
                         stream_path: p.stream_path.clone(),
                         gate: gate.clone(),
+                        source_floor,
                         out_cols: p.out_cols.clone(),
                     });
                     exec.family_of.insert(shape_id.to_string(), (key_cols, p.num_id, key_tuple));
@@ -1496,6 +1526,7 @@ pub(crate) async fn activate_shape(
                             pred: p.pred.clone(),
                             stream_path: p.stream_path.clone(),
                             gate: gate.clone(),
+                            source_floor,
                             out_cols: p.out_cols.clone(),
                         },
                     );
@@ -1580,14 +1611,26 @@ impl ActivationOutput {
         shutdown: &crate::shutdown::ShutdownToken,
         attempt: Option<&super::replay::ReplayAttempt>,
     ) -> Result<()> {
+        self.push_group(ds, path, vec![env], shutdown, attempt).await
+    }
+
+    async fn push_group(
+        &mut self,
+        ds: &DsClient,
+        path: &str,
+        group: Vec<Envelope>,
+        shutdown: &crate::shutdown::ShutdownToken,
+        attempt: Option<&super::replay::ReplayAttempt>,
+    ) -> Result<()> {
         check_replay_attempt(attempt)?;
-        let bytes = crate::ds::envelope_memory_bytes(&env);
-        if !self.envelopes.is_empty() && (self.envelopes.len() >= 256 || self.bytes.saturating_add(bytes) > 256 * 1024)
+        let bytes = group.iter().map(crate::ds::envelope_memory_bytes).sum::<u64>();
+        if !self.envelopes.is_empty()
+            && (self.envelopes.len().saturating_add(group.len()) > 256 || self.bytes.saturating_add(bytes) > 256 * 1024)
         {
             self.flush(ds, path, shutdown, attempt).await?;
         }
         self.bytes = self.bytes.saturating_add(bytes);
-        self.envelopes.push(env);
+        self.envelopes.extend(group);
         Ok(())
     }
 
@@ -1602,7 +1645,13 @@ impl ActivationOutput {
         if self.envelopes.is_empty() {
             return Ok(());
         }
-        let append = ds.append_retrying(path, &self.envelopes, DsClient::RESTORE_APPEND_BUDGET, shutdown);
+        let append = async {
+            if self.envelopes[0].headers.seq.is_some() {
+                ds.append_plain_retrying(path, &self.envelopes, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+            } else {
+                ds.append_retrying(path, &self.envelopes, DsClient::RESTORE_APPEND_BUDGET, shutdown).await
+            }
+        };
         if let Some(attempt) = attempt {
             tokio::select! {
                 biased;
@@ -1647,8 +1696,9 @@ pub(crate) async fn backfill_and_activate(
     // than appended as snapshot envelopes.
     aggregate: Option<(AggFn, Option<usize>)>,
     shutdown: &crate::shutdown::ShutdownToken,
-    ack_rx: tokio::sync::oneshot::Receiver<LogPosition>,
-) -> Result<()> {
+    ack_rx: tokio::sync::oneshot::Receiver<ShapeRegistration>,
+    restored_seed: Option<PlainSeed>,
+) -> Result<PlainSeed> {
     let abort = || {
         let _ = cmd_tx.send(SequencerCmd::AbortShape {
             table: table.clone(),
@@ -1656,14 +1706,14 @@ pub(crate) async fn backfill_and_activate(
             attempt_id: None,
         });
     };
-    if ack_rx.await.is_err() {
-        bail!("sequencer dropped the begin-shape ack");
-    }
+    let registration = ack_rx.await.context("sequencer dropped the begin-shape ack")?;
     // Backfill: current matching rows from a REPEATABLE READ snapshot, predicate pushed into the
     // SELECT; `matches()` is the final authority (a safety net if the SQL is ever a looser
     // superset). A `changes_only` feed skips the backfill and forwards only future matches
     // (passthrough gate) — the non-materialized live tail a subset query follows.
-    let (gate, agg_seed, emitted_seed) = if changes_only {
+    let (gate, agg_seed, emitted_seed) = if let Some(seed) = &restored_seed {
+        (seed.gate.clone(), None, 0u64)
+    } else if changes_only {
         (crate::pg::SnapshotGate::passthrough(), None, 0u64)
     } else {
         let t0 = std::time::Instant::now();
@@ -1675,12 +1725,14 @@ pub(crate) async fn backfill_and_activate(
             }
         }
     };
+    let source_floor = restored_seed.as_ref().map_or(registration.source_floor, |seed| seed.source_floor);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     if cmd_tx
         .send(SequencerCmd::ActivateShape {
             table: table.clone(),
             shape_id: shape_id.to_string(),
-            gate,
+            gate: gate.clone(),
+            source_floor,
             agg_seed,
             emitted_seed,
             attempt: None,
@@ -1690,7 +1742,8 @@ pub(crate) async fn backfill_and_activate(
     {
         bail!("sequencer is gone");
     }
-    ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))
+    ready_rx.await.unwrap_or_else(|_| Err(anyhow::anyhow!("sequencer dropped the ready channel")))?;
+    Ok(PlainSeed { gate, source_floor })
 }
 
 /// What a create is refused with when a shutdown interrupts it. The client's move is to retry
@@ -1807,6 +1860,11 @@ pub(crate) async fn process_envelope(
     // not LSN order, is the sound backfill↔replication reconciliation.
     let lsn_u64 = lsn.as_deref().map(crate::pg::lsn_to_u64).unwrap_or(0);
     let xid = txid.as_deref().and_then(|s| s.parse::<u64>().ok());
+    let origin = if !library_mode && (!shapes.is_empty() || !families.is_empty()) {
+        Some(crate::ds::SourcePosition::from_envelope(&env)?)
+    } else {
+        None
+    };
     metrics().envelopes.fetch_add(1, Ordering::Relaxed);
     let _t = Timer::new(&metrics().process_envelope);
     // Standalone shapes: evaluate each stateless filter directly on the delta (no thread, no clone).
@@ -1825,7 +1883,9 @@ pub(crate) async fn process_envelope(
     let row_now: Option<&Row> = delta.iter().find(|Tup2(_, w)| *w > 0).map(|Tup2(r, _)| r);
     if absolute {
         for (sid, shape) in shapes.iter() {
-            if shape.gate.should_skip(lsn_u64, xid) {
+            if shape.gate.should_skip(lsn_u64, xid)
+                || origin.zip(shape.source_floor).is_some_and(|(p, floor)| p <= floor)
+            {
                 if let Some((hops, _)) = tr.as_mut() {
                     hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
                 }
@@ -1840,7 +1900,7 @@ pub(crate) async fn process_envelope(
                 hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
                 ids.push(sid.clone());
             }
-            if let Some(e) = absolute_envelope(
+            if let Some(mut e) = absolute_envelope(
                 ts,
                 &env.key,
                 held,
@@ -1848,6 +1908,9 @@ pub(crate) async fn process_envelope(
                 lsn.clone(),
                 shape.out_cols.as_deref().map(Vec::as_slice),
             ) {
+                if !library_mode {
+                    stamp_plain_effect(&env, std::slice::from_mut(&mut e))?;
+                }
                 pending.entry(shape.stream_path.clone()).or_default().push(e);
             }
         }
@@ -1859,7 +1922,9 @@ pub(crate) async fn process_envelope(
             for (key, routed) in router.index.iter() {
                 let held = if new_key.as_ref() == Some(key) { row_now } else { None };
                 for rs in routed {
-                    if rs.gate.should_skip(lsn_u64, xid) {
+                    if rs.gate.should_skip(lsn_u64, xid)
+                        || origin.zip(rs.source_floor).is_some_and(|(p, floor)| p <= floor)
+                    {
                         continue;
                     }
                     if let Some((hops, ids)) = tr.as_mut() {
@@ -1867,7 +1932,7 @@ pub(crate) async fn process_envelope(
                         hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
                         ids.push(sid);
                     }
-                    if let Some(e) = absolute_envelope(
+                    if let Some(mut e) = absolute_envelope(
                         ts,
                         &env.key,
                         held,
@@ -1875,6 +1940,9 @@ pub(crate) async fn process_envelope(
                         lsn.clone(),
                         rs.out_cols.as_deref().map(Vec::as_slice),
                     ) {
+                        if !library_mode {
+                            stamp_plain_effect(&env, std::slice::from_mut(&mut e))?;
+                        }
                         pending.entry(rs.stream_path.clone()).or_default().push(e);
                     }
                 }
@@ -1891,7 +1959,7 @@ pub(crate) async fn process_envelope(
         Box::new(candidate_ids.iter().filter_map(|sid| shapes.get_key_value(sid)))
     };
     for (sid, shape) in candidates {
-        if shape.gate.should_skip(lsn_u64, xid) {
+        if shape.gate.should_skip(lsn_u64, xid) || origin.zip(shape.source_floor).is_some_and(|(p, floor)| p <= floor) {
             if let Some((hops, _)) = tr.as_mut() {
                 hops.push(crate::trace::TraceHop::new(format!("filter:{sid}"), "dropped"));
             }
@@ -1909,7 +1977,11 @@ pub(crate) async fn process_envelope(
             hops.push(crate::trace::TraceHop::new(format!("shape:{sid}"), "passed"));
             ids.push(sid.clone());
         }
-        let envs = translate_output(ts, out, txid.clone(), lsn.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
+        let mut envs =
+            translate_output(ts, out, txid.clone(), lsn.clone(), shape.out_cols.as_deref().map(Vec::as_slice));
+        if !library_mode {
+            stamp_plain_effect(&env, &mut envs)?;
+        }
         pending.entry(shape.stream_path.clone()).or_default().extend(envs);
     }
     // Equality routers: route each delta row by its key to exactly the shapes registered on that key.
@@ -1928,7 +2000,8 @@ pub(crate) async fn process_envelope(
                 routed_keys.push(key);
             }
             for rs in routed {
-                if rs.gate.should_skip(lsn_u64, xid) {
+                if rs.gate.should_skip(lsn_u64, xid) || origin.zip(rs.source_floor).is_some_and(|(p, floor)| p <= floor)
+                {
                     continue;
                 }
                 by_shape
@@ -1966,7 +2039,10 @@ pub(crate) async fn process_envelope(
         }
         metrics().family_steps.fetch_add(1, Ordering::Relaxed);
         for (_sid, (stream_path, out_cols, rows)) in by_shape {
-            let envs = translate_output(ts, rows, txid.clone(), lsn.clone(), out_cols);
+            let mut envs = translate_output(ts, rows, txid.clone(), lsn.clone(), out_cols);
+            if !library_mode {
+                stamp_plain_effect(&env, &mut envs)?;
+            }
             if !envs.is_empty() {
                 pending.entry(stream_path.to_string()).or_default().extend(envs);
             }
@@ -2102,7 +2178,11 @@ pub(crate) async fn flush_pending(ds: &DsClient, pending: HashMap<String, Vec<En
             let ds = ds.clone();
             set.spawn(async move {
                 let _t = Timer::new(&metrics().append);
-                ds.append_reliable(&path, &envs).await;
+                if envs.first().is_some_and(|env| env.headers.seq.is_some()) {
+                    ds.append_plain_reliable(&path, &envs).await;
+                } else {
+                    ds.append_reliable(&path, &envs).await;
+                }
                 metrics().shape_appends.fetch_add(1, Ordering::Relaxed);
             });
         }
@@ -2334,10 +2414,12 @@ mod schema_fence_tests {
                 "s1",
                 crate::pg::SnapshotGate::passthrough(),
                 None,
+                None,
                 0,
                 &mut emitted,
                 &shutdown,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -2354,6 +2436,120 @@ mod schema_fence_tests {
             assert_eq!(std::fs::read_dir(dir.path().join("spill")).unwrap().count(), 0);
         }
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn pg_activation_never_splits_a_key_change_effect_at_the_append_cap() {
+        use axum::extract::{Request, State};
+        use axum::http::Method;
+        use axum::response::{IntoResponse, Response};
+        type Captured = Arc<std::sync::Mutex<(Option<String>, Vec<Vec<Envelope>>)>>;
+        async fn capture(State(state): State<Captured>, req: Request) -> Response {
+            if *req.method() == Method::HEAD {
+                let mut response = "".into_response();
+                response.headers_mut().insert("stream-seq-guard", "durable-v1".parse().unwrap());
+                if let Some(sequence) = state.lock().unwrap().0.as_ref() {
+                    response.headers_mut().insert("stream-seq", sequence.parse().unwrap());
+                }
+                return response;
+            }
+            let desired = req.headers()["stream-seq"].to_str().unwrap().to_string();
+            let expected: Option<String> =
+                serde_json::from_str(req.headers()["stream-expected-seq"].to_str().unwrap()).unwrap();
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            let mut state = state.lock().unwrap();
+            assert_eq!(expected, state.0);
+            state.0 = Some(desired.clone());
+            state.1.push(serde_json::from_slice(&body).unwrap());
+            ([("stream-seq-guard", "durable-v1".to_string()), ("stream-seq", desired)], "").into_response()
+        }
+        let captured = Captured::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ds = DsClient::new(format!("http://{}", listener.local_addr().unwrap()));
+        let app = axum::Router::new().fallback(axum::routing::any(capture)).with_state(captured.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let ts = items(None);
+        let dir = crate::pending_buffer::tests::Scratch::new();
+        let budget = PendingBudget::new(crate::pending_buffer::PendingBufferConfig {
+            memory_bytes: 0,
+            spill_dir: dir.path().join("spill"),
+        });
+        let mut buffered = SpillQueue::new(budget);
+        let seed: PlainSeed = serde_json::from_value(
+            serde_json::to_value(PlainSeed {
+                gate: crate::pg::SnapshotGate::parse_with_horizon("5:9:7", "0/15", "0/30"),
+                source_floor: Some(crate::ds::SourcePosition { lsn: 0xe, seq: 0 }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut already_seeded = env(None);
+        already_seeded.value = Some(serde_json::json!({"id": 60000, "n": 60000}));
+        already_seeded.headers.lsn = Some("0/F".into());
+        already_seeded.headers.txid = Some("6".into());
+        assert!(
+            crate::ds::SourcePosition::from_envelope(&already_seeded).unwrap() > seed.source_floor.unwrap(),
+            "the creation floor cannot suppress this snapshot-visible effect"
+        );
+        buffered.push(&already_seeded).unwrap();
+        for id in 0..255 {
+            let mut value = env(None);
+            value.key = id.to_string();
+            value.value = Some(serde_json::json!({"id": id, "n": id}));
+            value.headers.seq = Some(id as u64);
+            buffered.push(&value).unwrap();
+        }
+        let mut changed_key = env(None);
+        changed_key.old = Some(serde_json::json!({"id": 10000, "n": 10000}));
+        changed_key.value = Some(serde_json::json!({"id": 10001, "n": 10001}));
+        changed_key.headers.operation = "update".into();
+        changed_key.headers.seq = Some(255);
+        buffered.push(&changed_key).unwrap();
+        let mut exec = TableExec::new(ts.clone());
+        exec.pending.insert(
+            "s1".into(),
+            PendingShape {
+                num_id: 1,
+                stream_path: "shape/s1".into(),
+                pred: Arc::new(CompiledPredicate::MatchAll),
+                out_cols: None,
+                kind: CreateKind::Plain,
+                buffered,
+                attempt_id: None,
+            },
+        );
+        let mut execs = [(ts.table.to_string(), exec)].into_iter().collect();
+        let result = activate_shape(
+            &ds,
+            &mut execs,
+            &ts.table,
+            "s1",
+            seed.gate,
+            seed.source_floor,
+            None,
+            0,
+            &mut HashMap::new(),
+            &crate::shutdown::ShutdownToken::new(),
+            None,
+            false,
+        )
+        .await;
+        server.abort();
+        result.unwrap();
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.1.iter().map(Vec::len).collect::<Vec<_>>(), [255, 2]);
+        let final_group = &captured.1[1];
+        assert!(
+            final_group.iter().all(|env| env.headers.seq == Some(255) && env.headers.lsn.as_deref() == Some("0/10"))
+        );
+        assert_eq!(
+            final_group.iter().map(|env| env.key.as_str()).collect::<std::collections::HashSet<_>>(),
+            ["10000", "10001"].into_iter().collect::<std::collections::HashSet<_>>()
+        );
+        assert_eq!(
+            final_group.iter().map(|env| env.headers.operation.as_str()).collect::<std::collections::HashSet<_>>(),
+            ["delete", "upsert"].into_iter().collect::<std::collections::HashSet<_>>()
+        );
     }
 
     #[tokio::test]
@@ -2426,7 +2622,12 @@ mod schema_fence_tests {
             rx
         };
         let horizon = begin(Some(attempt.clone())).await.unwrap();
-        assert_eq!(horizon.offset, offset, "the ack includes completed rows after the published pin");
+        assert_eq!(horizon.position.offset, offset, "the ack includes completed rows after the published pin");
+        assert_eq!(
+            horizon.source_floor,
+            Some(crate::ds::SourcePosition { lsn: 0x10, seq: 0 }),
+            "registration floor excludes the held, not-yet-sequenced transaction"
+        );
         let stale = super::super::replay::ReplayAttempt::new();
         sequencer
             .cmd_tx
@@ -2443,6 +2644,7 @@ mod schema_fence_tests {
                 table: ts.table.clone(),
                 shape_id: "s1".into(),
                 gate: crate::pg::SnapshotGate::passthrough(),
+                source_floor: None,
                 agg_seed: None,
                 emitted_seed: 0,
                 attempt: Some(attempt.clone()),
@@ -2460,6 +2662,7 @@ mod schema_fence_tests {
                 table: ts.table.clone(),
                 shape_id: "s1".into(),
                 gate: crate::pg::SnapshotGate::passthrough(),
+                source_floor: None,
                 agg_seed: None,
                 emitted_seed: 0,
                 attempt: None,
@@ -2646,6 +2849,7 @@ mod schema_fence_tests {
                 &pred,
                 None,
                 &gate,
+                None,
                 "shape/s1",
                 &LogPosition::start(),
                 &until,

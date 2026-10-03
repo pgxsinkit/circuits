@@ -194,6 +194,46 @@ fn decode_replay_page(body: String, offset: &str, next: &str, until: Option<&str
 pub struct StreamHead {
     pub next_offset: Option<String>,
     pub closed: bool,
+    pub sequence: Option<String>,
+    pub sequence_guard: Option<String>,
+}
+
+impl StreamHead {
+    pub(crate) fn plain_frontier(&self) -> Result<Option<SourcePosition>> {
+        delivery_frontier(self.sequence_guard.as_deref(), self.sequence.as_deref())
+    }
+}
+
+/// Stable source-effect identity. Its fixed-width token sorts exactly like `(lsn, seq)`.
+/// Only PG plain output uses it; client read offsets remain opaque and unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SourcePosition {
+    pub(crate) lsn: u64,
+    pub(crate) seq: u64,
+}
+
+impl SourcePosition {
+    pub(crate) fn from_envelope(env: &Envelope) -> Result<Self> {
+        let lsn = env.headers.lsn.as_deref().context("PG plain output source has no LSN")?;
+        let (hi, lo) = lsn.split_once('/').context("PG plain output source has an invalid LSN")?;
+        let hi = u32::from_str_radix(hi, 16).context("PG plain output source has an invalid LSN")?;
+        let lo = u32::from_str_radix(lo, 16).context("PG plain output source has an invalid LSN")?;
+        Ok(Self {
+            lsn: (u64::from(hi) << 32) | u64::from(lo),
+            seq: env.headers.seq.context("PG plain output source has no sequence")?,
+        })
+    }
+
+    pub(crate) fn token(self) -> String {
+        format!("{:016x}{:016x}", self.lsn, self.seq)
+    }
+
+    fn parse(token: &str) -> Result<Self> {
+        if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            bail!("invalid PG plain output Stream-Seq receipt: {token:?}");
+        }
+        Ok(Self { lsn: u64::from_str_radix(&token[..16], 16)?, seq: u64::from_str_radix(&token[16..], 16)? })
+    }
 }
 
 /// A read hit a stream that is not there: deleted (404) or soft-deleted (410).
@@ -370,6 +410,45 @@ struct StoreResponse {
     next_offset: Option<String>,
     up_to_date: bool,
     closed: bool,
+    sequence: Option<String>,
+    sequence_guard: Option<String>,
+}
+
+struct AppendSequence {
+    desired: String,
+    expected: Option<String>,
+}
+
+struct AppendBatch<'a> {
+    envelopes: &'a [Envelope],
+    plain: bool,
+    start: usize,
+    expected: Option<SourcePosition>,
+    initialized: bool,
+}
+
+impl<'a> AppendBatch<'a> {
+    fn new(envelopes: &'a [Envelope], plain: bool) -> Self {
+        Self { envelopes, plain, start: 0, expected: None, initialized: false }
+    }
+}
+
+#[derive(Debug)]
+struct SequenceMoved;
+
+impl std::fmt::Display for SequenceMoved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("plain output delivery frontier advanced during append")
+    }
+}
+
+impl std::error::Error for SequenceMoved {}
+
+fn delivery_frontier(guard: Option<&str>, sequence: Option<&str>) -> Result<Option<SourcePosition>> {
+    if !matches!(guard, Some("durable-v1" | "volatile-v1")) {
+        bail!("PG plain output requires the durable-streams sequence guard (durable-v1 or volatile-v1)");
+    }
+    sequence.map(SourcePosition::parse).transpose()
 }
 
 impl StoreResponse {
@@ -408,6 +487,7 @@ trait DurableStreamStore: Send + Sync {
         content_type: &'a str,
         body: Vec<u8>,
         response_body: BodyRead,
+        sequence: Option<AppendSequence>,
     ) -> StoreFuture<'a>;
     fn read<'a>(&'a self, path: &'a str, offset: &'a str, live: bool) -> StoreFuture<'a>;
     fn head<'a>(&'a self, path: &'a str) -> StoreFuture<'a>;
@@ -517,6 +597,8 @@ impl HttpDurableStreamsStore {
         let next_offset = header(&res, "stream-next-offset");
         let up_to_date = res.headers().get("stream-up-to-date").is_some();
         let closed = header(&res, "stream-closed").is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let sequence = header(&res, "stream-seq");
+        let sequence_guard = header(&res, "stream-seq-guard");
         let should_read = match body_read {
             BodyRead::Never => false,
             BodyRead::OnFailure => !(200..300).contains(&status),
@@ -529,7 +611,7 @@ impl HttpDurableStreamsStore {
         // interrupted body into `""` would manufacture an empty page at a real next offset.
         // Otherwise the selected mode keeps each operation's best-effort behavior.
         let body = if should_read { Some(res.text().await.map_err(anyhow::Error::new)) } else { None };
-        StoreResponse { status, body, next_offset, up_to_date, closed }
+        StoreResponse { status, body, next_offset, up_to_date, closed, sequence, sequence_guard }
     }
 }
 
@@ -553,16 +635,17 @@ impl DurableStreamStore for HttpDurableStreamsStore {
         content_type: &'a str,
         body: Vec<u8>,
         response_body: BodyRead,
+        sequence: Option<AppendSequence>,
     ) -> StoreFuture<'a> {
         Box::pin(async move {
-            let res = self
-                .http
-                .post(self.stream_url(path))
-                .header(reqwest::header::CONTENT_TYPE, content_type)
-                .body(body)
-                .send()
-                .await
-                .with_context(|| format!("POST {path}"))?;
+            let mut request =
+                self.http.post(self.stream_url(path)).header(reqwest::header::CONTENT_TYPE, content_type).body(body);
+            if let Some(sequence) = sequence {
+                request = request
+                    .header("stream-seq", sequence.desired)
+                    .header("stream-expected-seq", serde_json::to_string(&sequence.expected)?);
+            }
+            let res = request.send().await.with_context(|| format!("POST {path}"))?;
             Ok(Self::response(res, response_body).await)
         })
     }
@@ -690,7 +773,7 @@ impl DsClient {
             return Ok(());
         }
         let body = serde_json::to_vec(events).with_context(|| format!("serializing POST {path}"))?;
-        let res = self.store.append(path, "application/json", body, BodyRead::OnFailure).await?;
+        let res = self.store.append(path, "application/json", body, BodyRead::OnFailure, None).await?;
         if !(200..300).contains(&res.status) {
             let status = res.status;
             return Err(status_error("POST", path, status, &res.body_or_default()));
@@ -763,12 +846,35 @@ impl DsClient {
         budget: std::time::Duration,
         shutdown: &crate::shutdown::ShutdownToken,
     ) -> Result<()> {
+        self.append_retrying_batch(path, AppendBatch::new(envelopes, false), budget, shutdown).await
+    }
+
+    /// PG plain output only. The receipt certifies complete source effects, independent of the
+    /// current page/batch boundaries. A conditional mismatch refilters the same prepared effects;
+    /// it never re-runs an aggregate or advances the global input checkpoint.
+    pub(crate) async fn append_plain_retrying(
+        &self,
+        path: &str,
+        envelopes: &[Envelope],
+        budget: std::time::Duration,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> Result<()> {
+        self.append_retrying_batch(path, AppendBatch::new(envelopes, true), budget, shutdown).await
+    }
+
+    async fn append_retrying_batch(
+        &self,
+        path: &str,
+        mut batch: AppendBatch<'_>,
+        budget: std::time::Duration,
+        shutdown: &crate::shutdown::ShutdownToken,
+    ) -> Result<()> {
         let deadline = std::time::Instant::now() + budget;
         let mut attempt = 0u32;
         loop {
-            let e = match self.append_checked(path, envelopes).await {
-                Ok(Appended::Ok { .. }) => return Ok(()),
-                Ok(Appended::Retired(status)) => match self.head(path).await {
+            let e = match self.append_batch_once(path, &mut batch).await {
+                Ok(_) => return Ok(()),
+                Err(AppendError::Gone(status)) => match self.head(path).await {
                     // There and appendable: the terminal status did not come from storage. Typed as
                     // its own condition, so a budget that runs out on it is retried at boot and NAMED
                     // for what it is — something between the engine and storage answering one stream
@@ -783,7 +889,13 @@ impl DsClient {
                     // an acknowledged subscription. The HEAD's own error is kept, typed.
                     Err(he) => he.context(format!("POST {path} -> {status}; HEAD could not confirm it")),
                 },
-                Err(e) => {
+                Err(AppendError::Other(e)) => {
+                    if e.is::<SequenceMoved>() {
+                        if std::time::Instant::now() >= deadline || shutdown.is_shutting_down() {
+                            return Err(e.context("plain output refiltering exceeded its retry budget or shutdown"));
+                        }
+                        continue;
+                    }
                     if !is_unavailable(&e) {
                         return Err(e);
                     }
@@ -842,8 +954,11 @@ impl DsClient {
         let payload = serde_json::to_vec(envelopes)
             .map_err(|e| AppendError::Other(anyhow::Error::new(e).context(format!("serializing POST {path}"))))?;
         let payload_len = payload.len() as u64;
-        let res =
-            self.store.append(path, "application/json", payload, BodyRead::Always).await.map_err(AppendError::Other)?;
+        let res = self
+            .store
+            .append(path, "application/json", payload, BodyRead::Always, None)
+            .await
+            .map_err(AppendError::Other)?;
         // A retired stream answers 404 (deleted), 410 (soft-deleted) or 409 + `stream-closed: true`
         // (closed, which retirement does before deleting).  The provider parses the header before
         // draining its response; the body text ("stream is closed") is not the contract.
@@ -858,13 +973,96 @@ impl DsClient {
         }
     }
 
+    async fn append_batch_once(
+        &self,
+        path: &str,
+        batch: &mut AppendBatch<'_>,
+    ) -> std::result::Result<Option<String>, AppendError> {
+        if !batch.plain {
+            return self.append_once(path, batch.envelopes).await;
+        }
+        if batch.envelopes.is_empty() {
+            return Ok(None);
+        }
+        if !batch.initialized {
+            let mut previous = None;
+            for env in batch.envelopes {
+                let position = SourcePosition::from_envelope(env).map_err(AppendError::Other)?;
+                if previous.is_some_and(|previous| position < previous) {
+                    return Err(AppendError::Other(anyhow::anyhow!("PG plain output effects are out of source order")));
+                }
+                previous = Some(position);
+            }
+            let head = self.head(path).await.map_err(AppendError::Other)?.ok_or(AppendError::Gone(404))?;
+            if head.closed {
+                return Err(AppendError::Gone(409));
+            }
+            batch.expected = delivery_frontier(head.sequence_guard.as_deref(), head.sequence.as_deref())
+                .map_err(AppendError::Other)?;
+            batch.initialized = true;
+        }
+        while let Some(env) = batch.envelopes.get(batch.start) {
+            let position = SourcePosition::from_envelope(env).map_err(AppendError::Other)?;
+            if !batch.expected.is_some_and(|frontier| position <= frontier) {
+                break;
+            }
+            // Every member of a source effect has the same origin, so refiltering removes all of
+            // it. Producers must never split that effect between atomic appends.
+            batch.start += 1;
+        }
+        let envelopes = &batch.envelopes[batch.start..];
+        let Some(last) = envelopes.last() else { return Ok(None) };
+        let desired = SourcePosition::from_envelope(last).map_err(AppendError::Other)?;
+        let payload = serde_json::to_vec(envelopes).map_err(|e| AppendError::Other(e.into()))?;
+        let payload_len = payload.len() as u64;
+        let sequence = AppendSequence { desired: desired.token(), expected: batch.expected.map(SourcePosition::token) };
+        let res = self
+            .store
+            .append(path, "application/json", payload, BodyRead::Always, Some(sequence))
+            .await
+            .map_err(AppendError::Other)?;
+        if res.status == 404 || res.status == 410 || (res.status == 409 && res.closed) {
+            return Err(AppendError::Gone(res.status));
+        }
+        if (200..300).contains(&res.status) || res.status == 409 || res.status == 412 {
+            let frontier = delivery_frontier(res.sequence_guard.as_deref(), res.sequence.as_deref())
+                .map_err(AppendError::Other)?;
+            if frontier < batch.expected {
+                return Err(AppendError::Other(anyhow::anyhow!("PG plain output delivery receipt moved backwards")));
+            }
+            if (200..300).contains(&res.status) {
+                if !frontier.is_some_and(|frontier| frontier >= desired) {
+                    return Err(AppendError::Other(anyhow::anyhow!(
+                        "PG plain output append omitted its committed receipt"
+                    )));
+                }
+                *self.appended.lock().unwrap().entry(path.to_string()).or_insert(0) += payload_len;
+                batch.expected = frontier;
+                return Ok(res.next_offset);
+            }
+            if res.status == 409 && !frontier.is_some_and(|frontier| frontier >= desired) {
+                return Err(AppendError::Other(status_error("POST", path, res.status, &res.body_or_default())));
+            }
+            if frontier == batch.expected {
+                return Err(AppendError::Other(anyhow::anyhow!(
+                    "PG plain output sequence refusal supplied no newer receipt"
+                )));
+            }
+            batch.expected = frontier;
+            return Err(AppendError::Other(SequenceMoved.into()));
+        }
+        Err(AppendError::Other(status_error("POST", path, res.status, &res.body_or_default())))
+    }
+
     /// Append with **no silent loss**: retry transient failures with capped backoff until the append
     /// lands. A dropped shape-stream append is a permanent divergence for every subscriber of that
     /// shape, so the only sound behaviors are (a) retry until success — the storage server being down
     /// simply backpressures the tailer, matching the ingestor's read-then-commit stance — or (b) stop
     /// because the stream was retired (the shape was dropped/evicted mid-flush), which is a clean
-    /// no-op. Envelopes are absolute per-pk (`upsert`/`delete` by key), so an at-least-once retry
-    /// that double-appends after an ambiguous network failure is idempotent for readers.
+    /// no-op. Absolute per-pk envelopes (`upsert`/`delete` by key) let a completed row fold converge
+    /// after an ambiguous retry double-appends, but the wire still exposes repeated older values.
+    /// PG plain delivery uses [`Self::append_plain_reliable`] to filter complete source effects
+    /// against conditional durable receipts instead.
     /// Returns `false` iff the stream is retired (404, 410, or closed).
     ///
     /// Treating a **closed** stream as terminal is sound only for shape streams: their envelopes are
@@ -882,10 +1080,18 @@ impl DsClient {
     /// the shape, so the batch has no reader left. Either way the shape's batch is never silently
     /// abandoned while the shape stays registered and stale.
     pub async fn append_reliable(&self, path: &str, envelopes: &[Envelope]) -> bool {
+        self.append_reliable_batch(path, AppendBatch::new(envelopes, false)).await
+    }
+
+    pub(crate) async fn append_plain_reliable(&self, path: &str, envelopes: &[Envelope]) -> bool {
+        self.append_reliable_batch(path, AppendBatch::new(envelopes, true)).await
+    }
+
+    async fn append_reliable_batch(&self, path: &str, mut batch: AppendBatch<'_>) -> bool {
         let mut attempt = 0u32;
         let mut false_gone = 0u32;
         loop {
-            match self.append_once(path, envelopes).await {
+            match self.append_batch_once(path, &mut batch).await {
                 Ok(_) => return true,
                 Err(AppendError::Gone(status)) => {
                     let verdict = match self.reconcile.get() {
@@ -895,7 +1101,7 @@ impl DsClient {
                     if verdict == GoneVerdict::Discard {
                         tracing::debug!(
                             "append to {path}: stream retired ({status}); discarding {} envelopes",
-                            envelopes.len()
+                            batch.envelopes.len()
                         );
                         return false;
                     }
@@ -912,6 +1118,9 @@ impl DsClient {
                     tokio::time::sleep(backoff).await;
                 }
                 Err(AppendError::Other(e)) => {
+                    if e.is::<SequenceMoved>() {
+                        continue;
+                    }
                     attempt += 1;
                     let backoff =
                         std::time::Duration::from_millis(100u64.saturating_mul(1 << attempt.min(5)).min(2000));
@@ -1010,7 +1219,12 @@ impl DsClient {
         if !(200..300).contains(&res.status) {
             return Err(status_error("HEAD", path, res.status, ""));
         }
-        Ok(Some(StreamHead { next_offset: res.next_offset, closed: res.closed }))
+        Ok(Some(StreamHead {
+            next_offset: res.next_offset,
+            closed: res.closed,
+            sequence: res.sequence,
+            sequence_guard: res.sequence_guard,
+        }))
     }
 
     /// Read from `offset` (use "-1" for the beginning). `live` enables long-poll tailing.
@@ -1233,7 +1447,9 @@ mod tests {
             let result = tokio::time::timeout(Duration::from_secs(2), async {
                 match operation {
                     "ensure" => store.ensure("shape/s1", "application/json").await,
-                    "append" => store.append("shape/s1", "application/json", b"[]".to_vec(), BodyRead::Always).await,
+                    "append" => {
+                        store.append("shape/s1", "application/json", b"[]".to_vec(), BodyRead::Always, None).await
+                    }
                     "read" => store.read("changes/0", "-1", false).await,
                     "head" => store.head("shape/s1").await,
                     "close" => store.close("shape/s1").await,
@@ -1336,6 +1552,131 @@ mod tests {
         assert!(short_timeouts().live_request() > short_timeouts().request);
     }
 
+    struct ReceiptStore {
+        script: std::sync::Mutex<std::collections::VecDeque<(u16, Option<SourcePosition>)>>,
+        requests: std::sync::Mutex<Vec<(AppendSequence, Vec<Envelope>)>>,
+        frontier: std::sync::Mutex<Option<SourcePosition>>,
+        guard: Option<&'static str>,
+    }
+
+    impl ReceiptStore {
+        fn new(script: impl IntoIterator<Item = (u16, Option<SourcePosition>)>) -> Self {
+            Self {
+                script: std::sync::Mutex::new(script.into_iter().collect()),
+                requests: Default::default(),
+                frontier: Default::default(),
+                guard: Some("durable-v1"),
+            }
+        }
+    }
+
+    impl DurableStreamStore for ReceiptStore {
+        fn ensure<'a>(&'a self, _path: &'a str, _content_type: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(201)) })
+        }
+        fn append<'a>(
+            &'a self,
+            _path: &'a str,
+            _content_type: &'a str,
+            body: Vec<u8>,
+            _read: BodyRead,
+            sequence: Option<AppendSequence>,
+        ) -> StoreFuture<'a> {
+            Box::pin(async move {
+                self.requests
+                    .lock()
+                    .unwrap()
+                    .push((sequence.expect("plain writes are conditional"), serde_json::from_slice(&body)?));
+                let (status, frontier) = self.script.lock().unwrap().pop_front().expect("unexpected additional POST");
+                *self.frontier.lock().unwrap() = frontier;
+                let mut res = response(status);
+                res.sequence = frontier.map(SourcePosition::token);
+                res.sequence_guard = self.guard.map(str::to_string);
+                Ok(res)
+            })
+        }
+        fn read<'a>(&'a self, _path: &'a str, _offset: &'a str, _live: bool) -> StoreFuture<'a> {
+            Box::pin(async { panic!("sequence receipts must not scan shape bodies") })
+        }
+        fn head<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async {
+                let mut res = response(200);
+                res.sequence = self.frontier.lock().unwrap().map(SourcePosition::token);
+                res.sequence_guard = self.guard.map(str::to_string);
+                Ok(res)
+            })
+        }
+        fn close<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(204)) })
+        }
+        fn delete<'a>(&'a self, _path: &'a str) -> StoreFuture<'a> {
+            Box::pin(async { Ok(response(204)) })
+        }
+    }
+
+    fn effect(seq: u64, key: &str) -> Envelope {
+        let mut env = replay_envelope(key);
+        env.headers.lsn = Some("200000/abcdef".into());
+        env.headers.seq = Some(seq);
+        env
+    }
+
+    #[tokio::test]
+    async fn plain_receipt_mismatch_refilters_whole_effects_before_retrying() {
+        let first = SourcePosition::from_envelope(&effect(1, "old-key")).unwrap();
+        let last = SourcePosition::from_envelope(&effect(3, "latest")).unwrap();
+        let store = Arc::new(ReceiptStore::new([(412, Some(first)), (503, Some(first)), (204, Some(last))]));
+        let ds = DsClient::with_store("receipt://store".into(), store.clone());
+        let group = [effect(1, "old-key"), effect(1, "new-key"), effect(2, "middle"), effect(3, "latest")];
+        ds.append_plain_retrying("shape/s1", &group, Duration::from_secs(2), &crate::shutdown::ShutdownToken::new())
+            .await
+            .unwrap();
+        let requests = store.requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].1.len(), 4);
+        assert!(requests[0].0.expected.is_none());
+        for (sequence, body) in &requests[1..] {
+            assert_eq!(sequence.expected.as_deref(), Some(first.token().as_str()));
+            assert_eq!(sequence.desired, last.token());
+            assert_eq!(body.iter().map(|env| env.key.as_str()).collect::<Vec<_>>(), ["middle", "latest"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_lost_response_uses_committed_receipt_without_another_body_append() {
+        let last = SourcePosition::from_envelope(&effect(2, "newer")).unwrap();
+        let store = Arc::new(ReceiptStore::new([(503, Some(last)), (412, Some(last))]));
+        let ds = DsClient::with_store("receipt://store".into(), store.clone());
+        assert!(ds.append_plain_reliable("shape/s1", &[effect(1, "older"), effect(2, "newer")]).await);
+        assert_eq!(store.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn plain_output_refuses_unknown_capability_or_malformed_frontier_before_post() {
+        for guard in [None, Some("unknown-version")] {
+            let mut store = ReceiptStore::new([]);
+            store.guard = guard;
+            let store = Arc::new(store);
+            let ds = DsClient::with_store("receipt://store".into(), store.clone());
+            let error = ds
+                .append_plain_retrying(
+                    "shape/s1",
+                    &[effect(1, "key")],
+                    Duration::from_secs(1),
+                    &crate::shutdown::ShutdownToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("sequence guard"), "{error:#}");
+            assert!(store.requests.lock().unwrap().is_empty());
+        }
+        assert!(delivery_frontier(Some("durable-v1"), Some("not-a-source-token")).is_err());
+        assert!(delivery_frontier(Some("volatile-v1"), None).unwrap().is_none());
+        let big = SourcePosition { lsn: u64::MAX, seq: u64::MAX };
+        assert_eq!(SourcePosition::parse(&big.token()).unwrap(), big);
+        assert!(SourcePosition { lsn: big.lsn, seq: 1 }.token() < big.token());
+    }
+
     #[derive(Default)]
     struct ScriptedStore {
         appended: std::sync::Mutex<Vec<(String, String, Vec<u8>)>>,
@@ -1349,6 +1690,8 @@ mod tests {
             next_offset: Some("opaque-provider-token".to_string()),
             up_to_date: true,
             closed: false,
+            sequence: None,
+            sequence_guard: None,
         }
     }
 
@@ -1363,6 +1706,7 @@ mod tests {
             content_type: &'a str,
             body: Vec<u8>,
             _response_body: BodyRead,
+            _sequence: Option<AppendSequence>,
         ) -> StoreFuture<'a> {
             Box::pin(async move {
                 self.appended.lock().unwrap().push((path.to_string(), content_type.to_string(), body));

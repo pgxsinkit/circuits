@@ -156,7 +156,7 @@ pub enum LifeState {
     /// complete; `gate` is the shape's original backfill-snapshot fence (still needed if the shape
     /// went dormant with pre-backfill changes in flight). While dormant the shape **pins** its
     /// resume segment: the segment is not deleted until the shape is reactivated or evicted.
-    Dormant { since: Instant, resume: LogPosition, gate: SnapshotGate },
+    Dormant { since: Instant, resume: LogPosition, gate: SnapshotGate, source_floor: Option<crate::ds::SourcePosition> },
     /// A touch is replaying the change log to bring the shape back. Concurrent touches await
     /// the same outcome, including whether failure permanently retired the shape or is retryable.
     /// `resume` is the position the replay is running FROM: it keeps pinning its change-log segment
@@ -175,7 +175,7 @@ impl HeapSize for LifeState {
     /// owned data.
     fn heap_bytes(&self) -> usize {
         match self {
-            LifeState::Dormant { since: _, resume, gate } => resume.heap_bytes() + gate.heap_bytes(),
+            LifeState::Dormant { resume, gate, .. } => resume.heap_bytes() + gate.heap_bytes(),
             LifeState::Reactivating { resume, .. } => resume.heap_bytes(),
             LifeState::Active | LifeState::Deactivating { .. } => 0,
         }

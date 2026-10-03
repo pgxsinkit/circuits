@@ -2,9 +2,9 @@
 //!
 //! `SIGTERM`/`SIGINT` must not be a kill: the ingestor may be half-way through appending a commit,
 //! the sequencer may be half-way through fanning a transaction out, and the durable checkpoint that
-//! decides where the next boot resumes is written lazily. A hard stop costs a replay (correct, but
-//! wasteful) — and, worse, leaves a long-poll holding the pod's termination grace for its full
-//! window.
+//! decides where the next boot resumes is written lazily. A hard stop costs input replay; plain
+//! Postgres output suppresses already landed effects using its separate delivery proof (ADR-0012).
+//! An unjoined long-poll can also hold the pod's termination grace for its full window.
 //!
 //! So shutdown is **cooperative and ordered**:
 //!
@@ -44,8 +44,8 @@ pub const EXIT_SHUTDOWN_FORCED: i32 = 70;
 
 /// Exit code when every party finished but the durable catalog writer did **not drain**: the final
 /// checkpoint (and anything queued behind it) may not be in storage, so the next boot may replay from
-/// an earlier one. Nothing is corrupted — a replay is de-duplicated — but it is not a clean exit
-/// either, and `0` must keep meaning "everything got to a clean point".
+/// an earlier one. Plain Postgres output retains its separate delivery proof (ADR-0012), but this
+/// is not a clean exit, and `0` must keep meaning "everything got to a clean point".
 pub const EXIT_SHUTDOWN_INCOMPLETE: i32 = 71;
 
 /// How a graceful shutdown ended — what the process exits with.

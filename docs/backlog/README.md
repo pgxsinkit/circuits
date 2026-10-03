@@ -1,14 +1,13 @@
 # Backlog
 
-The documented ledger for work we deliberately are **not** doing now: parked investigations (with
-their evidence), improvement candidates, and escape-hatched designs. Same rules as pgxsinkit's
-`docs/backlog`:
+The documented ledger of known defects, investigations, deferred designs and completed repairs,
+with their evidence retained. Same rules as pgxsinkit's `docs/backlog`:
 
 - One numbered file per item. Entries are **never deleted** — status flips instead, so a symptom
   someone trips over next year finds the prior investigation instead of restarting it.
 - Every item carries a **Reopen trigger**: the concrete event or evidence that justifies picking it
   up. Until that fires, the item is settled — do not re-litigate it from scratch.
-- `Status: resolved` (implemented/fixed, with validation and limits retained) · `parked` (investigated, evidence recorded, waiting on the trigger) · `candidate`
+- `Status: resolved` (implemented/fixed, with validation and limits retained) · `in progress` (selected, with implementation or qualification underway) · `parked` (investigated, evidence recorded, waiting on the trigger) · `candidate`
   (improvement we would take, unscheduled) · `promoted → adr/00xx` (one-line pointer to the ADR that
   superseded it) · `dropped` (decided against without implementation; keep the why). Earlier entries used `dropped (fixed)` for completed work; those are now `resolved`.
 - This directory is an engineering ledger, not user documentation.
@@ -23,7 +22,7 @@ This assessment uses the entries' recorded evidence, with source spot checks for
 
 | Entries          | Assessment                                                  | Reason / next decision                                                                                                                                                                                                                                            |
 | ---------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 0011             | Review correctness impact before more optional fork work    | Hard-stop replay is reproduced; final row convergence does not remove transient backward/forward updates. Check the actual downstream reader's replay/order contract before selecting a repair.                                                                   |
+| 0011             | Resolved for plain Postgres shapes                          | Durable delivery frontiers and original seed/registration coverage passed real restart, full engine and protocol qualification. Other output modes remain in 0034.                                                                                                |
 | 0010             | Conditional high for a live consumer of this harness client | Direct terminal-read recovery still needs qualification; current lease renewal already rebinds a changed handle. Production pgxsinkit uses a separate reader according to the entry. Verify the remaining gap and consumer exposure before prioritizing a repair. |
 | 0001             | Medium operational; bounded repair candidate                | A real silent-refusal incident hid an untracked table for over an hour. Correct responses do not make missing diagnostics harmless. Recheck current refusal paths and exclude already fixed pool-warning work.                                                    |
 | 0005             | Medium deployment constraint                                | New/re-created tables require restart; choose automatic discovery or explicit reload only when the migration/restart contract requires it.                                                                                                                        |
@@ -35,27 +34,27 @@ This assessment uses the entries' recorded evidence, with source spot checks for
 | 0004             | Fixed                                                       | Retained historical test-race record.                                                                                                                                                                                                                             |
 | 0012–0014        | Parked or trigger-dependent                                 | Dependency compatibility and load-sensitive test leads retain their recorded evidence and reopen conditions.                                                                                                                                                      |
 
-For the native production read path, assess 0011's downstream impact before treating 0019's fork-only crash recovery as next by default. Small operator-facing repairs in 0001 and 0015 can be selected independently. A conditional harness-client issue should rise immediately if that client becomes a live consumer; entry age alone is neither urgency nor authorization.
+With plain Postgres delivery in 0011 resolved, 0001 is the strongest recorded bounded operational repair candidate: a confirmed silent-refusal incident remains relevant. Optional 0019 fork recovery is conditional on fork workloads. Unsequenced-output leads in 0034 and producer-only identity in 0033 require fresh qualification; neither is a reproduced native defect. A conditional harness-client issue should rise immediately if that client becomes a live consumer. Entry age alone is neither urgency nor authorization.
 
 ### Upstream audit entries
 
 The upstream-audit backlog resumed on 2026-10-03 with fixes for 0017, 0018, 0020, 0021, 0022, 0029, 0030 and 0031. Urgency describes
 the remaining local surface; parked leads need evidence before they become defect repairs.
 
-| Entries    | Urgency                      | Reason                                                                                                                            |
-| ---------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| 0017       | Fixed                        | Shared pending memory/spill budget, replay admission and a fixed endpoint; total process RSS and disk capacity remain separate.   |
-| 0018       | Fixed                        | Reference-only parent metadata writes, conservative failed-write pins and owned release retries.                                  |
-| 0019       | Conditional medium           | Fork graph crash recovery remains separate; the engine's ordinary read path does not use DS forks.                                |
-| 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.             |
-| 0021       | Fixed                        | Sticky DELETE observation ends inline and reactor SSE, including pending reads and backpressured sockets, without claiming close. |
-| 0023       | Low                          | Conservative dormant-age semantics; no production retention incident was reproduced.                                              |
-| 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
-| 0029       | Fixed                        | Committed metadata capture, durable close retries and owned completion of cancelled staged POST/PUT bodies.                       |
-| 0030       | Fixed                        | Accepted checkpoint tail capture and release recovery guards for false proofs and first/later WAL gaps.                           |
-| 0031       | Fixed                        | Coherent runtime cache/watch publication prevents stale callbacks from hiding newer bytes and durable EOF.                        |
-| 0032       | Parked; unproved             | One CLI startup connection failed after readiness; bounded reruns passed, cause unknown.                                          |
-| 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                              |
+| Entries    | Urgency                      | Reason                                                                                                                                    |
+| ---------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| 0017       | Fixed                        | Shared pending memory/spill budget, replay admission and a fixed endpoint; total process RSS and disk capacity remain separate.           |
+| 0018       | Fixed                        | Reference-only parent metadata writes, conservative failed-write pins and owned release retries.                                          |
+| 0019       | Conditional medium           | Fork graph crash recovery remains separate; the engine's ordinary read path does not use DS forks.                                        |
+| 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.                     |
+| 0021       | Fixed                        | Sticky DELETE observation ends inline and reactor SSE, including pending reads and backpressured sockets, without claiming close.         |
+| 0023       | Low                          | Conservative dormant-age semantics; no production retention incident was reproduced.                                                      |
+| 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                                |
+| 0029       | Fixed                        | Committed metadata capture, durable close retries and owned completion of cancelled staged POST/PUT bodies.                               |
+| 0030       | Fixed                        | Accepted checkpoint tail capture and release recovery guards for false proofs and first/later WAL gaps.                                   |
+| 0031       | Fixed                        | Coherent runtime cache/watch publication prevents stale callbacks from hiding newer bytes and durable EOF.                                |
+| 0032       | Parked; unproved             | Two CLI startup connections failed after readiness; child/socket diagnostics added, five further full-file runs passed, cause unresolved. |
+| 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                                      |
 
 - [0001 — A refused shape create is not logged](0001-refused-shape-create-not-logged.md) — candidate
 - [0002 — The harness client retries a dead subscription's renewal at its floor cadence, logging a non-JSON body](0002-harness-client-renewal-retry-storm.md) — candidate
@@ -67,7 +66,7 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0008 — `CIRCUITS_DS_URL` is not validated at resolve](0008-ds-url-not-validated-and-prometheus-port-ignored.md) — candidate
 - [0009 — A Postgres error with no SQLSTATE and no io source retries forever at boot](0009-no-sqlstate-postgres-error-retries-forever.md) — candidate
 - [0010 — The harness client does not re-subscribe when its stream is retired](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) — candidate
-- [0011 — A forced exit replays the checkpoint window onto shape streams](0011-a-forced-exit-replays-the-checkpoint-window.md) — candidate
+- [0011 — A forced exit replays the checkpoint window onto shape streams](0011-a-forced-exit-replays-the-checkpoint-window.md) — resolved for plain Postgres shapes (other modes: 0034)
 - [0012 — vitest is held at 4.x by the protocol suite](0012-vitest-held-at-4-by-the-protocol-suite.md) — parked
 - [0013 — The change-log "skips the envelopes a migration outran" test times out under load](0013-fail-closed-skip-test-times-out-under-load.md) — candidate
 - [0014 — The log server's second-server test failed once under heavy load](0014-log-server-lock-test-failed-once-under-load.md) — parked
@@ -89,6 +88,8 @@ the remaining local surface; parked leads need evidence before they become defec
 - [0030 — Checkpoint tail capture can cross a rejected append](0030-checkpoint-tail-can-cross-a-rejected-append.md) — resolved
 - [0031 — Tail watch publication can regress after close](0031-tail-watch-publication-can-regress-after-close.md) — resolved
 - [0032 — CLI readiness accepted before the first PUT connection was refused](0032-cli-readiness-accepted-before-first-connection-refused.md) — parked
+- [0033 — Producer deduplication identity can lag durable bytes](0033-producer-deduplication-identity-can-lag-durable-bytes.md) — candidate
+- [0034 — Unsequenced output needs separate restart qualification](0034-unsequenced-output-needs-separate-restart-qualification.md) — parked
 
 ## Not carried over
 

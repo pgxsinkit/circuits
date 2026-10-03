@@ -5,8 +5,8 @@ use super::*;
 
 /// The engine's durable **shape catalog**: an append-only event stream replayed at boot so a
 /// restart re-registers every shape itself instead of requiring a client re-registration storm.
-/// Plain/routed shapes resume with passthrough gates (the change log replays everything after the
-/// persisted offset; re-emission across the crash window is idempotent absolute upserts);
+/// PG plain/routed shapes retain their original seed gate and registration source floor; durable
+/// output receipts suppress effects already delivered beyond the lazy global checkpoint.
 /// aggregates re-seed their fold from a fresh Postgres snapshot (their fresh gate then skips the
 /// replayed history). Subquery shapes are NOT restorable without persisted inner-node state (a
 /// fresh-seeded node cannot detect downtime flips, which would leave stale move-outs forever) —
@@ -17,6 +17,25 @@ use super::*;
 /// DEFINITIVE answer about one shape — its table moved or is gone, its stream is missing or closed,
 /// it is a subquery shape — retires that shape, and the rest restore around it.
 pub(crate) const CATALOG_STREAM: &str = "meta/catalog";
+pub(crate) const PLAIN_DELIVERY_FORMAT: u32 = 1;
+
+#[derive(Debug)]
+pub(crate) struct CatalogPlainDeliveryFormat {
+    shape: String,
+    found: Option<u32>,
+}
+
+impl std::fmt::Display for CatalogPlainDeliveryFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "catalog plain delivery format is unsupported for shape {}: {:?}; original seed/source coverage cannot be guessed",
+            self.shape, self.found
+        )
+    }
+}
+
+impl std::error::Error for CatalogPlainDeliveryFormat {}
 
 /// One catalog event. `Offset` checkpoints the sequencer's processed change-log position (the
 /// replay start after a restart), appended at most every ~2s.
@@ -37,6 +56,13 @@ pub(crate) enum CatalogEvent {
         sig: Option<String>,
         subscription: String,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivery_format: Option<u32>,
+    },
+    /// Original plain seed coverage, durable before create ACK, even for an empty snapshot.
+    Seeded {
+        id: String,
+        seed: PlainSeed,
     },
     /// A subscription joined a shared feed, or RENEWED its lease (ADR-0008): the same subscription
     /// id twice is one claim, and the second one only moves `at`. The fold keeps a SET, so a
@@ -486,6 +512,7 @@ fn refuse(ev: &CatalogEvent, e: &anyhow::Error) -> ! {
 fn event_kind(ev: &CatalogEvent) -> &'static str {
     match ev {
         CatalogEvent::Created { .. } => "created",
+        CatalogEvent::Seeded { .. } => "seeded",
         CatalogEvent::Joined { .. } => "joined",
         CatalogEvent::Left { .. } => "left",
         CatalogEvent::Dormant { .. } => "dormant",
@@ -728,6 +755,8 @@ type Restored = (
     Option<String>,
     std::collections::BTreeMap<String, u64>,
     Option<(LogPosition, crate::pg::SnapshotGate)>,
+    Option<u32>,
+    Option<PlainSeed>,
 );
 
 /// The durable catalog, folded — everything a boot needs before it decides what to *do* with it.
@@ -810,7 +839,7 @@ impl CatalogFold {
     /// epoch and the offset, remove-on-drop for the shapes — are unit-testable.
     fn apply(&mut self, ev: CatalogEvent) {
         match ev {
-            CatalogEvent::Created { rec, sig, subscription, at } => {
+            CatalogEvent::Created { rec, sig, subscription, at, delivery_format } => {
                 // Every create moves the id high-water mark, and nothing ever moves it back (see
                 // `max_shape_id`). `max`, not "the last one wins": the engine mints ids
                 // monotonically from one counter, so the log is monotonic anyway, and taking the
@@ -818,7 +847,15 @@ impl CatalogFold {
                 if let Some(num) = shape_id_num(&rec.id) {
                     self.max_shape_id = Some(self.max_shape_id.map_or(num, |cur| cur.max(num)));
                 }
-                self.recs.insert(rec.id.clone(), (*rec, sig, [(subscription, at)].into_iter().collect(), None));
+                self.recs.insert(
+                    rec.id.clone(),
+                    (*rec, sig, [(subscription, at)].into_iter().collect(), None, delivery_format, None),
+                );
+            }
+            CatalogEvent::Seeded { id, seed } => {
+                if let Some(e) = self.recs.get_mut(&id) {
+                    e.5 = Some(seed);
+                }
             }
             // A join and a lease RENEWAL are the same record: insert wins for a new id, and only
             // moves the lease for one already held (ADR-0008). The restored `at` is what stops a
@@ -965,7 +1002,39 @@ impl Engine {
                     return Err(anyhow::Error::new(CatalogPredatesSubscriptions { detail }));
                 }
                 let eid = ev["eid"].as_str().unwrap_or_default().to_string();
-                let Ok(ev) = serde_json::from_value::<CatalogEvent>(ev) else { continue };
+                let strict_seed = ev["t"] == "seeded";
+                if strict_seed {
+                    // These fields are mandatory in the modern witness even though their shared
+                    // types accept missing fields for legacy records. An explicit null floor is
+                    // the valid no-history registration boundary; omission is not that proof.
+                    let id = ev["id"].as_str().unwrap_or("<unknown>");
+                    for field in ["/seed/source_floor", "/seed/gate/horizon"] {
+                        if ev.pointer(field).is_none() {
+                            bail!(
+                                "malformed Seeded catalog record for shape {id}: missing {field}; original seed/source coverage cannot be guessed"
+                            );
+                        }
+                    }
+                }
+                // A modern Created promises original seed/source coverage. Skipping a malformed
+                // one would erase an acknowledged shape before apply_catalog can refuse its format.
+                let strict_created =
+                    ev["t"] == "created" && ev.get("delivery_format").is_some_and(|format| !format.is_null());
+                let strict_context = if strict_created {
+                    let id = ev.pointer("/rec/id").and_then(serde_json::Value::as_str).unwrap_or("<unknown>");
+                    format!(
+                        "malformed modern Created catalog record for shape {id}: original seed/source coverage cannot be guessed"
+                    )
+                } else {
+                    "malformed Seeded catalog record: original seed/source coverage cannot be guessed".to_string()
+                };
+                let ev = match serde_json::from_value::<CatalogEvent>(ev) {
+                    Ok(ev) => ev,
+                    Err(error) if strict_seed || strict_created => {
+                        return Err(anyhow::Error::new(error).context(strict_context));
+                    }
+                    Err(_) => continue,
+                };
                 fold.apply_once(&eid, ev);
             }
             match next {
@@ -1043,7 +1112,7 @@ impl Engine {
         if mode == RestoreMode::Park {
             // The epoch broke: hold the records, touch nothing else (see `RestoreMode::Park`).
             let mut st = self.state.lock().await;
-            for (id, (rec, _, _, _)) in recs {
+            for (id, (rec, _, _, _, _, _)) in recs {
                 st.shapes.insert(id, rec); // `next_shape_id` was moved past every minted id above
                 // No share entries and therefore no subscriptions: a parked epoch's shapes exist
                 // only to be retired, and nothing may join or renew one.
@@ -1064,6 +1133,21 @@ impl Engine {
         let mut retire: Vec<Unrestorable> = Vec::new();
         let mut candidates: Vec<(String, Restored)> = Vec::with_capacity(recs.len());
         for (id, restored) in recs {
+            if self.pg_url.is_some() && !restored.0.is_subquery && restored.0.aggregate.is_none() {
+                if restored.4 != Some(PLAIN_DELIVERY_FORMAT) {
+                    return Err(CatalogPlainDeliveryFormat { shape: id, found: restored.4 }.into());
+                }
+                if restored.5.is_none() {
+                    retire.push(Unrestorable {
+                        table: restored.0.table.clone(),
+                        stream_path: restored.0.stream_path.clone(),
+                        id,
+                        reason: crate::metrics::RestoreRetireReason::IncompleteCreate,
+                        detail: "creation never durably completed its Seeded witness".into(),
+                    });
+                    continue;
+                }
+            }
             // (`next_shape_id` was moved past every id the log ever minted, above.)
             match unrestorable(&restored.0, compiled) {
                 Some((reason, detail)) => retire.push(Unrestorable {
@@ -1097,7 +1181,12 @@ impl Engine {
                 Some(h) if h.closed => {
                     Some((crate::metrics::RestoreRetireReason::StreamClosed, "its stream is closed to appends"))
                 }
-                Some(_) => None,
+                Some(h) => {
+                    if self.pg_url.is_some() && !rec.is_subquery && rec.aggregate.is_none() {
+                        h.plain_frontier()?;
+                    }
+                    None
+                }
             };
             match gone {
                 Some((reason, detail)) => retire.push(Unrestorable {
@@ -1139,10 +1228,10 @@ impl Engine {
         // 5. Install records + shares + lifecycles. From here to the end it is all or nothing: a
         // shape that fails to resume undoes every one of these (`roll_back_restore`).
         let installed: Vec<String> = install.iter().map(|(id, _)| id.clone()).collect();
-        let mut resume: Vec<ShapeRecord> = Vec::new();
+        let mut resume: Vec<(ShapeRecord, Option<PlainSeed>)> = Vec::new();
         let cmd_tx = {
             let mut st = self.state.lock().await;
-            for (id, (rec, sig, subs, dormant)) in install {
+            for (id, (rec, sig, subs, dormant, _, seed)) in install {
                 st.shapes.insert(id.clone(), rec.clone());
                 if let Some(sig) = sig {
                     // Restored feeds are live immediately (their streams already hold data).
@@ -1163,17 +1252,23 @@ impl Engine {
                     // no replay at boot — the first touch reactivates it from its own resume
                     // offset. (Dormancy age restarts at boot; the TTL clock is conservative.)
                     Some((resume_at, gate)) => {
+                        let gate = seed.as_ref().map_or(gate, |seed| seed.gate.clone());
                         self.lives.lock().unwrap().insert(
                             id.clone(),
                             ShapeLife {
                                 last_read: std::time::Instant::now(),
-                                state: LifeState::Dormant { since: std::time::Instant::now(), resume: resume_at, gate },
+                                state: LifeState::Dormant {
+                                    since: std::time::Instant::now(),
+                                    resume: resume_at,
+                                    gate,
+                                    source_floor: seed.as_ref().and_then(|s| s.source_floor),
+                                },
                             },
                         );
                     }
                     None => {
                         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
-                        resume.push(rec);
+                        resume.push((rec, seed));
                     }
                 }
             }
@@ -1189,17 +1284,17 @@ impl Engine {
             cmd_tx
         };
 
-        // 6. Re-register with the sequencer. Plain/routed shapes resume without a backfill and
-        // with a passthrough gate (`changes_only = true` path): everything after the restored
-        // offset replays, and re-emission across the crash window is idempotent. Aggregates
+        // 6. Re-register with the sequencer. PG plain/routed shapes resume without a backfill,
+        // preserving original seed coverage; conditional appends filter already delivered effects.
+        // Aggregates
         // re-seed their fold from a fresh snapshot (fresh gate skips the replayed history).
         //
         // A failure here is never a reason to drop the shape: every definitive reason was settled
         // above, so what is left is Postgres or storage having a moment (or a record the engine
         // cannot compile, which no amount of dropping would explain). The whole restore is undone
         // and the error goes to the boot, typed, for its retry-or-refuse decision.
-        for rec in &resume {
-            if let Err(e) = self.resume_shape(&cmd_tx, rec, compiled).await {
+        for (rec, seed) in &resume {
+            if let Err(e) = self.resume_shape(&cmd_tx, rec, compiled, seed.clone()).await {
                 tracing::error!("restore: shape {} failed to resume ({e:#}); undoing the whole restore", rec.id);
                 self.roll_back_restore(&installed, &cmd_tx).await;
                 // Storage confirming the stream gone is not a failure of THIS shape's resume to wait
@@ -1314,6 +1409,7 @@ impl Engine {
         cmd_tx: &mpsc::UnboundedSender<SequencerCmd>,
         rec: &ShapeRecord,
         compiled: &HashMap<TableRef, TableSchema>,
+        seed: Option<PlainSeed>,
     ) -> Result<()> {
         let ts = compiled.get(&rec.table).with_context(|| format!("table '{}' no longer exists", rec.table))?;
         let out_cols: Option<Arc<Vec<usize>>> = match &rec.columns {
@@ -1400,8 +1496,10 @@ impl Engine {
             aggregate,
             &self.shutdown_token(),
             ack_rx,
+            seed,
         )
         .await
+        .map(|_| ())
     }
 }
 
@@ -1525,7 +1623,14 @@ pub(crate) mod testing {
                                     return axum::http::StatusCode::NOT_FOUND.into_response();
                                 }
                                 let closed = if st.closed.lock().unwrap().contains(&path) { "true" } else { "false" };
-                                (axum::http::StatusCode::OK, [("stream-next-offset", "0"), ("stream-closed", closed)])
+                                (
+                                    axum::http::StatusCode::OK,
+                                    [
+                                        ("stream-next-offset", "0"),
+                                        ("stream-closed", closed),
+                                        ("stream-seq-guard", "durable-v1"),
+                                    ],
+                                )
                                     .into_response()
                             },
                         )
@@ -2408,6 +2513,7 @@ mod tests {
         ev["rec"]["stream_path"] = serde_json::json!(format!("shape/{id}"));
         ev["sig"] = serde_json::json!(format!("sig-{id}"));
         ev["subscription"] = serde_json::json!(format!("sub-{id}"));
+        ev["delivery_format"] = serde_json::json!(PLAIN_DELIVERY_FORMAT);
         serde_json::from_value(ev).unwrap()
     }
 
@@ -2426,6 +2532,146 @@ mod tests {
     fn catalog(mut events: Vec<CatalogEvent>) -> CatalogFold {
         events.push(CatalogEvent::Offset { pos: pos(0, "10"), highwater: None });
         fold_of(events)
+    }
+
+    #[test]
+    fn plain_seed_witness_retains_snapshot_and_source_floor_across_dormancy() {
+        let gate = crate::pg::SnapshotGate::parse_with_horizon("5:9:7", "0/20", "0/30");
+        let seed = PlainSeed { gate: gate.clone(), source_floor: Some(crate::ds::SourcePosition { lsn: 16, seq: 3 }) };
+        let encoded = serde_json::to_value(CatalogEvent::Seeded { id: "s1".into(), seed: seed.clone() }).unwrap();
+        let decoded = serde_json::from_value(encoded).unwrap();
+        let fold = catalog(vec![
+            shape("s1", "public.users"),
+            decoded,
+            dormant("s1"),
+            CatalogEvent::Reactivated { id: "s1".into() },
+        ]);
+        let restored = &fold.recs["s1"];
+        assert!(restored.3.is_none());
+        assert_eq!(restored.4, Some(PLAIN_DELIVERY_FORMAT));
+        let recovered = restored.5.as_ref().unwrap();
+        assert_eq!(serde_json::to_value(&recovered.gate).unwrap(), serde_json::to_value(&gate).unwrap());
+        assert_eq!(recovered.source_floor, seed.source_floor);
+        assert!(recovered.gate.should_skip(0x20, Some(6)));
+        assert!(!recovered.gate.should_skip(0x20, Some(7)));
+        assert!(!recovered.gate.should_skip(0x30, Some(6)), "the WAL insertion horizon survives serialization");
+    }
+
+    #[tokio::test]
+    async fn legacy_pg_plain_catalog_refuses_before_stream_checks_or_registration() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".into());
+        let mut fold = catalog(vec![shape("s1", "public.users")]);
+        fold.recs.get_mut("s1").unwrap().4 = None;
+        let error = engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.unwrap_err();
+        assert!(error.is::<CatalogPlainDeliveryFormat>(), "{error:#}");
+        assert_eq!(crate::pg::boot_disposition(&error), crate::pg::BootFailure::Fatal);
+        assert_eq!(server.heads() + server.deletes(), 0);
+        assert_nothing_installed(&engine).await;
+    }
+
+    async fn assert_catalog_fold_refuses(mut malformed: serde_json::Value, expected_context: &str) {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".into());
+        let mut healthy = serde_json::to_value(shape("s1", "public.users")).unwrap();
+        healthy["eid"] = serde_json::json!("healthy-created");
+        malformed["eid"] = serde_json::json!("malformed-record");
+        server.serve_page(CATALOG_STREAM, serde_json::json!([healthy, malformed]));
+
+        for _ in 0..2 {
+            let error = match engine.fold_catalog().await {
+                Err(error) => error,
+                Ok(fold) => {
+                    panic!("a malformed proof record silently returned a partial fold of {} shapes", fold.recs.len())
+                }
+            };
+            assert!(format!("{error:#}").contains(expected_context), "{error:#}");
+            assert_eq!(crate::pg::boot_disposition(&error), crate::pg::BootFailure::Fatal);
+        }
+        assert_eq!(server.heads() + server.deletes() + server.closes(), 0);
+        assert!(server.catalog_events().is_empty(), "a refusing fold must not rewrite the catalog");
+        assert_nothing_installed(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn modern_created_malformed_delivery_format_refuses_catalog_fold() {
+        for format in [serde_json::json!("v1"), serde_json::json!({}), serde_json::json!(u64::MAX)] {
+            let mut malformed = serde_json::to_value(shape("s2", "public.users")).unwrap();
+            malformed["delivery_format"] = format;
+            assert_catalog_fold_refuses(malformed, "malformed modern Created catalog record for shape s2").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_created_malformed_record_refuses_catalog_fold() {
+        let mut malformed = serde_json::to_value(shape("s2", "public.users")).unwrap();
+        malformed["rec"].as_object_mut().unwrap().remove("stream_path");
+        assert_catalog_fold_refuses(malformed, "malformed modern Created catalog record for shape s2").await;
+    }
+
+    fn raw_seeded() -> serde_json::Value {
+        serde_json::to_value(CatalogEvent::Seeded {
+            id: "s1".into(),
+            seed: PlainSeed { gate: crate::pg::SnapshotGate::passthrough(), source_floor: None },
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn modern_seeded_missing_source_floor_refuses_catalog_fold() {
+        let mut malformed = raw_seeded();
+        malformed["seed"].as_object_mut().unwrap().remove("source_floor");
+        assert_catalog_fold_refuses(
+            malformed,
+            "malformed Seeded catalog record for shape s1: missing /seed/source_floor",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn modern_seeded_missing_horizon_refuses_catalog_fold() {
+        let mut malformed = raw_seeded();
+        malformed["seed"]["gate"].as_object_mut().unwrap().remove("horizon");
+        assert_catalog_fold_refuses(
+            malformed,
+            "malformed Seeded catalog record for shape s1: missing /seed/gate/horizon",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn modern_seeded_explicit_null_floor_and_legacy_dormant_gate_remain_valid() {
+        let server = FakeDs::start().await;
+        let engine = Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".into());
+        let mut created = serde_json::to_value(shape("s1", "public.users")).unwrap();
+        created["eid"] = serde_json::json!("created");
+        let mut seeded = raw_seeded();
+        seeded["eid"] = serde_json::json!("seeded");
+        assert!(seeded["seed"]["source_floor"].is_null());
+        let mut dormant = serde_json::to_value(dormant("s1")).unwrap();
+        dormant["eid"] = serde_json::json!("dormant");
+        dormant["gate"].as_object_mut().unwrap().remove("horizon");
+        server.serve_page(CATALOG_STREAM, serde_json::json!([created, seeded, dormant]));
+        let fold = engine.fold_catalog().await.unwrap();
+        let record = &fold.recs["s1"];
+        assert!(record.5.as_ref().unwrap().source_floor.is_none());
+        assert_eq!(serde_json::to_value(&record.5.as_ref().unwrap().gate).unwrap()["horizon"], 0);
+        assert_eq!(serde_json::to_value(&record.3.as_ref().unwrap().1).unwrap()["horizon"], 0);
+        assert_nothing_installed(&engine).await;
+    }
+
+    #[tokio::test]
+    async fn modern_pg_plain_creation_without_seeded_witness_is_retired() {
+        let server = FakeDs::start().await;
+        let engine = restoring(Engine::new_pg(DsClient::new(server.url()), "postgres://u@127.0.0.1:1/db".into())).await;
+        let fold = catalog(vec![shape("s1", "public.users")]);
+        engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.unwrap();
+        assert!(engine.state.lock().await.shapes.is_empty());
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(5)).await);
+        assert_eq!(server.deletes(), 1);
+        assert_eq!(kinds_for(&server, "s1"), ["dropped", "retired"]);
+        engine.shutdown_token().begin();
+        assert!(engine.shutdown_token().wait_for_parties(std::time::Duration::from_secs(2)).await);
     }
 
     /// The catalog events that landed for one shape, by kind, in order.
@@ -2805,6 +3051,14 @@ mod tests {
             shape("s2", "public.users"),
             dormant("s2"),
             count_of("s3", "public.users"),
+            CatalogEvent::Seeded {
+                id: "s1".into(),
+                seed: PlainSeed { gate: crate::pg::SnapshotGate::passthrough(), source_floor: None },
+            },
+            CatalogEvent::Seeded {
+                id: "s2".into(),
+                seed: PlainSeed { gate: crate::pg::SnapshotGate::passthrough(), source_floor: None },
+            },
         ]);
         let err = engine
             .apply_catalog(fold, &users_compiled(), RestoreMode::Resume)
@@ -2823,7 +3077,19 @@ mod tests {
 
         // The retried boot restores into a clean engine (Postgres is still away, so without the
         // aggregate): a fresh sequencer, and the survivors registered with it.
-        let fold = catalog(vec![shape("s1", "public.users"), shape("s2", "public.users"), dormant("s2")]);
+        let fold = catalog(vec![
+            shape("s1", "public.users"),
+            shape("s2", "public.users"),
+            dormant("s2"),
+            CatalogEvent::Seeded {
+                id: "s1".into(),
+                seed: PlainSeed { gate: crate::pg::SnapshotGate::passthrough(), source_floor: None },
+            },
+            CatalogEvent::Seeded {
+                id: "s2".into(),
+                seed: PlainSeed { gate: crate::pg::SnapshotGate::passthrough(), source_floor: None },
+            },
+        ]);
         engine.apply_catalog(fold, &users_compiled(), RestoreMode::Resume).await.expect("the retry restores");
         assert_eq!(shape_ids(&*engine.state.lock().await), ["s1", "s2"]);
         assert!(engine.table_stats(&users()).await.is_some());

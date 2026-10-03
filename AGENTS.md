@@ -182,8 +182,16 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
 - **Ingest is at-least-once; consumers restore exactly-once effect.** The ingestor stamps
   `(commit lsn, xid, seq)`; the sequencer de-duplicates by `(lsn, seq)`. Aggregates and subquery contributor
   weights are NOT idempotent under duplicates — never bypass the highwater.
+- **Plain Postgres delivery has its own frontier** (ADR-0012). Persist the actual seed snapshot
+  gate and immutable registration highwater before acknowledging creation, including empty and
+  changes-only shapes. Every output member retains its source `(lsn, seq)`; append caps never split
+  one source effect. Use conditional plain append methods and committed storage receipts to filter
+  already delivered effects. This frontier never advances global input processing or replaces the
+  snapshot gate. Aggregates, asynchronous subqueries, library mode and volatile storage retain
+  their explicitly separate contracts.
 - **Live shape appends must not drop, and a registered shape's batch is never advanced past without
-  either LANDING it or RETIRING the shape.** Use `ds.append_reliable` (retry/backoff). A terminal
+  either LANDING it or RETIRING the shape.** Use the reliable append methods (`ds.append_plain_reliable`
+  for plain Postgres output, `ds.append_reliable` otherwise; retry/backoff). A terminal
   answer — 404/410/`stream-closed` — is _reconciled_, never taken on trust: `append_reliable` asks
   the engine (`Engine::reconcile_gone_shape_stream`, installed on the `DsClient` at construction),
   which retries when the shape is still registered AND `HEAD` finds its stream (the 404 was a proxy's,
@@ -281,7 +289,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
   close — a parked dormant shape's stream must stay appendable, and a rolled-back create's stream
   had no subscriber (plain `delete_stream`).
-- **The catalog writer never drops an event, and the two records a client is _promised_ are durable
+- **The catalog writer never drops an event, and the lifecycle records a client is _promised_ are durable
   before it is answered** (`engine/catalog.rs`). A failed append is classified with
   `ds::is_unavailable`: transport/timeout/5xx retries THAT event in place, forever, with backoff
   (100 ms → 5 s) — the queue is ordered and single-consumer, so everything behind it waits, which is
@@ -291,7 +299,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   until the creating PUT has succeeded, an append failure can just as well be "the stream is not
   there yet", so every failure is retried (a permanently-4xx PUT is retried forever, and says so).
   The rule for which records wait: **durable-before-ack = every record a CLIENT is told about** —
-  `Created` and the `Joined` of a NEW claim (`send_durable`, awaited before the HTTP answer, no
+  `Created`, a plain Postgres shape's `Seeded` witness, and the `Joined` of a NEW claim (`send_durable`, awaited before the HTTP answer, no
   timeout — a create while storage is down waits rather than handing back a shape a restart would
   forget), and the `Left`/`Dropped` of a native `DELETE`, whose success response has to mean the
   release or the purge survives a restart even under `CIRCUITS_SHAPE_IDLE_SECS=0`, where no

@@ -346,6 +346,7 @@ impl Engine {
                 sig: feed_sig.clone(),
                 subscription: sub.to_string(),
                 at: crate::changelog::now_secs(),
+                delivery_format: None,
             });
             self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
             self.ensure_retention_sweeper();
@@ -481,6 +482,7 @@ impl Engine {
             sig: feed_sig.clone(),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
+            delivery_format: self.pg_url.is_some().then_some(PLAIN_DELIVERY_FORMAT),
         });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
@@ -500,26 +502,37 @@ impl Engine {
         let outcome = match self.ds.ensure_stream(&rec.stream_path).await {
             Err(e) => Err(e.context("creating shape stream")),
             Ok(()) => {
-                backfill_and_activate(
-                    &self.ds,
-                    &self.pg_url,
-                    &cmd_tx,
-                    &ts,
-                    table,
-                    &id,
-                    &rec.stream_path,
-                    &pred,
-                    out_cols.as_ref(),
-                    changes_only,
-                    None,
-                    &self.shutdown_token(),
-                    ack_rx,
-                )
+                async {
+                    if self.pg_url.is_some() {
+                        let head =
+                            self.ds.head_retrying(&rec.stream_path, JOIN_HEAD_ATTEMPTS).await?.ok_or_else(|| {
+                                anyhow::Error::new(crate::ds::StreamGone { path: rec.stream_path.clone(), status: 404 })
+                            })?;
+                        head.plain_frontier()?;
+                    }
+                    backfill_and_activate(
+                        &self.ds,
+                        &self.pg_url,
+                        &cmd_tx,
+                        &ts,
+                        table,
+                        &id,
+                        &rec.stream_path,
+                        &pred,
+                        out_cols.as_ref(),
+                        changes_only,
+                        None,
+                        &self.shutdown_token(),
+                        ack_rx,
+                        None,
+                    )
+                    .await
+                }
                 .await
             }
         };
         match outcome {
-            Ok(()) => {
+            Ok(seed) => {
                 // The create's work is done, but it may have overlapped a degradation — its stream is
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
@@ -536,6 +549,9 @@ impl Engine {
                 }
                 // Durable before the guard is disarmed — see the subquery path above.
                 created.await;
+                if self.pg_url.is_some() {
+                    self.catalog_tx.send_durable(CatalogEvent::Seeded { id: id.clone(), seed }).await;
+                }
                 // The wait is an interval of its own: re-check before acknowledging.
                 if let Err(e) = self.recheck_after_durability(&id, &rec.stream_path, &gens).await {
                     // `Raced`, not `Failed` — see the subquery path.
@@ -737,6 +753,7 @@ impl Engine {
                     sig: Some(agg_sig.clone()),
                     subscription: sub.to_string(),
                     at: crate::changelog::now_secs(),
+                    delivery_format: None,
                 });
                 self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
                 self.ensure_retention_sweeper();
@@ -837,6 +854,7 @@ impl Engine {
             sig: Some(agg_sig.clone()),
             subscription: sub.to_string(),
             at: crate::changelog::now_secs(),
+            delivery_format: None,
         });
         self.lives.lock().unwrap().insert(id.clone(), ShapeLife::active());
         self.ensure_retention_sweeper();
@@ -861,10 +879,11 @@ impl Engine {
             Some((func, col_idx)),
             &self.shutdown_token(),
             ack_rx,
+            None,
         )
         .await;
         match outcome {
-            Ok(()) => {
+            Ok(_) => {
                 // The create's work is done, but it may have overlapped a degradation — its stream is
                 // then already reaped and the handle would be dead on arrival. Refuse instead of
                 // answering success (see `ensure_create_not_degraded`).
@@ -1172,7 +1191,7 @@ impl Engine {
                             LifeState::Active => Step::Done,
                             LifeState::Deactivating { done } => Step::WaitDeactivate(done.clone()),
                             LifeState::Reactivating { done, .. } => Step::WaitReactivate(done.clone()),
-                            LifeState::Dormant { resume, gate, .. } => {
+                            LifeState::Dormant { resume, gate, source_floor, .. } => {
                                 // Kick off the replay in a DETACHED task: `ensure_active` futures
                                 // are dropped when an HTTP client disconnects, and a cancelled
                                 // in-place replay would strand the shape in `Reactivating`. The
@@ -1181,6 +1200,7 @@ impl Engine {
                                 // concurrent toucher.
                                 let resume = resume.clone();
                                 let gate = gate.clone();
+                                let source_floor = *source_floor;
                                 let (tx, rx) = tokio::sync::watch::channel(None);
                                 let attempt = ReplayAttempt::new();
                                 life.state = LifeState::Reactivating {
@@ -1191,7 +1211,9 @@ impl Engine {
                                 let engine = self.clone();
                                 let id = id.to_string();
                                 tokio::spawn(async move {
-                                    let res = engine.resume_dormant(&id, resume.clone(), gate.clone(), &attempt).await;
+                                    let res = engine
+                                        .resume_dormant(&id, resume.clone(), gate.clone(), source_floor, &attempt)
+                                        .await;
                                     let mut err = match res {
                                         Ok(()) => {
                                             let mut lives = engine.lives.lock().unwrap();
@@ -1249,8 +1271,12 @@ impl Engine {
                                         && matches!(&life.state, LifeState::Reactivating { attempt: current, .. }
                                             if current.id() == attempt.id() && !attempt.is_cancelled())
                                     {
-                                        life.state =
-                                            LifeState::Dormant { since: std::time::Instant::now(), resume, gate };
+                                        life.state = LifeState::Dormant {
+                                            since: std::time::Instant::now(),
+                                            resume,
+                                            gate,
+                                            source_floor,
+                                        };
                                     }
                                     let _ = tx.send(Some(ReactivationOutcome::Retry { cause: format!("{err:#}") }));
                                 });
@@ -1332,6 +1358,7 @@ impl Engine {
         id: &str,
         resume: LogPosition,
         gate: crate::pg::SnapshotGate,
+        source_floor: Option<crate::ds::SourcePosition>,
         attempt: &ReplayAttempt,
     ) -> Result<()> {
         // Admission precedes registration: queued wakes keep their dormant history pin but do
@@ -1374,7 +1401,7 @@ impl Engine {
                 ack: ack_tx,
             })
             .map_err(|_| anyhow::anyhow!("sequencer is gone"))?;
-        let until = attempt.run(&shutdown, ack_rx).await.context("sequencer dropped the begin-shape ack")?;
+        let until = attempt.run(&shutdown, ack_rx).await.context("sequencer dropped the begin-shape ack")?.position;
         // This raw cursor is captured by the same command that installs pending buffering.
         // Changes processed after admission enter that buffer, so replay cannot chase a growing
         // head. A held prefix can overlap the buffer's eventual transaction; plain emission is
@@ -1386,6 +1413,7 @@ impl Engine {
             &pred,
             out_cols.as_ref(),
             &gate,
+            source_floor,
             &rec.stream_path,
             &resume,
             &until,
@@ -1406,6 +1434,7 @@ impl Engine {
                 table: rec.table.clone(),
                 shape_id: id.to_string(),
                 gate,
+                source_floor,
                 // A reactivation replays the change log; there is no backfill to seed a fold from
                 // (and an aggregate never goes dormant, so this is always a plain shape).
                 agg_seed: None,
@@ -1472,9 +1501,13 @@ impl Engine {
         let mut lives = self.lives.lock().unwrap();
         let Some(life) = lives.get_mut(id) else { return Ok(()) };
         match resume {
-            Some((resume, gate)) => {
-                life.state =
-                    LifeState::Dormant { since: std::time::Instant::now(), resume: resume.clone(), gate: gate.clone() };
+            Some((resume, gate, source_floor)) => {
+                life.state = LifeState::Dormant {
+                    since: std::time::Instant::now(),
+                    resume: resume.clone(),
+                    gate: gate.clone(),
+                    source_floor,
+                };
                 drop(lives);
                 self.catalog_tx.send(CatalogEvent::Dormant { id: id.to_string(), resume, gate });
                 metrics().shapes_dormanted.fetch_add(1, Ordering::Relaxed);

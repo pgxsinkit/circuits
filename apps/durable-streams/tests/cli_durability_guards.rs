@@ -27,16 +27,29 @@ fn unused_local_port() -> u16 {
     TcpListener::bind(("127.0.0.1", 0)).expect("reserve test port").local_addr().unwrap().port()
 }
 
-/// Block until `port` accepts a connection, i.e. the server got past every
-/// startup guard and is serving. Panics at the deadline rather than letting a
-/// later assertion fail for the wrong reason.
-fn wait_until_listening(port: u16) {
+/// Block until `port` accepts TCP and the child is still alive. Record probe
+/// endpoints for diagnosis; this does not establish which process accepted it.
+/// Panic at the deadline rather than let a later assertion hide startup failure.
+fn wait_until_listening(port: u16, child: &mut Child) -> (std::net::SocketAddr, std::net::SocketAddr) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match TcpStream::connect(("127.0.0.1", port)) {
-            Ok(_) => return,
+            Ok(socket) => {
+                let endpoints = (socket.local_addr().unwrap(), socket.peer_addr().unwrap());
+                let status = child.try_wait().expect("read readiness child status");
+                assert!(
+                    status.is_none(),
+                    "readiness child {} on port {port} exited: {status:?}; probe {endpoints:?}",
+                    child.id()
+                );
+                return endpoints;
+            }
             Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(error) => panic!("server never listened on {port}: {error}"),
+            Err(error) => panic!(
+                "server child {} never listened on port {port}: {error}; status {:?}",
+                child.id(),
+                child.try_wait()
+            ),
         }
     }
 }
@@ -162,7 +175,7 @@ fn a_second_server_on_the_same_data_dir_is_refused() {
     let dir = temp_data_dir("data-dir-lock");
 
     let owner_port = unused_local_port();
-    let owner = ServerUnderTest {
+    let mut owner = ServerUnderTest {
         child: server()
             .args(["--durability", "memory", "--port"])
             .arg(owner_port.to_string())
@@ -176,7 +189,7 @@ fn a_second_server_on_the_same_data_dir_is_refused() {
     };
     // The lock is taken during startup, so the contention assertion is only
     // meaningful once the first server is actually up.
-    wait_until_listening(owner_port);
+    wait_until_listening(owner_port, &mut owner.child);
 
     // Spawned with a bounded wait rather than `output()`: if the lock regresses, the second
     // server starts and serves forever, and `output()` would block on its stderr until the CI
@@ -225,24 +238,38 @@ fn direct_delete_terminates_a_waiting_long_poll_over_http() {
     }
     let dir = temp_data_dir("delete-long-poll");
     let port = unused_local_port();
-    let server = ServerUnderTest {
+    let mut server = ServerUnderTest {
         child: server()
             .args(["--durability", "memory", "--port"])
             .arg(port.to_string())
             .arg("--data-dir")
             .arg(dir.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
         dir,
     };
-    wait_until_listening(port);
-    assert!(request(port, "PUT", "/waiter", None).unwrap().starts_with("HTTP/1.1 201"));
+    let probe = wait_until_listening(port, &mut server.child);
+    let response = request(port, "PUT", "/waiter", None).unwrap_or_else(|error| {
+        panic!(
+            "first PUT failed: {error}; child {} port {port} status {:?}; readiness local/peer {probe:?}",
+            server.child.id(),
+            server.child.try_wait()
+        )
+    });
+    assert!(response.starts_with("HTTP/1.1 201"), "unexpected first PUT response: {response}");
     let (written, ready) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || request(port, "GET", "/waiter?offset=now&live=long-poll", Some(written)));
     ready.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-    assert!(request(port, "DELETE", "/waiter", None).unwrap().starts_with("HTTP/1.1 204"));
+    let response = request(port, "DELETE", "/waiter", None).unwrap_or_else(|error| {
+        panic!(
+            "DELETE failed: {error}; child {} port {port} status {:?}; readiness local/peer {probe:?}",
+            server.child.id(),
+            server.child.try_wait()
+        )
+    });
+    assert!(response.starts_with("HTTP/1.1 204"), "unexpected DELETE response: {response}");
     let response = reader.join().unwrap().expect("DELETE must wake the wire reader before its socket timeout");
     // The server can parse the already-written GET after DELETE and answer
     // 404; an admitted waiter answers 410. Deterministic handler tests verify

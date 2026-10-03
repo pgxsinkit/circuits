@@ -69,7 +69,7 @@ The dotted edges are the only coupling between writers and readers: publishing t
 
 `handlers::handle_append` (src/handlers.rs):
 
-1. **Parse idempotency headers** — `Producer-Id` / `Producer-Epoch` / `Stream-Seq`. A duplicate `(producer, epoch, seq)` is acknowledged without re-appending only when committed producer state proves it completed. A duplicate of a pending append returns retryable 503; its writer reservation is not durability proof. Duplicate response headers report committed sequence state.
+1. **Parse idempotency headers** — `Producer-Id` / `Producer-Epoch` / `Stream-Seq`. A duplicate `(producer, epoch, seq)` is acknowledged without re-appending only when committed producer state proves it completed. A pending producer duplicate returns retryable 503. An ordinary `Stream-Seq` conflict waits outside the append lock for committed metadata promotion, then rechecks admission before reporting 409; its writer reservation is not durability proof. Conditional sequence requests retain retryable 503 for pending durability. Duplicate response headers report committed sequence state.
 2. **`encode_wire`** — turn the request body into the contiguous wire representation. In JSON mode this flattens arrays and appends the `,` delimiter so the on-disk bytes are already a valid stream fragment.
 3. **Acquire the per-stream appender mutex** (`AsyncMutex<Appender>`). It orders that stream's file writes and WAL staging, and releases before the durability wait and reader publication.
 4. **`write_wire`** — `write_all` the bytes to the data file (they land in the OS page cache immediately) and advance the _writer_ tail (`Shared.tail`) under a short `RwLock` write. The reader-observable tail does **not** move yet.
@@ -80,6 +80,16 @@ Visibility is gated on durability (PROTOCOL.md §4.1): a live reader never obser
 Runtime cache and notification publication share the watch channel's existing value write lock (`send_if_modified`). A delayed append whose bytes are no newer, or whose open candidate follows a published close, changes neither the cache nor the notification. An accepted append installs its cache before updating the watch and waking readers. Durable close uses the same boundary, preserves the cache, keeps the byte frontier monotonic and makes closure sticky. A higher closed candidate remains valid for the body of an initially closed PUT. Shared-state promotion precedes this boundary without nesting its lock; reactor wake follows publication lock release. There is no additional per-stream mutex or map. This fixes out-of-order callbacks affecting inline SSE and prompt long-poll delivery; reproduction and qualification are recorded in [0031](../../docs/backlog/0031-tail-watch-publication-can-regress-after-close.md).
 
 Each producer entry has a writer value and an optional committed value, sharing one producer key and map allocation. Writer ordering still rejects stale epochs and sequence gaps. After durability, ordinary appends promote their own producer and writer-sequence deltas monotonically; a later failed stage rolls back writer state without undoing an earlier callback's promotion. General metadata writers capture only committed producer/sequence values and reader-visible closure, so a sweep, checkpoint or tier manifest write cannot persist a rejected append's speculative state. This adds committed values per producer; it is not a bound on producer cardinality or process memory.
+
+`Stream-Seq` body appends additionally retain sequence identity with their bytes in WAL kind 5.
+HEAD exposes the committed sequence and durable tail from one shared-state read. A committed
+sequence conflict returns 409 with that receipt; a tentative-only conflict returns retryable 503.
+The optional `Stream-Expected-Seq` request header is a JSON string or `null` (no committed
+sequence), and requires `Stream-Seq`. It is checked under the appender lock before mutation:
+pending sequence durability or closure returns 503, while a different committed frontier returns
+412 with its receipt. Conditional requests cannot combine producer headers. The guard is
+advertised as `Stream-Seq-Guard: durable-v1` in WAL mode or `volatile-v1` in memory mode. An absent
+guard is not proof of an absent frontier. Expected `null` does not mean the stream has no seed bytes.
 
 Close persists its validated candidate over that committed snapshot behind the metadata writer barrier. The owned blocking worker retains stream-operation admission through sidecar fsync/rename/directory fsync, in-memory promotion and reader notification, even if its awaiting caller is cancelled. Matching retries preserve the original close candidate. A close waiting on earlier unpublished bytes returns retryable 503 rather than exposing EOF ahead of them. Storage failure before confirmed durability exposes no successful close reply or reader EOF; failure after rename is uncertain and may recover closed. A later general writer cannot reopen a successfully committed close.
 
@@ -114,6 +124,19 @@ Every append is written to the per-stream data file (page cache, no hot fsync �
 Per-stream files are `fdatasync`'d off the ack path at a periodic **checkpoint**, after which the bounded WAL is recycled. On boot, recovery replays the WAL from its oldest retained segment, reconciles each stream's durable tail (torn-tail repair via truncation + `fdatasync`), then resets the WAL for fresh appends.
 
 Checkpoint captures an accepted writer tail and its paired file handle behind a short per-stream synchronous boundary. Initial PUT and POST hold that boundary from the data write through successful WAL staging or complete rollback; it never spans an await. Checkpoint releases it before filesystem barriers and proof persistence. It does not acquire the async appender from its blocking worker: compaction can retain that appender while awaiting work queued on the same bounded blocking pool. The WAL floor is sampled before dirty-epoch drain, and registration still precedes staging. Capturing the reader's `durable_tail` would be unsafe because WAL durability can precede its publication; checkpoint must preserve those staged bytes before recycling their records.
+
+That captured prefix also includes the last successfully staged **body** sequence, independently
+of callback promotion and empty-close intent. The file barrier certifies the captured bytes even
+when staging ran ahead of the sampled WAL floor; the cumulative tail proof persists their paired
+sequence before recycling. Recovery validates every sequenced wrapper before repair, counts only
+wire bytes toward stream offsets, and restores sequence identity even for records below a compacted
+file base. Stronger sequence proof is transferred durably into the sidecar before WAL/proof reset.
+Producer counters retain their separate existing durability limits.
+
+The new reader accepts old ordinary append records and two-column tail proofs. A data directory
+containing kind 5 records or sequence proofs must not be opened with an older binary: older readers
+may treat the new record as a torn tail and discard its proof. Downgrade requires a compatible
+backup or a separately prepared data directory; rolling back only the executable is unsupported.
 
 Recovery tracks actual physical logical EOF once per replay-touched stream, checking every in-range record before its positioned write. Overlap and adjacent extension are allowed; a record starting beyond physical EOF refuses startup before creating a hole. After retained WAL has repaired the file, a durable proof beyond the available live suffix also refuses startup before publication or metadata strengthening. Both checks run in release builds and retain the WAL for repair. Earlier legitimate writes and healthy shards may already have repaired data, so refusal is not a store-wide preservation transaction. Length checks cannot detect a same-length hole or content corruption already materialized by an older release. Fork-inherited and compacted prefixes below `file_base` retain their existing recovery rules; qualification is recorded in [0030](../../docs/backlog/0030-checkpoint-tail-can-cross-a-rejected-append.md).
 

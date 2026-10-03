@@ -101,6 +101,7 @@ fn node_states_cover_every_node_kind() {
             pred: pred.clone(),
             stream_path: "shape/s1".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         },
     );
@@ -113,6 +114,7 @@ fn node_states_cover_every_node_kind() {
             num_id: 2,
             stream_path: "shape/s2".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         }],
     );
@@ -362,6 +364,7 @@ fn dump_node_family_and_aggregate() {
             num_id: 5,
             stream_path: "shape/s5".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         }],
     );
@@ -627,6 +630,7 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
             ),
             stream_path: "shape/s1".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         },
     );
@@ -640,6 +644,7 @@ async fn library_mode_absolute_emission_retracts_without_an_old_row() {
             num_id: 7,
             stream_path: "shape/s7".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         }],
     );
@@ -780,6 +785,7 @@ async fn trace_family_route_and_filter_drop() {
             num_id: 7,
             stream_path: "shape/s7".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         }],
     );
@@ -799,6 +805,7 @@ async fn trace_family_route_and_filter_drop() {
             ),
             stream_path: "shape/s9".into(),
             gate: crate::pg::SnapshotGate::passthrough(),
+            source_floor: None,
             out_cols: None,
         },
     );
@@ -813,6 +820,9 @@ async fn trace_family_route_and_filter_drop() {
     let mut pending: HashMap<String, Vec<Envelope>> = HashMap::new();
 
     // Insert routed to key 'a' -> family hop routed with the key, shape s7 reached, filter s9 drops.
+    let mut input = env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None);
+    input.headers.lsn = Some("0/10".into());
+    input.headers.seq = Some(0);
     process_envelope(
         &ts,
         &shapes,
@@ -820,7 +830,7 @@ async fn trace_family_route_and_filter_drop() {
         &families,
         &mut aggregates,
         &agg_index,
-        env("insert", "1", Some(serde_json::json!({"id":1,"name":"a","active":true})), None),
+        input,
         &mut pending,
         &subqueries,
         &trace_tx,
@@ -843,6 +853,9 @@ async fn trace_family_route_and_filter_drop() {
     assert_eq!(ev["delta"][0]["row"]["name"], "a");
 
     // Insert whose key matches no routed shape -> family hop dropped, no shapes reached.
+    let mut input = env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None);
+    input.headers.lsn = Some("0/10".into());
+    input.headers.seq = Some(1);
     process_envelope(
         &ts,
         &shapes,
@@ -850,7 +863,7 @@ async fn trace_family_route_and_filter_drop() {
         &families,
         &mut aggregates,
         &agg_index,
-        env("insert", "2", Some(serde_json::json!({"id":2,"name":"zzz","active":true})), None),
+        input,
         &mut pending,
         &subqueries,
         &trace_tx,
@@ -868,6 +881,9 @@ async fn trace_family_route_and_filter_drop() {
 
     // Nobody subscribed -> nothing is built or sent (receiver dropped).
     drop(trace_rx);
+    let mut input = env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None);
+    input.headers.lsn = Some("0/10".into());
+    input.headers.seq = Some(2);
     process_envelope(
         &ts,
         &shapes,
@@ -875,7 +891,7 @@ async fn trace_family_route_and_filter_drop() {
         &families,
         &mut aggregates,
         &agg_index,
-        env("insert", "3", Some(serde_json::json!({"id":3,"name":"a","active":true})), None),
+        input,
         &mut pending,
         &subqueries,
         &trace_tx,

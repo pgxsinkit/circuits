@@ -149,12 +149,32 @@ struct WaiterReg {
     next_seq: u64,
 }
 
-/// A checkpoint's captured file and logical tail. Keep its stream incarnation
-/// until the tail merge so a concurrent durable removal can invalidate it.
+/// A checkpoint's captured file, accepted logical tail and body sequence. Keep
+/// its stream incarnation until the merge so durable removal can invalidate it.
 struct CheckpointStream {
     stream: Arc<StreamState>,
     tail: u64,
+    sequence: Option<String>,
     file: Arc<std::fs::File>,
+}
+
+/// A durable accepted prefix and the greatest Stream-Seq inside that prefix.
+/// Persisted together before recycling the WAL records which prove them.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DurableFrontier {
+    pub(crate) tail: u64,
+    pub(crate) sequence: Option<String>,
+}
+
+impl DurableFrontier {
+    pub(crate) fn merge(&mut self, tail: u64, sequence: Option<&str>) {
+        self.tail = self.tail.max(tail);
+        if let Some(sequence) = sequence {
+            if self.sequence.as_deref().map_or(true, |old| sequence > old) {
+                self.sequence = Some(sequence.to_owned());
+            }
+        }
+    }
 }
 
 /// Stage→committer signalling for the **dedicated-OS-thread committer** (Tier-2a).
@@ -342,7 +362,7 @@ pub struct Shard {
     /// The lock covers persistence too, so a serialized checkpoint cannot write
     /// an older map after a newer merge. Retirement is persisted at the next
     /// successful checkpoint, including one with no touched streams.
-    tails_cache: Mutex<Option<HashMap<u64, u64>>>,
+    tails_cache: Mutex<Option<HashMap<u64, DurableFrontier>>>,
     /// Per-shard batch-size + durability counters (spec §11). Updated once per
     /// successful committer `fdatasync` (`record_batch`) — cheap relaxed atomics,
     /// no lock/alloc/syscall on the commit path. Read off-path by the 1 Hz
@@ -410,8 +430,9 @@ pub fn checkpoint_wal_bytes() -> u64 {
 }
 
 /// Name of the per-shard durable-tail map: `<shard_dir>/tails` (task 11b). A
-/// Cumulative `stream_id durable_tail` line map (plain decimal text, one stream
-/// per line). At checkpoint, each touched stream's current logical `Shared.tail`
+/// Cumulative `stream_id durable_tail [JSON-escaped Stream-Seq]` line map, one
+/// stream per line. Old two-column proofs remain readable. At checkpoint, each
+/// touched stream's current logical `Shared.tail` and accepted body sequence
 /// (the file is durable up to it after the checkpoint `fdatasync`) is merged in
 /// and the whole map is written `tmp`+rename + fsync'd **before** segments are
 /// recycled — so recovery can truncate a stream's torn per-stream-file tail even
@@ -925,7 +946,12 @@ impl Shard {
                     }
                     let _capture = st.checkpoint_capture.lock().unwrap();
                     let s = st.shared.read().unwrap();
-                    CheckpointStream { stream: Arc::clone(st), tail: s.tail, file: Arc::clone(&s.file) }
+                    CheckpointStream {
+                        stream: Arc::clone(st),
+                        tail: s.tail,
+                        sequence: s.accepted_last_seq_header.clone(),
+                        file: Arc::clone(&s.file),
+                    }
                 })
                 .collect();
             let n_touched = touched.len();
@@ -1000,10 +1026,10 @@ impl Shard {
             // 5. Flush the meta sidecar of every touched stream whose append
             //    path marked it dirty (WAL mode defers the per-append debounced
             //    flush to here — see handle_append_inner). Strictly AFTER the
-            //    WAL-critical sequence above: sidecar producer/access state is
-            //    non-durable by contract and plays no part in WAL replay, so it
-            //    must never delay the recycle floor. Errors are ignored exactly
-            //    like the debounced flush ignored them.
+            //    WAL-critical sequence above: producer/access state is best
+            //    effort. A lagging callback can also leave sidecar Stream-Seq
+            //    behind, but the paired tail proof above already certifies it.
+            //    Sidecar failures must not delay recycle or erase that proof.
             let mut n_meta = 0u64;
             for st in drained {
                 if st.meta_dirty.swap(false, Ordering::AcqRel) {
@@ -1033,7 +1059,7 @@ impl Shard {
         }
     }
 
-    /// Merge captured `touched` tails into the persisted per-shard durable-tail
+    /// Merge captured `touched` tails/sequences into the persisted per-shard proof
     /// map (`<shard_dir>/tails`) and rewrite it
     /// durably (`tmp` + rename + fsync the dir-synced file). Called from
     /// `checkpoint` AFTER the touched per-stream files are fdatasync'd and BEFORE
@@ -1056,7 +1082,7 @@ impl Shard {
                 // Nothing touched, retired, or previously recorded.
                 return Ok(0);
             }
-            *cache = Some(Self::read_durable_tails_at(&self.dir)?);
+            *cache = Some(Self::read_durable_frontiers_at(&self.dir)?);
         }
         let map = cache.as_mut().unwrap();
         for entry in touched {
@@ -1065,8 +1091,7 @@ impl Shard {
             // therefore either merge before removal prunes it, or skip it here.
             // Failed removals never set the marker and keep their proof.
             if !entry.stream.wal_retired() {
-                let slot = map.entry(entry.stream.id).or_insert(0);
-                *slot = (*slot).max(entry.tail);
+                map.entry(entry.stream.id).or_default().merge(entry.tail, entry.sequence.as_deref());
             }
         }
         // HashMap::remove preserves capacity. Reclaim it geometrically at the
@@ -1075,16 +1100,21 @@ impl Shard {
         if map.capacity() > map.len().saturating_mul(4) {
             map.shrink_to(map.len().saturating_mul(2));
         }
-        // Serialize as `stream_id durable_tail` lines (sorted for a deterministic,
-        // diff-friendly file). Plain decimal text, matching the `checkpoint` file.
-        let mut entries: Vec<(u64, u64)> = map.iter().map(|(&k, &v)| (k, v)).collect();
-        entries.sort_unstable();
+        // Old two-column proofs remain readable. A third JSON string stores an
+        // opaque sequence safely, including whitespace and escaped characters.
+        let mut entries: Vec<_> = map.iter().collect();
+        entries.sort_unstable_by_key(|(id, _)| **id);
         let n = entries.len();
         let mut body = String::with_capacity(entries.len() * 16);
         {
             use std::fmt::Write as _;
-            for (id, tail) in entries {
-                let _ = writeln!(body, "{id} {tail}");
+            for (id, frontier) in entries {
+                let _ = write!(body, "{id} {}", frontier.tail);
+                if let Some(sequence) = &frontier.sequence {
+                    let encoded = serde_json::to_string(sequence).map_err(io::Error::other)?;
+                    let _ = write!(body, " {encoded}");
+                }
+                body.push('\n');
             }
         }
         // Keep the map lock through persistence. Concurrent checkpoints must
@@ -1119,7 +1149,7 @@ impl Shard {
     pub(crate) fn forget_stream(&self, st: &Arc<StreamState>) -> io::Result<()> {
         let mut cache = self.tails_cache.lock().unwrap();
         if cache.is_none() {
-            *cache = Some(Self::read_durable_tails_at(&self.dir)?);
+            *cache = Some(Self::read_durable_frontiers_at(&self.dir)?);
         }
         st.mark_wal_retired();
         cache.as_mut().unwrap().remove(&st.id);
@@ -1130,7 +1160,7 @@ impl Shard {
     /// an empty map when the file is absent (no checkpoint recorded tails yet).
     /// Every other read/parse failure is fatal: discarding a durability proof
     /// can truncate acknowledged bytes whose WAL records were recycled.
-    fn read_durable_tails_at(dir: &Path) -> io::Result<HashMap<u64, u64>> {
+    fn read_durable_frontiers_at(dir: &Path) -> io::Result<HashMap<u64, DurableFrontier>> {
         let mut map = HashMap::new();
         let path = dir.join(TAILS_FILE);
         let s = match std::fs::read_to_string(&path) {
@@ -1150,10 +1180,16 @@ impl Shard {
             return Err(malformed());
         }
         for line in s.lines() {
-            let mut it = line.split_whitespace();
-            let id: u64 = it.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
-            let tail: u64 = it.next().ok_or_else(malformed)?.parse().map_err(|_| malformed())?;
-            if it.next().is_some() || map.insert(id, tail).is_some() {
+            let (id, remainder) = line.trim().split_once(char::is_whitespace).ok_or_else(malformed)?;
+            let id: u64 = id.parse().map_err(|_| malformed())?;
+            let remainder = remainder.trim_start();
+            let (tail, sequence) = match remainder.split_once(char::is_whitespace) {
+                Some((tail, sequence)) => (tail, Some(sequence.trim())),
+                None => (remainder, None),
+            };
+            let tail: u64 = tail.parse().map_err(|_| malformed())?;
+            let sequence = sequence.map(serde_json::from_str::<String>).transpose().map_err(|_| malformed())?;
+            if map.insert(id, DurableFrontier { tail, sequence }).is_some() {
                 return Err(malformed());
             }
         }
@@ -1164,8 +1200,13 @@ impl Shard {
     /// this shard (task 11b). Empty when no checkpoint has recorded tails. Recovery
     /// seeds each stream's frontier from this map so a stream whose WAL records were
     /// all recycled still has its torn per-stream-file tail truncated.
+    pub(crate) fn read_durable_frontiers(&self) -> io::Result<HashMap<u64, DurableFrontier>> {
+        Self::read_durable_frontiers_at(&self.dir)
+    }
+
+    #[cfg(test)]
     pub fn read_durable_tails(&self) -> io::Result<HashMap<u64, u64>> {
-        Self::read_durable_tails_at(&self.dir)
+        Ok(self.read_durable_frontiers()?.into_iter().map(|(id, frontier)| (id, frontier.tail)).collect())
     }
 
     /// Unlink every WAL segment file whose entire lsn range is `< floor`, never

@@ -19,6 +19,8 @@ const H_CURSOR: &str = "stream-cursor";
 const H_TTL: &str = "stream-ttl";
 const H_EXPIRES_AT: &str = "stream-expires-at";
 const H_SEQ: &str = "stream-seq";
+const H_EXPECTED_SEQ: &str = "stream-expected-seq";
+const H_SEQ_GUARD: &str = "stream-seq-guard";
 const H_PRODUCER_ID: &str = "producer-id";
 const H_PRODUCER_EPOCH: &str = "producer-epoch";
 const H_PRODUCER_SEQ: &str = "producer-seq";
@@ -338,7 +340,7 @@ fn cors_preflight() -> Resp {
         )
         .hs(
             "access-control-allow-headers",
-            "content-type, authorization, If-None-Match, Stream-Seq, Stream-TTL, Stream-Expires-At, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
+            "content-type, authorization, If-None-Match, Stream-Seq, Stream-Expected-Seq, Stream-TTL, Stream-Expires-At, Stream-Closed, Producer-Id, Producer-Epoch, Producer-Seq, Stream-Forked-From, Stream-Fork-Offset, Stream-Fork-Sub-Offset",
         )
         .body(empty())
 }
@@ -666,7 +668,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                     // Stage to the WAL UNDER the appender lock so per-stream LSN order
                     // matches byte order (see stage_for_durability); the slow
                     // durability wait runs after the lock is dropped.
-                    let staged_lsn = match stage_for_durability(&store, &st, &wire, stream_offset) {
+                    let staged_lsn = match stage_for_durability(&store, &st, &wire, stream_offset, None) {
                         Ok(lsn) => lsn,
                         Err(_) => {
                             // ROLL BACK the data-file write: the bytes were 500'd but
@@ -795,6 +797,7 @@ fn stage_for_durability(
     st: &Arc<StreamState>,
     wire: &Bytes,
     stream_offset: u64,
+    sequence: Option<&str>,
 ) -> std::io::Result<Option<u64>> {
     // memory mode: no WAL — the page-cache file write IS the ack. No fsync, no stage.
     if durability() == DurabilityMode::Memory {
@@ -806,7 +809,13 @@ fn stage_for_durability(
     // (spec §7) BEFORE staging the WAL record — see the full ordering note in
     // the WAL spec. Registering first closes the recycle-before-fsync window.
     shard.register_dirty(st.id, Arc::clone(st));
-    let lsn = shard.reserve_and_stage(crate::wal::codec::RecordKind::Append, st.id, stream_offset, wire)?;
+    let lsn = match sequence {
+        Some(sequence) => {
+            let payload = crate::wal::codec::encode_sequenced_append(sequence, wire)?;
+            shard.reserve_and_stage(crate::wal::codec::RecordKind::SequencedAppend, st.id, stream_offset, &payload)?
+        }
+        None => shard.reserve_and_stage(crate::wal::codec::RecordKind::Append, st.id, stream_offset, wire)?,
+    };
     Ok(Some(lsn))
 }
 
@@ -1015,6 +1024,9 @@ impl AppendCompletion {
                     self.producer.as_ref().map(|p| (p.id.as_str(), ProducerState { epoch: p.epoch, last_seq: p.seq })),
                     self.seq_header.as_deref(),
                 );
+                if self.seq_header.is_some() {
+                    self.stream.append_committed.notify_waiters();
+                }
             }
             if self.meta_persist_needed {
                 if self.lsn.is_some() {
@@ -1129,6 +1141,19 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     };
     let close_req = header_is_true(&req, H_CLOSED);
     let seq_header = header_str(&req, H_SEQ).map(|s| s.to_string());
+    // JSON null means an absent frontier; a JSON string means that exact
+    // committed sequence. Absence of the header leaves ordinary POST unchanged.
+    let expected_sequence = match header_str(&req, H_EXPECTED_SEQ) {
+        Some(raw) if seq_header.is_some() => match serde_json::from_str::<Option<String>>(raw) {
+            Ok(expected) => Some(expected),
+            Err(_) => ret!(text_response(400, "Stream-Expected-Seq must be JSON null or a string"), Conflict),
+        },
+        Some(_) => ret!(text_response(400, "Stream-Expected-Seq requires Stream-Seq"), Conflict),
+        None => None,
+    };
+    if expected_sequence.is_some() && producer.is_some() {
+        ret!(text_response(400, "Stream-Expected-Seq cannot be combined with producer headers"), Conflict);
+    }
     let req_ct = header_str(&req, "content-type").map(|s| s.to_string());
 
     let body = req.body.clone();
@@ -1163,140 +1188,176 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
 
     // Serialize per stream: producer validation + write + state update under one
     // lock. Time the wait separately — lock contention is a key bottleneck.
-    let lock_t0 = crate::telemetry::Timer::start();
-    let srv_lock_t0 = std::time::Instant::now();
-    let mut ap = st.appender.lock().await;
-    crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
-    crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
+    let mut ap = loop {
+        // Register before checking the committed predicate: promotion can race
+        // lock acquisition, and notify_waiters does not retain a future permit.
+        let committed = st.append_committed.notified();
+        tokio::pin!(committed);
+        committed.as_mut().enable();
+        let lock_t0 = crate::telemetry::Timer::start();
+        let srv_lock_t0 = std::time::Instant::now();
+        let ap = st.appender.lock().await;
+        crate::telemetry::record_append_lock_wait(lock_t0.elapsed_secs());
+        crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
 
-    // Closed checks (precedence: closed → seq regression → gap).
-    let retry_close = {
-        let s = st.shared.read().unwrap();
-        if s.closed {
-            // Report the durable tail to clients (never an offset a crash could
-            // roll back) — same monotonicity contract as `tail()`.
-            let tail = s.durable_tail;
-            let matching = close_req
-                && match &producer {
-                    Some(p) => s
+        // Closed checks (precedence: closed → seq regression → gap).
+        let retry_close = {
+            let s = st.shared.read().unwrap();
+            if s.closed {
+                // Report the durable tail to clients (never an offset a crash could
+                // roll back) — same monotonicity contract as `tail()`.
+                let tail = s.durable_tail;
+                if expected_sequence.is_some() {
+                    if !s.closed_durable {
+                        drop(s);
+                        ret!(text_response(503, "close is waiting for durability"), Conflict);
+                    }
+                    drop(s);
+                    ret!(closed_conflict(tail), Closed);
+                }
+                let matching = close_req
+                    && match &producer {
+                        Some(p) => s
+                            .closed_by
+                            .as_ref()
+                            .is_some_and(|(id, epoch, seq)| id == &p.id && *epoch == p.epoch && *seq == p.seq),
+                        None => body.is_empty(),
+                    };
+                if !matching {
+                    drop(s);
+                    ret!(closed_conflict(tail), Closed);
+                }
+                if !s.closed_durable && s.durable_tail < s.tail {
+                    drop(s);
+                    ret!(text_response(503, "close is waiting for append durability"), Conflict);
+                }
+                Some(CloseCandidate {
+                    producer: s
                         .closed_by
                         .as_ref()
-                        .is_some_and(|(id, epoch, seq)| id == &p.id && *epoch == p.epoch && *seq == p.seq),
-                    None => body.is_empty(),
-                };
-            if !matching {
-                drop(s);
-                ret!(closed_conflict(tail), Closed);
+                        .map(|(id, epoch, seq)| (id.clone(), ProducerState { epoch: *epoch, last_seq: *seq })),
+                    seq_header: s.last_seq_header.clone(),
+                })
+            } else {
+                None
             }
-            if !s.closed_durable && s.durable_tail < s.tail {
-                drop(s);
-                ret!(text_response(503, "close is waiting for append durability"), Conflict);
-            }
-            Some(CloseCandidate {
-                producer: s
-                    .closed_by
-                    .as_ref()
-                    .map(|(id, epoch, seq)| (id.clone(), ProducerState { epoch: *epoch, last_seq: *seq })),
-                seq_header: s.last_seq_header.clone(),
-            })
-        } else {
-            None
-        }
-    };
-    if let Some(candidate) = retry_close {
-        drop(ap);
-        let worker = spawn_close(st.clone(), candidate, _operation.into_owned(st.clone()));
-        if let Err(error) = await_close(worker).await {
-            ret!(
-                text_response(
-                    if error.kind() == std::io::ErrorKind::WouldBlock { 503 } else { 500 },
-                    "close not durable"
-                ),
-                Conflict
-            );
-        }
-        let mut response =
-            ResponseBuilder::new(204).hs(H_CLOSED, "true").h(H_NEXT_OFFSET, format_offset(st.tail().bytes));
-        if let Some(p) = &producer {
-            response = response.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
-        }
-        ret!(response.body(empty()), Dup);
-    }
-
-    // Producer validation.
-    if let Some(p) = &producer {
-        let outcome = {
-            let s = st.shared.read().unwrap();
-            validate_producer(&s, p)
         };
-        match outcome {
-            ProducerOutcome::Accept => {}
-            ProducerOutcome::Pending => {
-                ret!(text_response(503, "producer append is waiting for durability"), Conflict);
+        if let Some(candidate) = retry_close {
+            drop(ap);
+            let worker = spawn_close(st.clone(), candidate, _operation.into_owned(st.clone()));
+            if let Err(error) = await_close(worker).await {
+                ret!(
+                    text_response(
+                        if error.kind() == std::io::ErrorKind::WouldBlock { 503 } else { 500 },
+                        "close not durable"
+                    ),
+                    Conflict
+                );
             }
-            ProducerOutcome::Duplicate { last_seq } => {
-                // Gate Stream-Closed on the stream's ACTUAL durable-closed state
-                // (what readers observe), not on the retry request's close flag.
-                // This branch is past the already-closed early-return, so the
-                // stream is open here unless it was closed durably in between.
-                let (tail, closed) = {
-                    let s = st.shared.read().unwrap();
-                    (s.durable_tail, s.closed_durable)
-                };
-                let mut b = ResponseBuilder::new(204)
-                    .h(H_NEXT_OFFSET, format_offset(tail))
-                    .h(H_PRODUCER_EPOCH, p.epoch.to_string())
-                    .h(H_PRODUCER_SEQ, last_seq.to_string());
-                if closed {
-                    b = b.hs(H_CLOSED, "true");
+            let mut response =
+                ResponseBuilder::new(204).hs(H_CLOSED, "true").h(H_NEXT_OFFSET, format_offset(st.tail().bytes));
+            if let Some(p) = &producer {
+                response = response.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
+            }
+            ret!(response.body(empty()), Dup);
+        }
+
+        if let Some(expected) = &expected_sequence {
+            let shared = st.shared.read().unwrap();
+            if shared.last_seq_header != shared.committed_last_seq_header {
+                ret!(text_response(503, "sequence append is waiting for durability"), Conflict);
+            }
+            if expected != &shared.committed_last_seq_header {
+                ret!(sequence_frontier_response(&shared, 412, "Sequence precondition failed"), Conflict);
+            }
+        }
+
+        // Producer validation.
+        if let Some(p) = &producer {
+            let outcome = {
+                let s = st.shared.read().unwrap();
+                validate_producer(&s, p)
+            };
+            match outcome {
+                ProducerOutcome::Accept => {}
+                ProducerOutcome::Pending => {
+                    ret!(text_response(503, "producer append is waiting for durability"), Conflict);
                 }
-                ret!(b.body(empty()), Dup);
-            }
-            ProducerOutcome::StaleEpoch { current } => {
-                // Include the durable tail (matching the production Caddy server)
-                // so a fenced producer learns the current offset. Spec §5.2.1
-                // mandates only Producer-Epoch; Stream-Next-Offset is additive.
-                let tail = st.shared.read().unwrap().durable_tail;
-                ret!(
-                    ResponseBuilder::new(403)
-                        .h(H_PRODUCER_EPOCH, current.to_string())
+                ProducerOutcome::Duplicate { last_seq } => {
+                    // Gate Stream-Closed on the stream's ACTUAL durable-closed state
+                    // (what readers observe), not on the retry request's close flag.
+                    // This branch is past the already-closed early-return, so the
+                    // stream is open here unless it was closed durably in between.
+                    let (tail, closed) = {
+                        let s = st.shared.read().unwrap();
+                        (s.durable_tail, s.closed_durable)
+                    };
+                    let mut b = ResponseBuilder::new(204)
                         .h(H_NEXT_OFFSET, format_offset(tail))
-                        .body(full("stale producer epoch")),
-                    Conflict
-                );
-            }
-            ProducerOutcome::Gap { expected } => {
-                ret!(
-                    ResponseBuilder::new(409)
-                        .h(H_PRODUCER_EXPECTED, expected.to_string())
-                        .h(H_PRODUCER_RECEIVED, p.seq.to_string())
-                        .body(full("producer sequence gap")),
-                    Conflict
-                );
-            }
-            ProducerOutcome::BadEpochStart => {
-                ret!(text_response(400, "new producer epoch must start at seq 0"), Conflict);
+                        .h(H_PRODUCER_EPOCH, p.epoch.to_string())
+                        .h(H_PRODUCER_SEQ, last_seq.to_string());
+                    if closed {
+                        b = b.hs(H_CLOSED, "true");
+                    }
+                    ret!(b.body(empty()), Dup);
+                }
+                ProducerOutcome::StaleEpoch { current } => {
+                    // Include the durable tail (matching the production Caddy server)
+                    // so a fenced producer learns the current offset. Spec §5.2.1
+                    // mandates only Producer-Epoch; Stream-Next-Offset is additive.
+                    let tail = st.shared.read().unwrap().durable_tail;
+                    ret!(
+                        ResponseBuilder::new(403)
+                            .h(H_PRODUCER_EPOCH, current.to_string())
+                            .h(H_NEXT_OFFSET, format_offset(tail))
+                            .body(full("stale producer epoch")),
+                        Conflict
+                    );
+                }
+                ProducerOutcome::Gap { expected } => {
+                    ret!(
+                        ResponseBuilder::new(409)
+                            .h(H_PRODUCER_EXPECTED, expected.to_string())
+                            .h(H_PRODUCER_RECEIVED, p.seq.to_string())
+                            .body(full("producer sequence gap")),
+                        Conflict
+                    );
+                }
+                ProducerOutcome::BadEpochStart => {
+                    ret!(text_response(400, "new producer epoch must start at seq 0"), Conflict);
+                }
             }
         }
-    }
-    // Stream-Seq (writer sequencing) regression check — after producer dedup so
-    // duplicate producer requests stay idempotent (204).
-    if let Some(seq) = &seq_header {
-        let s = st.shared.read().unwrap();
-        if let Some(last) = &s.last_seq_header {
-            if seq.as_str() <= last.as_str() {
-                let tail = s.durable_tail;
-                drop(s);
-                // Body must read "Sequence conflict" to match the reference
-                // server: clients classify a 409 as a sequence conflict by the
-                // word "sequence" in the message (see @durable-streams/client).
-                ret!(
-                    ResponseBuilder::new(409).h(H_NEXT_OFFSET, format_offset(tail)).body(full("Sequence conflict")),
-                    Conflict
-                );
+        // Stream-Seq (writer sequencing) regression check — after producer dedup so
+        // duplicate producer requests stay idempotent (204).
+        let pending_sequence = if let Some(seq) = &seq_header {
+            let s = st.shared.read().unwrap();
+            if s.last_seq_header.as_deref().is_some_and(|last| seq.as_str() <= last) {
+                if s.committed_last_seq_header.as_deref().map_or(true, |committed| seq.as_str() > committed) {
+                    true
+                } else {
+                    // Body must read "Sequence conflict" to match the reference
+                    // server: clients classify a 409 as a sequence conflict by the
+                    // word "sequence" in the message (see @durable-streams/client).
+                    ret!(sequence_frontier_response(&s, 409, "Sequence conflict"), Conflict);
+                }
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if pending_sequence {
+            drop(ap);
+            // Ordinary protocol writers receive a committed conflict, never a
+            // refusal that pretends pending bytes are durable. Revalidate all
+            // admission rules after the owning append promotes metadata;
+            // conditional writers returned 503 above. No Shared guard lives here.
+            committed.await;
+            continue;
         }
-    }
+        break ap;
+    };
 
     // Write + state updates. `new_tail` carries the writer tail to publish to
     // readers only AFTER durability (below), so a live reader never observes
@@ -1371,8 +1432,13 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         // byte order (see stage_for_durability). A stage failure is not durable —
         // error out (and skip the close commit below) rather than ack 2xx.
         let staged_lsn = if !wire.is_empty() {
-            match stage_for_durability(&store, &st, &wire, stream_offset) {
-                Ok(lsn) => lsn,
+            match stage_for_durability(&store, &st, &wire, stream_offset, seq_header.as_deref()) {
+                Ok(lsn) => {
+                    if let Some(sequence) = &seq_header {
+                        st.shared.write().unwrap().accepted_last_seq_header = Some(sequence.clone());
+                    }
+                    lsn
+                }
                 Err(_) => {
                     // ROLL BACK everything this append changed (still under the
                     // appender lock, so no concurrent appender observed it):
@@ -1441,13 +1507,19 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         );
     }
 
-    let tail = st.tail();
+    let shared = st.shared.read().unwrap();
     let status = if completion.producer.is_some() && !body.is_empty() { 200 } else { 204 };
-    let mut b = ResponseBuilder::new(status).h(H_NEXT_OFFSET, format_offset(tail.bytes));
+    let mut b = ResponseBuilder::new(status).h(H_NEXT_OFFSET, format_offset(shared.durable_tail));
+    if completion.seq_header.is_some() {
+        b = sequence_guard(b);
+        if let Some(sequence) = &shared.committed_last_seq_header {
+            b = b.h(H_SEQ, sequence.clone());
+        }
+    }
     if let Some(p) = &completion.producer {
         b = b.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
     }
-    if tail.closed {
+    if shared.closed_durable {
         b = b.hs(H_CLOSED, "true");
     }
     (b.body(empty()), Accept, is_json)
@@ -2424,6 +2496,19 @@ async fn read_range_bytes(st: &Arc<StreamState>, start: u64, end: u64) -> std::i
 
 // ---------- HEAD ----------
 
+fn sequence_frontier_response(shared: &Shared, status: u16, message: &'static str) -> Resp {
+    let mut response =
+        sequence_guard(ResponseBuilder::new(status)).h(H_NEXT_OFFSET, format_offset(shared.durable_tail));
+    if let Some(sequence) = &shared.committed_last_seq_header {
+        response = response.h(H_SEQ, sequence.clone());
+    }
+    response.body(full(message))
+}
+
+fn sequence_guard(response: ResponseBuilder) -> ResponseBuilder {
+    response.hs(H_SEQ_GUARD, if durability() == DurabilityMode::Wal { "durable-v1" } else { "volatile-v1" })
+}
+
 fn handle_head(store: Arc<Store>, path: String) -> Resp {
     let st = match store.get(&path) {
         Some(s) => s,
@@ -2433,18 +2518,21 @@ fn handle_head(store: Arc<Store>, path: String) -> Resp {
         return gone();
     }
     // HEAD must not reset the TTL.
-    let t = st.tail();
-    let mut b = ResponseBuilder::new(200)
+    let shared = st.shared.read().unwrap();
+    let mut b = sequence_guard(ResponseBuilder::new(200))
         .h("content-type", st.config.content_type.clone())
-        .h(H_NEXT_OFFSET, format_offset(t.bytes))
+        .h(H_NEXT_OFFSET, format_offset(shared.durable_tail))
         .hs("cache-control", "no-store");
+    if let Some(sequence) = &shared.committed_last_seq_header {
+        b = b.h(H_SEQ, sequence.clone());
+    }
     if let Some(ttl) = st.config.ttl_seconds {
         b = b.h(H_TTL, ttl.to_string());
     }
     if let Some(raw) = &st.config.expires_at_raw {
         b = b.h(H_EXPIRES_AT, raw.clone());
     }
-    if t.closed {
+    if shared.closed_durable {
         b = b.hs(H_CLOSED, "true");
     }
     b.body(empty())

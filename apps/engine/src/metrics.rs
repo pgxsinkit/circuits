@@ -247,15 +247,18 @@ pub enum RestoreRetireReason {
     StreamMissing,
     /// Storage answered the stream's `HEAD` with `stream-closed`: it can never be appended to again.
     StreamClosed,
+    /// A modern plain Created record never reached its durable Seeded/create ACK boundary.
+    IncompleteCreate,
 }
 
 impl RestoreRetireReason {
-    pub const ALL: [RestoreRetireReason; 5] = [
+    pub const ALL: [RestoreRetireReason; 6] = [
         RestoreRetireReason::Schema,
         RestoreRetireReason::Subquery,
         RestoreRetireReason::TableGone,
         RestoreRetireReason::StreamMissing,
         RestoreRetireReason::StreamClosed,
+        RestoreRetireReason::IncompleteCreate,
     ];
 
     /// The label an operator sees: the `reason` attribute on Prometheus, the key suffix in JSON.
@@ -266,6 +269,7 @@ impl RestoreRetireReason {
             RestoreRetireReason::TableGone => "table_gone",
             RestoreRetireReason::StreamMissing => "stream_missing",
             RestoreRetireReason::StreamClosed => "stream_closed",
+            RestoreRetireReason::IncompleteCreate => "incomplete_create",
         }
     }
 }

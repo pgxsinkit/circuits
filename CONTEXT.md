@@ -30,6 +30,10 @@ creates and renews its shape through the engine and reads its rows from the log 
 **Shape**:
 A live, incrementally maintained selection of a table's rows, materialised as one stream.
 
+**Delivery frontier**:
+The source effects already durably delivered to one shape. It belongs to that shape alone;
+it does not establish another shape's coverage or the engine's overall processing progress.
+
 **Active / Dormant / Evicted**:
 The retention lifecycle of a shape — maintained live; parked with its stream retained and no engine
 state; removed entirely.

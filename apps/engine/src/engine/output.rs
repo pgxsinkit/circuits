@@ -3,6 +3,17 @@
 
 use super::*;
 
+/// Stamp every member of one complete PG plain source effect. In particular, a key change's
+/// delete and upsert share one identity, so retry filtering cannot acknowledge only half of it.
+pub(crate) fn stamp_plain_effect(source: &Envelope, output: &mut [Envelope]) -> Result<()> {
+    crate::ds::SourcePosition::from_envelope(source)?;
+    for env in output {
+        env.headers.lsn.clone_from(&source.headers.lsn);
+        env.headers.seq = source.headers.seq;
+    }
+    Ok(())
+}
+
 /// What [`apply_envelope`] makes of one change event: the input Z-set delta, the originating txid
 /// and the commit LSN.
 pub(crate) type EnvelopeDelta = (Vec<Tup2<Row, ZWeight>>, Option<String>, Option<String>);
