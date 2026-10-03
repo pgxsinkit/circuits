@@ -1651,6 +1651,13 @@ impl Shard {
         *self.on_stage.lock().unwrap() = Some(cb);
     }
 
+    /// Test-only: pause after captured files are durable, before publishing
+    /// checkpoint tails and flushing the metadata sidecars.
+    #[cfg(test)]
+    pub fn set_on_checkpoint_tails_hook(&self, cb: Box<dyn Fn() + Send + Sync>) {
+        *self.on_checkpoint_tails.lock().unwrap() = Some(cb);
+    }
+
     /// Test-only: assign the next lsn + reserve its segment range, but write **no
     /// bytes** — deliberately leaving a gap so the watermark/gap test can prove
     /// the committer will not advance `durable_lsn` past an unwritten lsn.

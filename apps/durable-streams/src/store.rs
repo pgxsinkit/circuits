@@ -26,10 +26,23 @@ pub struct Tail {
     pub closed: bool,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProducerState {
     pub epoch: u64,
     pub last_seq: u64,
+}
+
+/// One producer identity owns both its serialized writer frontier and its
+/// independently published committed frontier; map keys are never duplicated.
+#[derive(Clone, Debug)]
+pub struct ProducerEntry {
+    pub writer: ProducerState,
+    pub committed: Option<ProducerState>,
+}
+
+pub(crate) struct CloseCandidate {
+    pub producer: Option<(String, ProducerState)>,
+    pub seq_header: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,8 +84,8 @@ pub struct Shared {
     /// consistent (file, file_base) pair.
     pub file: Arc<File>,
     /// Writer-facing close intent: set under the appender lock the instant a
-    /// close is accepted (so subsequent appends are rejected) and persisted to
-    /// the sidecar. NOT what readers observe — see `closed_durable`.
+    /// close is accepted (so subsequent appends are rejected). General sidecar
+    /// writers capture only `closed_durable`; the close worker persists intent.
     pub closed: bool,
     /// Reader-observable EOF: set only AFTER the closure is durable (under `strict`,
     /// the data fsync + meta fsync; under `fast`, the meta fsync — the data fsync
@@ -85,13 +98,32 @@ pub struct Shared {
     pub closed_durable: bool,
     /// Producer that closed the stream (producer_id, epoch, seq), for idempotent re-close.
     pub closed_by: Option<(String, u64, u64)>,
-    pub producers: HashMap<String, ProducerState>,
+    pub producers: HashMap<String, ProducerEntry>,
     pub last_seq_header: Option<String>,
+    pub committed_last_seq_header: Option<String>,
     pub last_access: SystemTime,
     /// Number of live forks reading through this stream.
     pub ref_count: u32,
     /// Deleted while forks still reference it: direct ops 410, path blocked.
     pub soft_deleted: bool,
+}
+
+impl Shared {
+    /// Promote only this request's durable metadata. Callback order may differ
+    /// from writer order, and a later writer can still be waiting or rolling back.
+    pub(crate) fn commit_append_metadata(&mut self, producer: Option<(&str, ProducerState)>, seq: Option<&str>) {
+        if let Some((id, state)) = producer {
+            let entry = self.producers.get_mut(id).expect("accepted producer has a writer entry");
+            if entry.committed.map_or(true, |old| (state.epoch, state.last_seq) > (old.epoch, old.last_seq)) {
+                entry.committed = Some(state);
+            }
+        }
+        if let Some(seq) = seq {
+            if self.committed_last_seq_header.as_deref().map_or(true, |old| seq > old) {
+                self.committed_last_seq_header = Some(seq.to_owned());
+            }
+        }
+    }
 }
 
 pub struct Appender {
@@ -315,6 +347,14 @@ pub struct StreamState {
     ref_meta_fault: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     ref_meta_attempts: AtomicU64,
+    #[cfg(test)]
+    close_meta_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    close_meta_hook: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    append_commit_hook: StdMutex<Option<Arc<dyn Fn(u64) + Send + Sync>>>,
     /// Most recently appended wire chunk, kept resident so caught-up live
     /// readers (SSE / long-poll) and immediate catch-up reads are served from
     /// memory — one read+encode shared across all subscribers — instead of a
@@ -350,14 +390,27 @@ struct StreamLifecycle {
 
 pub(crate) struct StreamOperationGuard<'a>(&'a StreamState);
 
+pub(crate) struct OwnedStreamOperationGuard(Arc<StreamState>);
+
+impl StreamOperationGuard<'_> {
+    pub(crate) fn into_owned(self, owner: Arc<StreamState>) -> OwnedStreamOperationGuard {
+        assert!(std::ptr::eq(self.0, owner.as_ref()), "operation belongs to its stream");
+        // Transfer the existing admission without opening a gap in which
+        // DELETE could fence a second admission. The Arc now owns its lifetime.
+        std::mem::forget(self);
+        OwnedStreamOperationGuard(owner)
+    }
+}
+
 impl Drop for StreamOperationGuard<'_> {
     fn drop(&mut self) {
-        let mut lifecycle = self.0.lifecycle.lock().unwrap();
-        lifecycle.in_flight -= 1;
-        if lifecycle.in_flight == 0 {
-            self.0.lifecycle_idle.notify_all();
-            self.0.lifecycle_notify.notify_waiters();
-        }
+        self.0.finish_operation();
+    }
+}
+
+impl Drop for OwnedStreamOperationGuard {
+    fn drop(&mut self) {
+        self.0.finish_operation();
     }
 }
 
@@ -425,6 +478,15 @@ pub fn tail_cache_bytes() -> usize {
 }
 
 impl StreamState {
+    fn finish_operation(&self) {
+        let mut lifecycle = self.lifecycle.lock().unwrap();
+        lifecycle.in_flight -= 1;
+        if lifecycle.in_flight == 0 {
+            self.lifecycle_idle.notify_all();
+            self.lifecycle_notify.notify_waiters();
+        }
+    }
+
     pub(crate) fn begin_operation(&self) -> Option<StreamOperationGuard<'_>> {
         let mut lifecycle = self.lifecycle.lock().unwrap();
         if lifecycle.retiring || self.shared.read().unwrap().soft_deleted {
@@ -439,8 +501,36 @@ impl StreamState {
         self.lifecycle.lock().unwrap().retiring
     }
 
+    #[cfg(test)]
+    pub(crate) fn admitted_operations(&self) -> usize {
+        self.lifecycle.lock().unwrap().in_flight
+    }
+
     pub(crate) fn hard_delete_pending(&self) -> bool {
         self.hard_delete.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_close_meta_once(&self, after_rename: bool) {
+        self.close_meta_fault.store(if after_rename { 2 } else { 1 }, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_close_meta_hook(&self, hook: Box<dyn Fn() + Send + Sync>) {
+        *self.close_meta_hook.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_append_commit_hook(&self, hook: Box<dyn Fn(u64) + Send + Sync>) {
+        *self.append_commit_hook.lock().unwrap() = Some(Arc::from(hook));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn run_append_commit_hook(&self, tail: u64) {
+        let hook = self.append_commit_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(tail);
+        }
     }
 
     pub(crate) fn wal_retired(&self) -> bool {
@@ -1167,8 +1257,13 @@ impl Store {
                 closed: meta.closed,
                 closed_durable: meta.closed,
                 closed_by: meta.closed_by.clone(),
-                producers: meta.producers.clone(),
+                producers: meta
+                    .producers
+                    .iter()
+                    .map(|(id, state)| (id.clone(), ProducerEntry { writer: *state, committed: Some(*state) }))
+                    .collect(),
                 last_seq_header: meta.last_seq_header.clone(),
+                committed_last_seq_header: meta.last_seq_header.clone(),
                 last_access: UNIX_EPOCH
                     .checked_add(Duration::from_secs(meta.last_access_unix))
                     .expect("validated deadline"),
@@ -1196,6 +1291,12 @@ impl Store {
             ref_meta_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             ref_meta_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            close_meta_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            close_meta_hook: StdMutex::new(None),
+            #[cfg(test)]
+            append_commit_hook: StdMutex::new(None),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::from_meta(&meta.segments, meta.sealed_offset, &self.segments_dir()),
             blobstore: self.blobstore.clone(),
@@ -1507,6 +1608,7 @@ impl Store {
                 closed_by: None,
                 producers: HashMap::new(),
                 last_seq_header: None,
+                committed_last_seq_header: None,
                 last_access: SystemTime::now(),
                 ref_count: 0,
                 soft_deleted: false,
@@ -1532,6 +1634,12 @@ impl Store {
             ref_meta_fault: std::sync::atomic::AtomicU8::new(0),
             #[cfg(test)]
             ref_meta_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            close_meta_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            close_meta_hook: StdMutex::new(None),
+            #[cfg(test)]
+            append_commit_hook: StdMutex::new(None),
             last_chunk: RwLock::new(None),
             tier: crate::tier::TierState::default(),
             blobstore: self.blobstore.clone(),
@@ -1838,10 +1946,14 @@ impl Meta {
             fork_offset_raw: st.config.fork_offset_raw.clone(),
             fork_sub_offset: st.config.fork_sub_offset,
             base_offset: st.base_offset,
-            closed: s.closed,
-            closed_by: s.closed_by.clone(),
-            producers: s.producers.clone(),
-            last_seq_header: s.last_seq_header.clone(),
+            closed: s.closed_durable,
+            closed_by: if s.closed_durable { s.closed_by.clone() } else { None },
+            producers: s
+                .producers
+                .iter()
+                .filter_map(|(id, entry)| entry.committed.map(|state| (id.clone(), state)))
+                .collect(),
+            last_seq_header: s.committed_last_seq_header.clone(),
             last_access_unix: unix_secs(s.last_access),
             ref_count: s.ref_count,
             soft_deleted: s.soft_deleted,
@@ -1877,6 +1989,67 @@ pub fn write_meta_sync(st: &StreamState, durable: bool) -> std::io::Result<()> {
         return Ok(());
     }
     write_meta_locked(st, durable)
+}
+
+/// Persist one validated close candidate and publish it before another general
+/// metadata writer can capture the stream. The caller owns operation admission
+/// throughout this blocking worker, including cancellation of its HTTP waiter.
+pub(crate) fn commit_close_sync(st: &StreamState, candidate: &CloseCandidate) -> std::io::Result<()> {
+    let _g = st.meta_lock.lock().unwrap_or_else(|error| error.into_inner());
+    if st.hard_delete.load(Ordering::Acquire) {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "closed stream was deleted"));
+    }
+    {
+        let shared = st.shared.read().unwrap();
+        if shared.closed_durable {
+            return Ok(());
+        }
+        if shared.durable_tail < shared.tail {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "close is waiting for append durability"));
+        }
+    }
+    let mut meta = Meta::capture(st);
+    meta.closed = true;
+    meta.closed_by = candidate.producer.as_ref().map(|(id, state)| (id.clone(), state.epoch, state.last_seq));
+    if let Some((id, state)) = &candidate.producer {
+        meta.producers.insert(id.clone(), *state);
+    }
+    if let Some(seq) = &candidate.seq_header {
+        if meta.last_seq_header.as_deref().map_or(true, |old| seq.as_str() > old) {
+            meta.last_seq_header = Some(seq.clone());
+        }
+    }
+    #[cfg(test)]
+    let fault = st.close_meta_fault.swap(0, Ordering::AcqRel);
+    #[cfg(test)]
+    if fault == 1 {
+        return Err(std::io::Error::other("injected close metadata replacement failure"));
+    }
+    replace_meta_locked(st, &meta)?;
+    #[cfg(test)]
+    if fault == 2 {
+        return Err(std::io::Error::other("injected close directory sync failure after rename"));
+    }
+    fsync_parent_dir(&meta_path(&st.file_path))?;
+    #[cfg(test)]
+    if let Some(hook) = st.close_meta_hook.lock().unwrap().as_ref() {
+        hook();
+    }
+    let tail = {
+        let mut shared = st.shared.write().unwrap();
+        shared.commit_append_metadata(
+            candidate.producer.as_ref().map(|(id, state)| (id.as_str(), *state)),
+            candidate.seq_header.as_deref(),
+        );
+        shared.closed_durable = true;
+        shared.durable_tail
+    };
+    // Publication belongs to this owned worker rather than its cancellable
+    // waiter. A later sweep cannot reopen the just-fsynced closure.
+    st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
+    #[cfg(target_os = "linux")]
+    crate::sse_reactor::wake_stream(st);
+    Ok(())
 }
 
 fn write_meta_locked(st: &StreamState, durable: bool) -> std::io::Result<()> {
@@ -3732,7 +3905,12 @@ mod meta_sweep_tests {
         let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
 
-        st.shared.write().unwrap().producers.insert("p1".into(), ProducerState { epoch: 1, last_seq: 3 });
+        let state = ProducerState { epoch: 1, last_seq: 3 };
+        st.shared
+            .write()
+            .unwrap()
+            .producers
+            .insert("p1".into(), ProducerEntry { writer: state, committed: Some(state) });
         store.mark_meta_dirty(&st);
         store.mark_meta_dirty(&st); // second mark while pending: deduped
 

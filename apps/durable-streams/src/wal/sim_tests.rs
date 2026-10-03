@@ -633,7 +633,7 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                     floor: 0,
                 });
             }
-            // ---- cancelled append (network drop) ----
+            // ---- cancelled direct handler (not a socket-disconnect model) ----
             _ if op < 14 => {
                 if let Some(mi) = sim.pick(|m| !m.deleted && !m.closed) {
                     cancelled_append(sim, store, mi).await;
@@ -644,11 +644,29 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
                 if let Some(mi) = sim.pick(|m| !m.deleted && !m.closed) {
                     let name = sim.models[mi].name.clone();
                     let ct = if sim.models[mi].json { JSON_CT } else { OCTET };
-                    let resp =
-                        handlers::handle(Arc::clone(store), post_req(&name, ct, b"", &[("stream-closed", "true")]))
+                    let resp = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        loop {
+                            let response = handlers::handle(
+                                Arc::clone(store),
+                                post_req(&name, ct, b"", &[("stream-closed", "true")]),
+                            )
                             .await;
+                            // A cancelled request's owned completion can still
+                            // wait for WAL durability. Retry only this status;
+                            // the deadline includes each handler's own await.
+                            if response.status != 503 {
+                                break response;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    })
+                    .await
+                    .unwrap_or_else(|_| sim.fail(format!("close {name} did not finish within 2 seconds")));
                     if !(200..300).contains(&resp.status) {
                         sim.fail(format!("close {name} rejected: {}", resp.status));
+                    }
+                    if !store.get(&name).is_some_and(|stream| stream.tail().closed) {
+                        sim.fail(format!("close {name} acknowledged without durable EOF"));
                     }
                     sim.note(format!("close {name}"));
                     sim.models[mi].closed = true;
@@ -730,9 +748,10 @@ async fn run_generation(sim: &mut Sim, store: &Arc<Store>, walset: &Arc<WalSet>,
             }
             // ---- live tail sanity ----
             // The reader-visible tail (durable_tail) may lawfully LAG the file
-            // length: a cancelled append leaves bytes in the file whose publish
-            // never ran (healed monotonically by the next acked append, or
-            // exposed by crash recovery). It must never EXCEED the file though.
+            // length while a staged append's owner still awaits its WAL barrier,
+            // including the detached completion of a cancelled direct handler.
+            // Runtime shutdown leaves recovery to finish that boundary. The
+            // published tail must never EXCEED the file though.
             _ if op < 33 => {
                 if let Some(mi) = sim.pick(|m| !m.deleted) {
                     let name = sim.models[mi].name.clone();

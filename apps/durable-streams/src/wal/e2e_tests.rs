@@ -117,6 +117,20 @@ fn post_req(path: &str, content_type: &str, body: &[u8]) -> Req {
     }
 }
 
+fn producer_post(path: &str, body: &[u8], epoch: u64, seq: u64, close: bool) -> Req {
+    let mut request = post_req(path, OCTET, body);
+    request.headers.extend([
+        ("producer-id".into(), "producer".into()),
+        ("producer-epoch".into(), epoch.to_string()),
+        ("producer-seq".into(), seq.to_string()),
+        ("stream-seq".into(), format!("{epoch:04}-{seq:04}")),
+    ]);
+    if close {
+        request.headers.push(("stream-closed".into(), "true".into()));
+    }
+    request
+}
+
 /// Create a stream over the REAL HTTP path; assert a 2xx.
 async fn create_stream(store: &Arc<Store>, path: &str, content_type: &str) {
     let resp = handlers::handle(Arc::clone(store), put_req(path, content_type, b"", &[])).await;
@@ -878,6 +892,733 @@ fn append_meta_image(meta: &crate::store::Meta) -> serde_json::Value {
     })
 }
 
+fn append_shared_image(stream: &crate::store::StreamState) -> serde_json::Value {
+    let shared = stream.shared.read().unwrap();
+    serde_json::json!({
+        "closed": shared.closed,
+        "closed_by": shared.closed_by,
+        "producers": shared.producers.iter().map(|(id, entry)| (id, entry.writer)).collect::<std::collections::HashMap<_, _>>(),
+        "last_seq_header": shared.last_seq_header,
+        "durable_tail": shared.durable_tail,
+    })
+}
+
+/// Dirty work from an acknowledged append or a TTL read must never persist
+/// writer state from a later POST rejected before WAL staging. Checkpoint's
+/// tail capture is deliberately completed before the failed append begins:
+/// this fixture isolates its sidecar write from the separate tail-map proof.
+async fn general_metadata_does_not_persist_failed_append(checkpoint: bool) {
+    let dir = temp_dir(if checkpoint { "general-meta-checkpoint" } else { "general-meta-sweep" });
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    let create = put_req("stream", OCTET, b"", &[("stream-ttl", "60")]);
+    assert_eq!(handlers::handle(h.store.clone(), create).await.status, 201);
+    let stream = h.store.get("stream").unwrap();
+    let sidecar = crate::store::meta_path(&stream.file_path);
+    let read_meta = || serde_json::from_slice::<crate::store::Meta>(&std::fs::read(&sidecar).unwrap()).unwrap();
+    let producer_request = |sequence: u64, body: &[u8], close: bool| {
+        let mut request = post_req("stream", OCTET, body);
+        request.headers.extend([
+            ("producer-id".into(), "producer".into()),
+            ("producer-epoch".into(), "1".into()),
+            ("producer-seq".into(), sequence.to_string()),
+            ("stream-seq".into(), format!("{sequence:04}")),
+        ]);
+        if close {
+            request.headers.push(("stream-closed".into(), "true".into()));
+        }
+        request
+    };
+    assert_eq!(handlers::handle(h.store.clone(), producer_request(0, b"baseline|", false)).await.status, 200);
+    h.walset.shards()[0].checkpoint().await.unwrap();
+    assert!(!stream.meta_dirty.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(append_meta_image(&read_meta()), append_shared_image(&stream));
+
+    let mut expected_bytes = b"baseline|".to_vec();
+    let failed_sequence = if checkpoint {
+        // The previous acknowledged producer update, not fabricated shared
+        // state, provides checkpoint's pending metadata work.
+        assert_eq!(handlers::handle(h.store.clone(), producer_request(1, b"prior|", false)).await.status, 200);
+        expected_bytes.extend_from_slice(b"prior|");
+        assert!(stream.meta_dirty.load(std::sync::atomic::Ordering::Acquire));
+        2
+    } else {
+        // GET is the real sliding-TTL renewal/queue route. HEAD and ordinary
+        // get() intentionally do not supply dirty metadata work.
+        assert!(h.store.get_for_read("stream").is_some());
+        assert!(stream.meta_dirty.load(std::sync::atomic::Ordering::Acquire));
+        1
+    };
+    let committed = append_shared_image(&stream);
+
+    let mut checkpoint_pause = None;
+    let mut checkpoint_task = None;
+    if checkpoint {
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let captured_tx = std::sync::Mutex::new(Some(captured_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        h.walset.shards()[0].set_on_checkpoint_tails_hook(Box::new(move || {
+            if let Some(captured) = captured_tx.lock().unwrap().take() {
+                let _ = captured.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }));
+        checkpoint_pause = Some(StagePause(release_tx));
+        let shard = h.walset.shards()[0].clone();
+        checkpoint_task = Some(tokio::spawn(async move { shard.checkpoint().await }));
+        tokio::time::timeout(std::time::Duration::from_secs(2), captured_rx).await.unwrap().unwrap();
+    }
+
+    let stream_id = stream.id;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    h.walset.shards()[0].set_on_stage_hook(Box::new(move |id| {
+        if id == stream_id {
+            if let Some(entered) = entered_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), producer_request(failed_sequence, &[b'x'; 512], true)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    let speculative = append_shared_image(&stream);
+    let speculative_close_visible = stream.shared.read().unwrap().closed_durable;
+    drop(checkpoint_pause);
+    let crossed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let swept = if let Some(task) = checkpoint_task.as_mut() {
+            task.await.unwrap().unwrap();
+            None
+        } else {
+            let store = h.store.clone();
+            Some(tokio::task::spawn_blocking(move || store.sweep_meta_once()).await.unwrap())
+        };
+        (append_meta_image(&read_meta()), swept)
+    })
+    .await;
+    // Release and join the real POST before asserting metadata images or
+    // dropping the runtime. Its body cannot fit a 256-byte WAL segment.
+    drop(pause);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap();
+    if crossed.is_err() {
+        if let Some(task) = checkpoint_task.as_mut() {
+            task.await.unwrap().unwrap();
+        }
+    }
+    h.walset.shards()[0].set_on_stage_hook(Box::new(|_| {}));
+    h.walset.shards()[0].set_on_checkpoint_tails_hook(Box::new(|| {}));
+    let rolled_back = append_shared_image(&stream);
+    let live_bytes = stream_file_bytes(&h.store, "stream");
+    let (persisted, swept) = crossed.expect("metadata writer must finish while the failed append is paused");
+    drop(stream);
+    h.crash();
+
+    // Run the complete production recovery sequence before comparing the
+    // captured sidecar, live rollback and reopened state.
+    let reopened = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered = append_meta_image(&read_meta());
+    let reopened_stream = reopened.store.get("stream").unwrap();
+    let reopened_state = append_shared_image(&reopened_stream);
+    let recovered_bytes = stream_file_bytes(&reopened.store, "stream");
+    drop(reopened_stream);
+    reopened.crash();
+    assert_eq!(response.status, 500, "oversized append must fail staging");
+    if !checkpoint {
+        assert_eq!(swept, Some(1), "the legitimate TTL renewal must supply one sweep write");
+    }
+    assert_eq!(speculative["closed"], true, "the pause must cross the speculative close window");
+    assert!(!speculative_close_visible, "the failed close was never reader-visible");
+    assert_ne!(speculative["producers"], committed["producers"], "the pause must cross a producer update");
+    assert_ne!(speculative["last_seq_header"], committed["last_seq_header"], "the pause must cross a writer update");
+    assert_eq!(rolled_back, committed, "the failed append restores the live metadata");
+    assert_eq!(live_bytes, expected_bytes, "stage failure removes its attempted bytes before restart");
+    assert_eq!(recovered_bytes, expected_bytes, "no bytes from the failed append recover");
+    assert_eq!(
+        (persisted, recovered, reopened_state),
+        (committed.clone(), committed.clone(), committed),
+        "the general metadata write and reopened stream must contain only committed append state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_general_meta_sweep_does_not_persist_failed_append() {
+    let _guard = DurabilityGuard::wal();
+    general_metadata_does_not_persist_failed_append(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_general_meta_checkpoint_does_not_persist_failed_append() {
+    let _guard = DurabilityGuard::wal();
+    general_metadata_does_not_persist_failed_append(true).await;
+}
+
+async fn duplicate_waiting_for_durability(close: bool, committed_retry: bool) {
+    let dir = temp_dir("duplicate-before-durability");
+    let mut h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    let request = |seq: u64, close: bool| {
+        let mut request = post_req("stream", OCTET, b"record|");
+        request.headers.extend([
+            ("producer-id".into(), "producer".into()),
+            ("producer-epoch".into(), "1".into()),
+            ("producer-seq".into(), seq.to_string()),
+        ]);
+        if close {
+            request.headers.push(("stream-closed".into(), "true".into()));
+        }
+        request
+    };
+    assert_eq!(handlers::handle(h.store.clone(), request(0, false)).await.status, 200);
+    h.stop_committers();
+    let append = tokio::spawn(handlers::handle(h.store.clone(), request(1, close)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while h.walset.shards()[0].waiter_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let duplicate = handlers::handle(h.store.clone(), request(if committed_retry { 0 } else { 1 }, close)).await;
+    let speculative = h.store.get("stream").unwrap().tail();
+    h.committers.push(h.walset.shards()[0].spawn_committer());
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap();
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let bytes = stream_file_bytes(&reopened.store, "stream");
+    reopened.crash();
+    assert_eq!(response.status, 200);
+    assert_eq!(speculative.bytes, 7);
+    assert!(!speculative.closed, "pending close must not be visible");
+    assert_eq!(bytes, b"record|record|");
+    if committed_retry {
+        assert_eq!(duplicate.status, 204);
+        assert_eq!(
+            duplicate
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case("producer-seq"))
+                .map(|(_, value)| value.as_str()),
+            Some("0"),
+            "duplicate replies report the committed sequence"
+        );
+    } else {
+        assert_eq!(duplicate.status, 503, "a duplicate must retry until its bytes and any closure are durable");
+    }
+}
+
+#[tokio::test]
+async fn e2e_duplicate_does_not_ack_pending_append() {
+    let _guard = DurabilityGuard::wal();
+    duplicate_waiting_for_durability(false, false).await;
+}
+
+#[tokio::test]
+async fn e2e_duplicate_does_not_ack_pending_close() {
+    let _guard = DurabilityGuard::wal();
+    duplicate_waiting_for_durability(true, false).await;
+}
+
+#[tokio::test]
+async fn e2e_duplicate_does_not_report_pending_producer_sequence() {
+    let _guard = DurabilityGuard::wal();
+    duplicate_waiting_for_durability(false, true).await;
+}
+
+async fn cancelled_staged_request_finishes_publication(initial_put: bool, close_body: bool, immediate_close: bool) {
+    let dir = temp_dir("cancelled-staged-publication");
+    let mut h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    if !initial_put {
+        create_stream(&h.store, "stream", OCTET).await;
+    }
+    h.stop_committers();
+    let request = if initial_put {
+        put_req("stream", OCTET, b"body|", &[])
+    } else {
+        producer_post("stream", b"body|", 1, 0, close_body)
+    };
+    let append = tokio::spawn(handlers::handle(h.store.clone(), request));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while h.walset.shards()[0].waiter_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let stream = h.store.get("stream").unwrap();
+    append.abort();
+    let cancelled = append.await;
+    let retained_admission = stream.admitted_operations();
+    let close_request = || {
+        let mut close = post_req("stream", OCTET, b"");
+        close.headers.push(("stream-closed".into(), "true".into()));
+        close
+    };
+    // Keep the committer stopped: this request cannot depend on whether the
+    // detached continuation has already been polled by this runtime.
+    let premature_close = if immediate_close {
+        let response = handlers::handle(h.store.clone(), close_request()).await;
+        Some((response.status, stream.tail()))
+    } else {
+        None
+    };
+    h.committers.push(h.walset.shards()[0].spawn_committer());
+    let publication = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let committed = initial_put || stream.shared.read().unwrap().producers["producer"].committed.is_some();
+            if stream.tail().bytes == 5 && committed && stream.admitted_operations() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let retry = if initial_put {
+        put_req("stream", OCTET, b"", &[])
+    } else {
+        producer_post("stream", b"body|", 1, 0, close_body)
+    };
+    let duplicate = handlers::handle(h.store.clone(), retry).await;
+    let close = handlers::handle(h.store.clone(), close_request()).await;
+    let live_tail = stream.tail();
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let bytes = stream_file_bytes(&reopened.store, "stream");
+    let tail = reopened.store.get("stream").unwrap().tail();
+    reopened.crash();
+    assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+    assert_eq!(
+        (retained_admission, publication.is_ok(), duplicate.status, close.status),
+        (
+            1,
+            true,
+            if initial_put {
+                200
+            } else if immediate_close {
+                409
+            } else {
+                204
+            },
+            204
+        ),
+        "staged ownership must survive cancellation and finish publication, metadata and later requests"
+    );
+    if immediate_close {
+        assert_eq!(premature_close, Some((503, crate::store::Tail { bytes: 0, closed: false })));
+    }
+    assert_eq!(live_tail, crate::store::Tail { bytes: 5, closed: true });
+    assert_eq!(bytes, b"body|");
+    assert_eq!(tail, live_tail);
+}
+
+#[tokio::test]
+async fn e2e_cancelled_staged_append_finishes_publication_and_metadata() {
+    let _guard = DurabilityGuard::wal();
+    cancelled_staged_request_finishes_publication(false, false, false).await;
+}
+
+#[tokio::test]
+async fn e2e_cancelled_initial_put_body_finishes_publication() {
+    let _guard = DurabilityGuard::wal();
+    cancelled_staged_request_finishes_publication(true, false, false).await;
+}
+
+#[tokio::test]
+async fn e2e_cancelled_staged_close_body_finishes_original_candidate() {
+    let _guard = DurabilityGuard::wal();
+    cancelled_staged_request_finishes_publication(false, true, false).await;
+}
+
+#[tokio::test]
+async fn e2e_cancelled_staged_append_allows_close_retry_after_immediate_503() {
+    let _guard = DurabilityGuard::wal();
+    cancelled_staged_request_finishes_publication(false, false, true).await;
+}
+
+#[tokio::test]
+async fn e2e_close_only_waits_for_preceding_append_durability() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("close-only-pending-body");
+    let mut h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    h.stop_committers();
+    let append = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", b"body|", 1, 0, false)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while h.walset.shards()[0].waiter_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let close = || {
+        let mut close = post_req("stream", OCTET, b"");
+        close.headers.push(("stream-closed".into(), "true".into()));
+        close
+    };
+    let pending = handlers::handle(h.store.clone(), close()).await;
+    let before_durability = h.store.get("stream").unwrap().tail();
+    h.committers.push(h.walset.shards()[0].spawn_committer());
+    assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(2), append).await.unwrap().unwrap().status, 200);
+    let completed = handlers::handle(h.store.clone(), close()).await;
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let bytes = stream_file_bytes(&reopened.store, "stream");
+    let tail = reopened.store.get("stream").unwrap().tail();
+    reopened.crash();
+    assert_eq!(pending.status, 503, "close-only cannot commit EOF ahead of preceding bytes");
+    assert_eq!(before_durability, crate::store::Tail { bytes: 0, closed: false });
+    assert_eq!(completed.status, 204, "matching close retries finish once bytes are durable");
+    assert_eq!(bytes, b"body|");
+    assert_eq!(tail, crate::store::Tail { bytes: 5, closed: true });
+}
+
+#[tokio::test]
+async fn e2e_failed_close_metadata_retries_original_candidate() {
+    let _guard = DurabilityGuard::wal();
+    for after_rename in [false, true] {
+        let dir = temp_dir("close-meta-failure-retry");
+        let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+        assert_eq!(
+            handlers::handle(h.store.clone(), put_req("stream", OCTET, b"", &[("stream-ttl", "60")])).await.status,
+            201
+        );
+        let stream = h.store.get("stream").unwrap();
+        let read_meta = || {
+            serde_json::from_slice::<crate::store::Meta>(
+                &std::fs::read(crate::store::meta_path(&stream.file_path)).unwrap(),
+            )
+            .unwrap()
+        };
+        stream.fail_close_meta_once(after_rename);
+        let failed = handlers::handle(h.store.clone(), producer_post("stream", b"body|", 1, 0, true)).await;
+        let uncertain_meta = read_meta();
+        let uncommitted_tail = stream.tail();
+        assert!(h.store.get_for_read("stream").is_some());
+        let swept = tokio::task::spawn_blocking({
+            let store = h.store.clone();
+            move || store.sweep_meta_once()
+        })
+        .await
+        .unwrap();
+        let swept_meta = read_meta();
+        let mismatch = handlers::handle(h.store.clone(), producer_post("stream", b"body|", 1, 1, true)).await;
+        let mut unowned = post_req("stream", OCTET, b"different|");
+        unowned.headers.push(("stream-closed".into(), "true".into()));
+        let unowned = handlers::handle(h.store.clone(), unowned).await;
+        let retry = || {
+            let mut retry = producer_post("stream", b"body-must-not-be-written-twice|", 1, 0, true);
+            retry.headers.iter_mut().find(|(key, _)| key == "stream-seq").unwrap().1 = "9999".into();
+            retry
+        };
+        let producerless_retry = || {
+            let mut retry = post_req("stream", OCTET, b"");
+            retry.headers.push(("stream-closed".into(), "true".into()));
+            retry
+        };
+        let (first, second) = tokio::join!(
+            handlers::handle(h.store.clone(), retry()),
+            handlers::handle(h.store.clone(), producerless_retry())
+        );
+        let committed_meta = read_meta();
+        let committed_tail = stream.tail();
+        drop(stream);
+        h.crash();
+        let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+        let bytes = stream_file_bytes(&reopened.store, "stream");
+        let tail = reopened.store.get("stream").unwrap().tail();
+        reopened.crash();
+        assert_eq!(failed.status, 500);
+        assert_eq!(
+            uncertain_meta.closed, after_rename,
+            "post-rename failure leaves an explicitly uncertain disk image"
+        );
+        assert_eq!(uncommitted_tail, crate::store::Tail { bytes: 5, closed: false });
+        assert_eq!(swept, 1);
+        assert!(!swept_meta.closed, "general writers must not commit a failed close candidate");
+        assert!(swept_meta.producers.is_empty());
+        assert!(swept_meta.last_seq_header.is_none());
+        assert_eq!(mismatch.status, 409);
+        assert_eq!(unowned.status, 409);
+        assert_eq!((first.status, second.status), (204, 204));
+        assert!(committed_meta.closed);
+        assert_eq!(
+            committed_meta.closed_by,
+            Some(("producer".into(), 1, 0)),
+            "producerless retry preserves original close ownership"
+        );
+        assert_eq!(
+            committed_meta.last_seq_header.as_deref(),
+            Some("0001-0000"),
+            "retry preserves the accepted writer sequence"
+        );
+        assert_eq!(committed_meta.producers["producer"].last_seq, 0);
+        assert_eq!(committed_tail, crate::store::Tail { bytes: 5, closed: true });
+        assert_eq!(bytes, b"body|", "retry never appends the candidate's body again");
+        assert_eq!(tail, committed_tail);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_committed_metadata_does_not_regress_with_callback_order() {
+    let _guard = DurabilityGuard::wal();
+    for next_epoch in [1, 2] {
+        let dir = temp_dir("append-commit-order");
+        let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+        create_stream(&h.store, "stream", OCTET).await;
+        let stream = h.store.get("stream").unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        stream.set_append_commit_hook(Box::new(move |tail| {
+            if tail == 6 {
+                if let Some(entered) = entered_tx.lock().unwrap().take() {
+                    let _ = entered.send(());
+                    let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+                }
+            }
+        }));
+        let pause = StagePause(release_tx);
+        let first = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", b"first|", 1, 0, false)));
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+        let next_seq = u64::from(next_epoch == 1);
+        let second =
+            handlers::handle(h.store.clone(), producer_post("stream", b"second|", next_epoch, next_seq, false)).await;
+        drop(pause);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), first).await.unwrap().unwrap();
+        stream.set_append_commit_hook(Box::new(|_| {}));
+        h.walset.shards()[0].checkpoint().await.unwrap();
+        let meta: crate::store::Meta =
+            serde_json::from_slice(&std::fs::read(crate::store::meta_path(&stream.file_path)).unwrap()).unwrap();
+        let committed = stream.shared.read().unwrap().producers["producer"].committed.unwrap();
+        drop(stream);
+        h.crash();
+        let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+        let recovered =
+            reopened.store.get("stream").unwrap().shared.read().unwrap().producers["producer"].committed.unwrap();
+        let bytes = stream_file_bytes(&reopened.store, "stream");
+        reopened.crash();
+        assert_eq!((first.status, second.status), (200, 200));
+        assert_eq!((committed.epoch, committed.last_seq), (next_epoch, next_seq));
+        assert_eq!((meta.producers["producer"].epoch, meta.producers["producer"].last_seq), (next_epoch, next_seq));
+        assert_eq!((recovered.epoch, recovered.last_seq), (next_epoch, next_seq));
+        assert_eq!(meta.last_seq_header, Some(format!("{next_epoch:04}-{next_seq:04}")));
+        assert_eq!(bytes, b"first|second|");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn e2e_stage_rollback_preserves_an_earlier_commit_promotion() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("rollback-preserves-commit");
+    let h = Harness::boot_with_segment_size(dir.path(), Some(1), 1, 256).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    let stream = h.store.get("stream").unwrap();
+    let (committed_tx, committed_rx) = tokio::sync::oneshot::channel();
+    let committed_tx = std::sync::Mutex::new(Some(committed_tx));
+    let (first_release_tx, first_release_rx) = std::sync::mpsc::channel();
+    let first_release_rx = std::sync::Mutex::new(first_release_rx);
+    stream.set_append_commit_hook(Box::new(move |tail| {
+        if tail == 6 {
+            if let Some(entered) = committed_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = first_release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let first_pause = StagePause(first_release_tx);
+    let first = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", b"first|", 1, 0, false)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), committed_rx).await.unwrap().unwrap();
+    let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+    let staged_tx = std::sync::Mutex::new(Some(staged_tx));
+    let (failed_release_tx, failed_release_rx) = std::sync::mpsc::channel();
+    let failed_release_rx = std::sync::Mutex::new(failed_release_rx);
+    let stream_id = stream.id;
+    h.walset.shards()[0].set_on_stage_hook(Box::new(move |id| {
+        if id == stream_id {
+            if let Some(entered) = staged_tx.lock().unwrap().take() {
+                let _ = entered.send(());
+                let _ = failed_release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+            }
+        }
+    }));
+    let failed_pause = StagePause(failed_release_tx);
+    let failed = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", &[b'x'; 512], 1, 1, true)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), staged_rx).await.unwrap().unwrap();
+    drop(first_pause);
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), first).await.unwrap().unwrap();
+    let promoted = stream.shared.read().unwrap().producers["producer"].committed.unwrap();
+    crate::store::write_meta_sync(&stream, true).unwrap();
+    drop(failed_pause);
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(2), failed).await.unwrap().unwrap();
+    stream.set_append_commit_hook(Box::new(|_| {}));
+    h.walset.shards()[0].set_on_stage_hook(Box::new(|_| {}));
+    let rolled_back = stream.shared.read().unwrap().producers["producer"].committed.unwrap();
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot_with_segment_size(dir.path(), None, 1, 256).unwrap();
+    let recovered =
+        reopened.store.get("stream").unwrap().shared.read().unwrap().producers["producer"].committed.unwrap();
+    let bytes = stream_file_bytes(&reopened.store, "stream");
+    let closed = reopened.store.get("stream").unwrap().tail().closed;
+    reopened.crash();
+    assert_eq!(first.status, 200);
+    assert_eq!(failed.status, 500);
+    for state in [promoted, rolled_back, recovered] {
+        assert_eq!((state.epoch, state.last_seq), (1, 0), "rollback must retain earlier request-owned promotion");
+    }
+    assert_eq!(bytes, b"first|");
+    assert!(!closed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_close_worker_publishes_after_http_waiter_cancellation() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("owned-close-publication");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    let stream = h.store.get("stream").unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    stream.set_close_meta_hook(Box::new(move || {
+        if let Some(entered) = entered_tx.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", b"body|", 1, 0, true)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    append.abort();
+    let cancelled = append.await;
+    let before_publication = stream.tail();
+    let mut sweep = tokio::task::spawn_blocking({
+        let stream = stream.clone();
+        move || crate::store::write_meta_sync(&stream, true)
+    });
+    let writer_blocked = tokio::time::timeout(std::time::Duration::from_millis(30), &mut sweep).await.is_err();
+    drop(pause);
+    let swept = sweep.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !stream.tail().closed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let committed_tail = stream.tail();
+    let meta: crate::store::Meta =
+        serde_json::from_slice(&std::fs::read(crate::store::meta_path(&stream.file_path)).unwrap()).unwrap();
+    stream.set_close_meta_hook(Box::new(|| {}));
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let tail = reopened.store.get("stream").unwrap().tail();
+    let bytes = stream_file_bytes(&reopened.store, "stream");
+    reopened.crash();
+    assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+    assert_eq!(before_publication, crate::store::Tail { bytes: 5, closed: false });
+    assert!(writer_blocked, "general metadata capture waits for the owned close's publication");
+    swept.unwrap();
+    assert!(meta.closed, "a later general writer cannot reopen a committed close");
+    assert_eq!(meta.producers["producer"].last_seq, 0);
+    assert_eq!(committed_tail, crate::store::Tail { bytes: 5, closed: true });
+    assert_eq!(tail, committed_tail);
+    assert_eq!(bytes, b"body|");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn e2e_cancelled_close_worker_retains_admission_until_delete_can_finish() {
+    let _guard = DurabilityGuard::wal();
+    let dir = temp_dir("owned-close-delete-admission");
+    let h = Harness::boot(dir.path(), Some(1), 1).unwrap();
+    create_stream(&h.store, "stream", OCTET).await;
+    let stream = h.store.get("stream").unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    stream.set_close_meta_hook(Box::new(move || {
+        if let Some(entered) = entered_tx.lock().unwrap().take() {
+            let _ = entered.send(());
+            let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }));
+    let pause = StagePause(release_tx);
+    let append = tokio::spawn(handlers::handle(h.store.clone(), producer_post("stream", b"body|", 1, 0, true)));
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    append.abort();
+    let cancelled = append.await;
+    let owned_admission = stream.admitted_operations();
+    let mut deletion = tokio::spawn(handlers::handle(
+        h.store.clone(),
+        Req { method: Method::Delete, path: "stream".into(), query: None, headers: vec![], body: Bytes::new() },
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !stream.is_retiring() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let delete_blocked = tokio::time::timeout(std::time::Duration::from_millis(30), &mut deletion).await.is_err();
+    let files_retained = stream.file_path.exists() && crate::store::meta_path(&stream.file_path).exists();
+    drop(pause);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), deletion).await.unwrap().unwrap();
+    let admission_released = stream.admitted_operations();
+    let files_absent = !stream.file_path.exists() && !crate::store::meta_path(&stream.file_path).exists();
+    stream.set_close_meta_hook(Box::new(|| {}));
+    drop(stream);
+    h.crash();
+    let reopened = Harness::boot(dir.path(), None, 1).unwrap();
+    let remains_absent = reopened.store.get("stream").is_none();
+    reopened.crash();
+    assert!(matches!(cancelled, Err(error) if error.is_cancelled()));
+    assert_eq!(owned_admission, 1, "owned worker retains the original admission after HTTP cancellation");
+    assert!(delete_blocked, "DELETE drains the owned worker without unlinking its sidecar");
+    assert!(files_retained);
+    assert_eq!(response.status, 204);
+    assert_eq!(admission_released, 0);
+    assert!(files_absent);
+    assert!(remains_absent);
+}
+
+#[tokio::test]
+async fn e2e_committed_metadata_memory_mode_and_put_body() {
+    let _guard = DurabilityGuard::memory();
+    let dir = temp_dir("memory-committed-metadata");
+    let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+    assert_eq!(handlers::handle(store.clone(), put_req("stream", OCTET, b"initial|", &[])).await.status, 201);
+    assert_eq!(handlers::handle(store.clone(), producer_post("stream", b"open|", 1, 0, false)).await.status, 200);
+    assert_eq!(store.sweep_meta_once(), 1);
+    let stream = store.get("stream").unwrap();
+    let swept: crate::store::Meta =
+        serde_json::from_slice(&std::fs::read(crate::store::meta_path(&stream.file_path)).unwrap()).unwrap();
+    assert_eq!(handlers::handle(store.clone(), producer_post("stream", b"close|", 1, 1, true)).await.status, 200);
+    let mut closed_put = put_req("closed-put", OCTET, b"closed-body|", &[]);
+    closed_put.headers.push(("stream-closed".into(), "true".into()));
+    assert_eq!(handlers::handle(store.clone(), closed_put).await.status, 201);
+    drop(stream);
+    drop(store);
+    let reopened = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+    let stream = reopened.get("stream").unwrap();
+    let committed = stream.shared.read().unwrap().producers["producer"].committed.unwrap();
+    assert!(!swept.closed);
+    assert_eq!(swept.producers["producer"].last_seq, 0);
+    assert_eq!(swept.last_seq_header.as_deref(), Some("0001-0000"));
+    assert_eq!(std::fs::read(&stream.file_path).unwrap(), b"initial|open|close|");
+    assert!(stream.tail().closed);
+    assert_eq!((committed.epoch, committed.last_seq), (1, 1));
+    let closed_put = reopened.get("closed-put").unwrap();
+    assert!(closed_put.tail().closed);
+    assert_eq!(std::fs::read(&closed_put.file_path).unwrap(), b"closed-body|");
+}
+
 /// Cross a real fork-reference update with an append that has changed its
 /// speculative writer state but has not staged any WAL record. Its 512-byte
 /// body cannot fit the fixture's 256-byte segment, so releasing the hook
@@ -969,7 +1710,7 @@ async fn fork_reference_does_not_persist_inflight_append(release_child: bool) {
     let reopened_state = serde_json::json!({
         "closed": reopened.closed,
         "closed_by": reopened.closed_by,
-        "producers": reopened.producers,
+        "producers": reopened.producers.iter().map(|(id, entry)| (id, entry.writer)).collect::<std::collections::HashMap<_, _>>(),
         "last_seq_header": reopened.last_seq_header,
         "durable_tail": reopened.durable_tail,
     });

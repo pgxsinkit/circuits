@@ -646,6 +646,7 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             let Some(_operation) = st.begin_operation() else {
                 return gone();
             };
+            let mut completion_owner = None;
             if let Some(wire) = wire {
                 let lock_t0 = crate::telemetry::Timer::start();
                 let mut ap = st.appender.lock().await;
@@ -680,11 +681,25 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
                     }
                 };
                 drop(ap);
-                if let Some(lsn) = staged_lsn {
-                    wait_durable_lsn(&store, &st, lsn).await;
+                let operation = _operation.into_owned(st.clone());
+                let mut completion = AppendCompletion {
+                    store: store.clone(),
+                    stream: st.clone(),
+                    wire,
+                    tail: Some(new_tail),
+                    lsn: staged_lsn,
+                    producer: None,
+                    seq_header: None,
+                    close: None,
+                    meta_persist_needed: false,
+                    seal_on_completion: false,
+                    operation: Some(operation),
+                    completed: false,
+                };
+                if completion.finish().await.is_err() {
+                    return text_response(500, "initial body publication failed");
                 }
-                // Durable now (wal) / page-cache written (memory): expose to readers.
-                publish_durable_tail(&st, new_tail, &wire);
+                completion_owner = Some(completion);
             }
             let t = st.tail();
             let mut b = ResponseBuilder::new(201)
@@ -694,7 +709,9 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
             if t.closed {
                 b = b.hs(H_CLOSED, "true");
             }
-            b.body(empty())
+            let response = b.body(empty());
+            drop(completion_owner);
+            response
         }
     }
 }
@@ -897,6 +914,7 @@ fn parse_producer_headers(req: &Req) -> Result<Option<ProducerHeaders>, &'static
 enum ProducerOutcome {
     Accept,
     Duplicate { last_seq: u64 },
+    Pending,
     StaleEpoch { current: u64 },
     Gap { expected: u64 },
     BadEpochStart,
@@ -911,7 +929,8 @@ fn validate_producer(shared: &Shared, p: &ProducerHeaders) -> ProducerOutcome {
                 ProducerOutcome::Gap { expected: 0 }
             }
         }
-        Some(state) => {
+        Some(entry) => {
+            let state = &entry.writer;
             if p.epoch < state.epoch {
                 ProducerOutcome::StaleEpoch { current: state.epoch }
             } else if p.epoch > state.epoch {
@@ -921,12 +940,128 @@ fn validate_producer(shared: &Shared, p: &ProducerHeaders) -> ProducerOutcome {
                     ProducerOutcome::BadEpochStart
                 }
             } else if p.seq <= state.last_seq {
-                ProducerOutcome::Duplicate { last_seq: state.last_seq }
+                match entry.committed {
+                    Some(committed) if committed.epoch == p.epoch && p.seq <= committed.last_seq => {
+                        ProducerOutcome::Duplicate { last_seq: committed.last_seq }
+                    }
+                    _ => ProducerOutcome::Pending,
+                }
             } else if p.seq == state.last_seq + 1 {
                 ProducerOutcome::Accept
             } else {
                 ProducerOutcome::Gap { expected: state.last_seq + 1 }
             }
+        }
+    }
+}
+
+fn spawn_close(
+    stream: Arc<StreamState>,
+    candidate: CloseCandidate,
+    operation: OwnedStreamOperationGuard,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    tokio::task::spawn_blocking(move || {
+        let _operation = operation;
+        commit_close_sync(&stream, &candidate)
+    })
+}
+
+async fn await_close(worker: tokio::task::JoinHandle<std::io::Result<()>>) -> std::io::Result<()> {
+    worker.await.unwrap_or_else(|error| Err(std::io::Error::other(format!("close worker failed: {error}"))))
+}
+
+/// Successful staging commits the process to finish publication even when its
+/// HTTP waiter disappears. The usual completion stays inline; only cancellation
+/// schedules another async task, retaining the original lifecycle admission.
+struct AppendCompletion {
+    store: Arc<Store>,
+    stream: Arc<StreamState>,
+    wire: Bytes,
+    tail: Option<u64>,
+    lsn: Option<u64>,
+    producer: Option<ProducerHeaders>,
+    seq_header: Option<String>,
+    close: Option<CloseCandidate>,
+    meta_persist_needed: bool,
+    seal_on_completion: bool,
+    operation: Option<OwnedStreamOperationGuard>,
+    completed: bool,
+}
+
+impl AppendCompletion {
+    async fn finish(&mut self) -> std::io::Result<()> {
+        if let Some(lsn) = self.lsn {
+            let dur_t0 = std::time::Instant::now();
+            wait_durable_lsn(&self.store, &self.stream, lsn).await;
+            crate::srvstats::record_durwait(dur_t0.elapsed());
+        }
+        #[cfg(test)]
+        self.stream.run_append_commit_hook(self.tail.unwrap_or_else(|| self.stream.shared.read().unwrap().tail));
+        if let Some(tail) = self.tail {
+            publish_durable_tail(&self.stream, tail, &self.wire);
+        }
+        if let Some(candidate) = self.close.take() {
+            let operation = self.operation.take().expect("completion owns operation admission");
+            let worker = spawn_close(self.stream.clone(), candidate, operation);
+            // The job now owns admission and the close candidate, including a
+            // deliberate failure. Dropping its HTTP waiter must not retry it.
+            self.completed = true;
+            await_close(worker).await?;
+        } else {
+            if self.producer.is_some() || self.seq_header.is_some() {
+                self.stream.shared.write().unwrap().commit_append_metadata(
+                    self.producer.as_ref().map(|p| (p.id.as_str(), ProducerState { epoch: p.epoch, last_seq: p.seq })),
+                    self.seq_header.as_deref(),
+                );
+            }
+            if self.meta_persist_needed {
+                if self.lsn.is_some() {
+                    // WAL staging registered this stream with its shard. Its
+                    // checkpoint owns the lagging producer/sequence/TTL flush.
+                    self.stream.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
+                } else {
+                    // Memory-mode writes have no checkpoint: retain the shared
+                    // store sweep queue rather than a per-append timer/write.
+                    self.store.mark_meta_dirty(&self.stream);
+                }
+            }
+        }
+        if self.seal_on_completion && !self.wire.is_empty() {
+            maybe_seal_bg(&self.store, &self.stream);
+        }
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for AppendCompletion {
+    fn drop(&mut self) {
+        if self.completed || self.operation.is_none() {
+            return;
+        }
+        let mut continuation = Self {
+            store: self.store.clone(),
+            stream: self.stream.clone(),
+            wire: std::mem::take(&mut self.wire),
+            tail: self.tail,
+            lsn: self.lsn,
+            producer: self.producer.take(),
+            seq_header: self.seq_header.take(),
+            close: self.close.take(),
+            meta_persist_needed: self.meta_persist_needed,
+            seal_on_completion: self.seal_on_completion,
+            operation: self.operation.take(),
+            // The detached task has no cancellable HTTP owner. If runtime
+            // shutdown drops it, WAL recovery takes over; never recursively
+            // schedule new tasks while the runtime is tearing down.
+            completed: true,
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = continuation.finish().await {
+                    eprintln!("WARN: cancelled append completion for {} failed: {error}", continuation.stream.path);
+                }
+            });
         }
     }
 }
@@ -1033,46 +1168,57 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     crate::srvstats::record_applock_wait(srv_lock_t0.elapsed());
 
     // Closed checks (precedence: closed → seq regression → gap).
-    {
+    let retry_close = {
         let s = st.shared.read().unwrap();
         if s.closed {
             // Report the durable tail to clients (never an offset a crash could
             // roll back) — same monotonicity contract as `tail()`.
             let tail = s.durable_tail;
-            if close_req {
-                if let Some(p) = &producer {
-                    if let Some((cid, cep, cseq)) = &s.closed_by {
-                        if *cid == p.id && *cep == p.epoch && *cseq == p.seq {
-                            drop(s);
-                            ret!(
-                                ResponseBuilder::new(204)
-                                    .hs(H_CLOSED, "true")
-                                    .h(H_NEXT_OFFSET, format_offset(tail))
-                                    .h(H_PRODUCER_EPOCH, p.epoch.to_string())
-                                    .h(H_PRODUCER_SEQ, p.seq.to_string())
-                                    .body(empty()),
-                                Dup
-                            );
-                        }
-                    }
-                    drop(s);
-                    ret!(closed_conflict(tail), Closed);
-                }
-                if body.is_empty() {
-                    // idempotent close of an already-closed stream
-                    drop(s);
-                    ret!(
-                        ResponseBuilder::new(204)
-                            .hs(H_CLOSED, "true")
-                            .h(H_NEXT_OFFSET, format_offset(tail))
-                            .body(empty()),
-                        Dup
-                    );
-                }
+            let matching = close_req
+                && match &producer {
+                    Some(p) => s
+                        .closed_by
+                        .as_ref()
+                        .is_some_and(|(id, epoch, seq)| id == &p.id && *epoch == p.epoch && *seq == p.seq),
+                    None => body.is_empty(),
+                };
+            if !matching {
+                drop(s);
+                ret!(closed_conflict(tail), Closed);
             }
-            drop(s);
-            ret!(closed_conflict(tail), Closed);
+            if !s.closed_durable && s.durable_tail < s.tail {
+                drop(s);
+                ret!(text_response(503, "close is waiting for append durability"), Conflict);
+            }
+            Some(CloseCandidate {
+                producer: s
+                    .closed_by
+                    .as_ref()
+                    .map(|(id, epoch, seq)| (id.clone(), ProducerState { epoch: *epoch, last_seq: *seq })),
+                seq_header: s.last_seq_header.clone(),
+            })
+        } else {
+            None
         }
+    };
+    if let Some(candidate) = retry_close {
+        drop(ap);
+        let worker = spawn_close(st.clone(), candidate, _operation.into_owned(st.clone()));
+        if let Err(error) = await_close(worker).await {
+            ret!(
+                text_response(
+                    if error.kind() == std::io::ErrorKind::WouldBlock { 503 } else { 500 },
+                    "close not durable"
+                ),
+                Conflict
+            );
+        }
+        let mut response =
+            ResponseBuilder::new(204).hs(H_CLOSED, "true").h(H_NEXT_OFFSET, format_offset(st.tail().bytes));
+        if let Some(p) = &producer {
+            response = response.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
+        }
+        ret!(response.body(empty()), Dup);
     }
 
     // Producer validation.
@@ -1083,6 +1229,9 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         };
         match outcome {
             ProducerOutcome::Accept => {}
+            ProducerOutcome::Pending => {
+                ret!(text_response(503, "producer append is waiting for durability"), Conflict);
+            }
             ProducerOutcome::Duplicate { last_seq } => {
                 // Gate Stream-Closed on the stream's ACTUAL durable-closed state
                 // (what readers observe), not on the retry request's close flag.
@@ -1158,8 +1307,15 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     // client's retry as a duplicate: silent loss from the client's view).
     let (prev_producer, prev_seq_header) = {
         let sh = st.shared.read().unwrap();
-        (producer.as_ref().map(|p| (p.id.clone(), sh.producers.get(&p.id).cloned())), sh.last_seq_header.clone())
+        (
+            producer.as_ref().map(|p| (p.id.clone(), sh.producers.get(&p.id).map(|entry| entry.writer))),
+            sh.last_seq_header.clone(),
+        )
     };
+    let close_candidate = close_req.then(|| CloseCandidate {
+        producer: producer.as_ref().map(|p| (p.id.clone(), ProducerState { epoch: p.epoch, last_seq: p.seq })),
+        seq_header: seq_header.clone(),
+    });
     if !wire.is_empty() {
         match write_wire(&st, &mut ap, &wire) {
             Ok(t) => new_tail = Some(t),
@@ -1184,19 +1340,21 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
             s.last_access = SystemTime::now();
         }
         if let Some(p) = &producer {
-            s.producers.insert(p.id.clone(), ProducerState { epoch: p.epoch, last_seq: p.seq });
+            let state = ProducerState { epoch: p.epoch, last_seq: p.seq };
+            match s.producers.get_mut(&p.id) {
+                Some(entry) => entry.writer = state,
+                None => {
+                    s.producers.insert(p.id.clone(), ProducerEntry { writer: state, committed: None });
+                }
+            }
         }
-        if let Some(seq) = seq_header {
-            s.last_seq_header = Some(seq);
+        if let Some(seq) = &seq_header {
+            s.last_seq_header = Some(seq.clone());
         }
         if close_req {
-            // Set the closed flag in memory so the durable meta capture below
-            // records it, but DO NOT notify readers (tail_tx) yet. The closure
-            // must be durable before any reader can observe EOF; otherwise a
-            // reader could act on the close, the server could crash before the
-            // closure is fsynced, and the stream would recover OPEN — a
-            // monotonicity violation (PROTOCOL.md §4.1). The reader
-            // notification is deferred until after write_meta_sync completes.
+            // Fence later writers with close intent. General metadata captures
+            // still see an open stream; the owned close worker persists this
+            // request's candidate before publishing durable EOF to readers.
             s.closed = true;
             if let Some(p) = &producer {
                 s.closed_by = Some((p.id.clone(), p.epoch, p.seq));
@@ -1230,12 +1388,13 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
                     sh.tail = sh.file_base + pre_written;
                     if let Some((id, prev)) = &prev_producer {
                         match prev {
-                            Some(ps) => {
-                                sh.producers.insert(id.clone(), ps.clone());
-                            }
-                            None => {
-                                sh.producers.remove(id);
-                            }
+                            Some(ps) => sh.producers.get_mut(id).expect("writer entry survives staging").writer = *ps,
+                            None => match sh.producers.get(id).and_then(|entry| entry.committed) {
+                                Some(committed) => sh.producers.get_mut(id).unwrap().writer = committed,
+                                None => {
+                                    sh.producers.remove(id);
+                                }
+                            },
                         }
                     }
                     sh.last_seq_header = prev_seq_header.clone();
@@ -1252,83 +1411,34 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
     };
     drop(ap);
 
-    // Wait for durability off the lock before exposing the bytes.
-    if let Some(lsn) = staged_lsn {
-        let dur_t0 = std::time::Instant::now();
-        wait_durable_lsn(&store, &st, lsn).await;
-        crate::srvstats::record_durwait(dur_t0.elapsed());
-    }
-
-    // Durable now (wal) / page-cache written (memory): expose the new bytes to
-    // readers, mirroring the close-visibility ordering below.
-    if let Some(t) = new_tail {
-        publish_durable_tail(&st, t, &wire);
-    }
-
-    // Closure ordering: WAL fsync → durable meta commit → expose the closure to
-    // readers (closed_durable) and wake waiters. Readers never observe EOF for a
-    // closure that is not yet durable (PROTOCOL.md §4.1).
-    // Producer/access updates are debounced (documented crash window; see store::Meta).
-    if close_req {
-        let st2 = st.clone();
-        let meta_res = tokio::task::spawn_blocking(move || write_meta_sync(&st2, true)).await;
-        if !matches!(meta_res, Ok(Ok(()))) {
-            ret!(text_response(500, "close not durable"), Conflict);
-        }
-        let tail = {
-            let mut s = st.shared.write().unwrap();
-            s.closed_durable = true;
-            s.durable_tail
-        };
-        st.tail_tx.send_replace(Tail { bytes: tail, closed: true });
-        #[cfg(target_os = "linux")]
-        crate::sse_reactor::wake_stream(&st);
-    } else if staged_lsn.is_some() {
-        // WAL mode: the stream is in its shard's dirty set (register_dirty ran
-        // during staging), so the ~3 s checkpoint will write the sidecar for us —
-        // just mark it. This keeps the meta `File::create`+`rename` (and its
-        // parent-directory rwsem, measured at ~40% of server CPU under write
-        // saturation) plus a timer task OFF the per-append path. Producer/access
-        // updates are already documented as a non-durable, lagging flush; the lag
-        // bound moves from the 100 ms debounce to the checkpoint cadence.
-        //
-        // GATED (cardinality-cliff #1): only mark when the append changed state
-        // the sidecar must persist — producer/seq idempotency or a sliding TTL.
-        // A plain append still gets its fdatasync AND its `durable_tail` recorded
-        // in the checkpoint's per-shard `tails` map (register_dirty + the
-        // unconditional `persist_durable_tails`, independent of this flag) — and
-        // that map, not the sidecar, is the authoritative durable-tail proof
-        // recovery reconciles against (see wal/shard.rs step 3a, wal/recovery.rs).
-        // `last_access` only gates TTL. So a plain non-TTL append needs no sidecar
-        // rewrite here — dropping it removes the O(touched) `write_meta_sync` calls
-        // that dominate the checkpoint's meta phase at high stream cardinality.
-        if meta_persist_needed {
-            st.meta_dirty.store(true, std::sync::atomic::Ordering::Release);
-        }
-    } else if meta_persist_needed {
-        // No WAL record staged (memory durability): no checkpoint will flush
-        // the sidecar — queue it for the store-level periodic sweeper. Same
-        // batched treatment the wal branch above gets from the checkpoint: no
-        // per-stream timer task, no per-append sidecar rewrite (#4691).
-        //
-        // Only queued when the append actually changed state the sidecar must
-        // persist — producer/seq idempotency or a sliding TTL. A plain append to
-        // a non-TTL stream changes only `durable_tail`/`last_access`, and
-        // memory-mode recovery reads NEITHER (the tail is re-derived from the
-        // data-file length in `Store::new_with_tier`; `last_access` only gates
-        // TTL expiry, which these streams don't have). Skipping the queue for
-        // that common case removes the per-append sidecar rewrite whose cost
-        // stops amortizing at high stream cardinality.
-        store.mark_meta_dirty(&st);
-    }
-    if !wire.is_empty() {
-        maybe_seal_bg(&store, &st);
+    // Transfer admission before the first await after staging. A dropped HTTP
+    // waiter schedules completion; the common path stays inline and task-free.
+    let operation = _operation.into_owned(st.clone());
+    let mut completion = AppendCompletion {
+        store,
+        stream: st.clone(),
+        wire,
+        tail: new_tail,
+        lsn: staged_lsn,
+        producer,
+        seq_header,
+        close: close_candidate,
+        meta_persist_needed,
+        seal_on_completion: true,
+        operation: Some(operation),
+        completed: false,
+    };
+    if let Err(error) = completion.finish().await {
+        ret!(
+            text_response(if error.kind() == std::io::ErrorKind::WouldBlock { 503 } else { 500 }, "close not durable"),
+            Conflict
+        );
     }
 
     let tail = st.tail();
-    let status = if producer.is_some() && !body.is_empty() { 200 } else { 204 };
+    let status = if completion.producer.is_some() && !body.is_empty() { 200 } else { 204 };
     let mut b = ResponseBuilder::new(status).h(H_NEXT_OFFSET, format_offset(tail.bytes));
-    if let Some(p) = &producer {
+    if let Some(p) = &completion.producer {
         b = b.h(H_PRODUCER_EPOCH, p.epoch.to_string()).h(H_PRODUCER_SEQ, p.seq.to_string());
     }
     if tail.closed {
