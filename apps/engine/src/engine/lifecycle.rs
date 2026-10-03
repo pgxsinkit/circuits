@@ -1777,14 +1777,18 @@ impl Engine {
                     crate::pg::pool_for(self.pg_url.as_deref().context("subquery work requires postgres")?)
                         .get()
                         .await?;
-                // `collect`: an inner-set node's seed IS engine state — the set it will maintain
-                // — so there is nothing to stream it to. It is read through the same streamed
-                // reader as every other backfill, so the transport (and the fences) are identical.
+                // Stream full rows into contributor assertions one chunk at a time. Nodes stay
+                // pending until phase C, so raw deltas/deferred flips cannot observe a partial set.
                 let scope = crate::pg::SettleScope::request(inner_table)
                     .with(inner_where.as_ref().map(referenced_tables).unwrap_or_default().iter());
-                let (rows, fences) =
-                    crate::pg::backfill_where_reader(&mut client, &ts, wsql, &scope).await?.collect().await?;
-                node_seeds.push((sig.clone(), rows, fences.gate));
+                let mut reader = crate::pg::backfill_where_reader(&mut client, &ts, wsql, &scope).await?;
+                while let Some(chunk) = reader.next_chunk().await? {
+                    if self.shutdown_token().is_shutting_down() {
+                        anyhow::bail!("{}", crate::engine::sequencer::SHUTTING_DOWN);
+                    }
+                    self.subqueries.lock().await.seed_chunk(id, sig, chunk).await?;
+                }
+                node_seeds.push((sig.clone(), reader.finish().await.gate));
             }
             let outer_ts =
                 begin.schemas.get(table).cloned().with_context(|| format!("unknown outer table '{table}'"))?;
@@ -2582,11 +2586,8 @@ mod cancellation_tests {
             .await
             .begin_create("s1", &"outer_t".into(), "shape/s1", &where_json, None, false)
             .unwrap();
-        let seeds = begin
-            .seeds
-            .iter()
-            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
-            .collect();
+        let seeds =
+            begin.seeds.iter().map(|(sig, _, _)| (sig.clone(), crate::pg::SnapshotGate::passthrough())).collect();
         engine
             .subqueries
             .lock()

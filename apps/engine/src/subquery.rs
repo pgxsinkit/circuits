@@ -83,8 +83,8 @@ pub struct SubqueryNode {
     /// Re-derivations a CHILD node's flip aimed at this node while it was still seeding
     /// (`seed_buffer.is_some()`), replayed after the seed is installed — see
     /// [`SubqueryRegistry::queue_node_deferred`]. The parent-node analogue of
-    /// [`PendingSubqueryShape::deferred`]: reconciling against a pre-seed (empty) set would
-    /// derive nothing and the seed would then overwrite the change with the older snapshot.
+    /// [`PendingSubqueryShape::deferred`]: reconciling against an incomplete seed can miss rows,
+    /// and later snapshot chunks could overwrite the change with older state.
     pub(crate) deferred: VecDeque<DeferredNodeWork>,
     /// The node's key in the membership circuit (registry-assigned, unique per live node).
     pub node_id: i64,
@@ -673,7 +673,7 @@ impl SubqueryRegistry {
     }
 
     /// Test seam (never compiled into the engine): assert one contributor onto a node exactly as
-    /// phase C's seed install does, so a cancellation test can park a create with a fresh node
+    /// chunk seeding does, so a cancellation test can park a create with a fresh node
     /// already holding real membership-circuit state.
     #[cfg(test)]
     pub(crate) async fn assert_seed_row_for_test(&mut self, sig: &SubquerySig, pk: &str, value: Value) {
@@ -999,9 +999,9 @@ impl SubqueryRegistry {
     /// Returns whether it was queued — `false` means the node is live (or gone) and the caller
     /// reconciles now.
     ///
-    /// A flip must never reconcile a mid-seed node: its set is still empty until phase C installs
-    /// the seed, so the re-derivation finds nothing to move — and the seed, taken from a snapshot
-    /// OLDER than the flip, is then installed over the change. The node and every dependent below
+    /// A flip must never reconcile a mid-seed node: its set is incomplete until phase C finishes
+    /// the seed, so the re-derivation can miss rows — and later chunks from a snapshot
+    /// OLDER than the flip can overwrite the change. The node and every dependent below
     /// it stay stale for the life of the shape. Deferring is the same answer
     /// [`queue_deferred`](Self::queue_deferred) gives for a not-yet-installed shape.
     ///
@@ -1038,7 +1038,33 @@ impl SubqueryRegistry {
         true
     }
 
-    /// Phase C (under the registry lock; brief, in-memory + lane enqueues): install the seeds,
+    /// Install one snapshot chunk as contributor assertions, without publishing the node. Raw
+    /// deltas and child flips still queue while `seed_buffer` is present; initial seed flips are
+    /// discarded. Only primary keys and projected values survive this call, never the full rows.
+    /// The pending create owns both the host index and circuit state across the step's await, so
+    /// its ordinary abort can retract even a chunk whose reply the caller stopped awaiting.
+    pub(crate) async fn seed_chunk(&mut self, shape_id: &str, sig: &SubquerySig, rows: Vec<Row>) -> Result<()> {
+        let pending = self
+            .pending_shapes
+            .iter()
+            .find(|p| p.shape_id == shape_id)
+            .context("seed_chunk: pending shape vanished")?;
+        anyhow::ensure!(pending.collect_log.contains(sig), "seed_chunk: node does not belong to create");
+        let n = self.nodes.get(sig).context("seed_chunk: node vanished")?;
+        anyhow::ensure!(n.seed_buffer.is_some(), "seed_chunk: node is already live");
+        let ts = self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?;
+        let proj_col = n.proj_col;
+        let mut seed = Assertions::default();
+        for mut row in rows {
+            let pk = ts.key_string(&row).unwrap_or_default();
+            let value = row.0.get_mut(proj_col).map(std::mem::take).unwrap_or(Value::Null);
+            seed.contributors.extend(self.assert_node_row(sig, &pk, Some(value)));
+        }
+        let _ = self.apply_asserts(seed).await;
+        Ok(())
+    }
+
+    /// Phase C (under the registry lock; brief, in-memory + lane enqueues): finish the seeds,
     /// replay every buffered delta through the seed gates, register the shape, and return the work
     /// the caller must propagate (see [`FinishedCreate`]). `seeded` counts the phase-B snapshot
     /// envelopes (for the shape's emitted counter). `seeded_pks` is the backfilled outer rows' pks,
@@ -1061,7 +1087,7 @@ impl SubqueryRegistry {
     pub async fn finish_create(
         &mut self,
         shape_id: &str,
-        node_seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)>,
+        node_seeds: Vec<(SubquerySig, crate::pg::SnapshotGate)>,
         outer_gate: crate::pg::SnapshotGate,
         seeded: u64,
         seeded_pks: std::collections::HashSet<String>,
@@ -1072,25 +1098,16 @@ impl SubqueryRegistry {
         );
         let mut work: VecDeque<(SubquerySig, Flip)> = VecDeque::new();
         let mut node_work: VecDeque<(SubquerySig, DeferredNodeWork)> = VecDeque::new();
-        // 1. Install node seeds, then replay each node's buffered deltas through its gate.
-        for (sig, rows, gate) in node_seeds {
-            let (ts, proj_col) = {
+        // 1. The snapshot chunks already landed, but nodes stayed pending. Install each gate
+        // before replaying its buffered deltas; no chunk may publish an incompletely seeded node.
+        for (sig, gate) in node_seeds {
+            let ts = {
                 let n = self.nodes.get(&sig).context("finish_create: node vanished")?;
-                (self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?, n.proj_col)
+                self.schemas.get(&n.inner_table).cloned().context("unknown inner table")?
             };
             if let Some(n) = self.nodes.get_mut(&sig) {
                 n.gate = gate;
             }
-            let mut seed = Assertions::default();
-            for r in &rows {
-                let pk = ts.key_string(r).unwrap_or_default();
-                let pv = r.0.get(proj_col).cloned().unwrap_or(Value::Null);
-                seed.contributors.extend(self.assert_node_row(&sig, &pk, Some(pv)));
-            }
-            // Initial state: the seed's flips are meaningless (every dependent's backfill
-            // already reflects the seeded set), so this step's deltas are discarded — only
-            // the replay below propagates.
-            let _ = self.apply_asserts(seed).await;
             let buffered = self.nodes.get_mut(&sig).and_then(|n| n.seed_buffer.take()).unwrap_or_default();
             // Replayed one buffered delta at a time, in arrival order, so each keeps its own
             // commit stamp and is recorded as the live decision it is (the outer buffer's replay
@@ -1206,9 +1223,9 @@ impl SubqueryRegistry {
     /// cancelled between `finish_create` returning and the engine publishing the shape lands in that
     /// second case.
     ///
-    /// The pending branch must cover a create that died ANYWHERE in phase C, not just before it:
-    /// phase C installs node seeds one await at a time, so a dropped future can leave a fresh node
-    /// holding a full seed. Removing it without retracting those contributor tuples would leave the
+    /// The pending branch covers cancellation during chunk installation and phase C:
+    /// a dropped future can leave a fresh node holding some or all of its seed.
+    /// Removing it without retracting those contributor tuples would leave the
     /// membership circuit carrying a dead node's set forever, so removal goes through the same
     /// retracting path a refcount-0 drop uses — unconditionally, because a node with no state
     /// retracts nothing and the check would cost the same scan as the retraction.
@@ -1220,6 +1237,9 @@ impl SubqueryRegistry {
         let Some(idx) = self.pending_shapes.iter().position(|p| p.shape_id == shape_id) else {
             return;
         };
+        // A cancelled seed step may have submitted its batch without receiving the reply. The
+        // contributor snapshot cannot license removal until that FIFO batch has completed.
+        self.circuit.barrier().await;
         // Taking the whole entry discards its deferred queue with it: work aimed at a shape that
         // will never exist has nowhere to land and nothing to correct. The same goes for the
         // deferred queue of each fresh node removed below — it dies with the node it was waiting on.
@@ -1232,6 +1252,15 @@ impl SubqueryRegistry {
             n.refcount = n.refcount.saturating_sub(1);
             if n.refcount > 0 {
                 continue;
+            }
+            // A cancelled send may also have updated the host index without submitting its
+            // assertions. Remove the sig independently of the circuit's published contributors.
+            let tkey = n.template_key.clone();
+            if let Some(tpl) = self.templates.get_mut(&tkey) {
+                tpl.pk_nodes.retain(|_, nodes| {
+                    nodes.remove(&sig);
+                    !nodes.is_empty()
+                });
             }
             // No cascade here (unlike `decref_nodes`): the compile log has one entry per `collect()`
             // call, deeper nodes included, so this walk already visits every node the create
@@ -2860,11 +2889,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn finish_create_hands_back_the_queued_work() {
         let (reg, begin) = registry_mid_create();
-        let seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)> = begin
-            .seeds
-            .iter()
-            .map(|(sig, _, _)| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
-            .collect();
+        let seeds: Vec<(SubquerySig, crate::pg::SnapshotGate)> =
+            begin.seeds.iter().map(|(sig, _, _)| (sig.clone(), crate::pg::SnapshotGate::passthrough())).collect();
         let registry = tokio::sync::Mutex::new(reg);
         move_shape_for_value(&registry, "s1", 0, &Value::Int(7), None).await.unwrap();
 
@@ -2918,7 +2944,7 @@ mod tests {
     }
 
     /// **A flip that reaches a still-seeding parent NODE waits, it is not reconciled.** The node's
-    /// set is empty until phase C installs its seed, so re-deriving now derives nothing — and the
+    /// set is incomplete until phase C finishes its seed, so re-deriving now misses rows — and the
     /// seed, taken from a snapshot older than the flip, is then installed over the change, leaving
     /// the node and everything below it stale for the life of the shape.
     #[tokio::test(flavor = "multi_thread")]
@@ -2959,10 +2985,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn finish_create_hands_back_the_node_work() {
         let (reg, deep, mid) = registry_mid_nested_create();
-        let seeds: Vec<(SubquerySig, Vec<Row>, crate::pg::SnapshotGate)> = [&deep, &mid]
-            .into_iter()
-            .map(|sig| (sig.clone(), Vec::new(), crate::pg::SnapshotGate::passthrough()))
-            .collect();
+        let seeds: Vec<(SubquerySig, crate::pg::SnapshotGate)> =
+            [&deep, &mid].into_iter().map(|sig| (sig.clone(), crate::pg::SnapshotGate::passthrough())).collect();
         let registry = tokio::sync::Mutex::new(reg);
         let (trace_tx, _rx) = tokio::sync::broadcast::channel(16);
         let mut work: VecDeque<(SubquerySig, Flip)> =
@@ -2981,7 +3005,7 @@ mod tests {
         assert!(reg.nodes[&mid].seed_buffer.is_none(), "and the node is live, so nothing defers again");
     }
 
-    /// A create cancelled in the MIDDLE of phase C — one fresh node's seed already asserted into
+    /// A create cancelled after chunk assertions and before activation — one fresh node's seed in
     /// the membership circuit, the shape not installed — leaves nothing behind. The rollback state
     /// is the registry's (the pending entry never left it), so the abort can retract the partial
     /// seed as well as unwind the refcounts, edges and templates.
@@ -3003,6 +3027,174 @@ mod tests {
         assert!(reg.pending_seed.is_empty(), "nothing is left waiting to be seeded");
         assert_eq!(reg.circuit_distinct(deep_id), 0, "the partial seed was retracted");
         assert_eq!(reg.circuit_distinct(mid_id), 0);
+    }
+
+    /// A dropped apply can still be queued on the circuit thread. Rollback must wait before
+    /// inspecting the contributor snapshot; otherwise the late assertion escapes its retraction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn abort_retracts_a_seed_assertion_cancelled_while_queued() {
+        cancelled_seed_send(false).await;
+        cancelled_seed_send(true).await;
+    }
+
+    async fn cancelled_seed_send(before_enqueue: bool) {
+        let (mut reg, deep, existing) = if before_enqueue {
+            let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+            reg.set_schemas(Arc::new(creating_schemas()));
+            let predicate = |value| {
+                serde_json::from_value(serde_json::json!({
+                    "col":"gid", "in":{"table":"inner_t","project":"gid", "where":{"col":"gid","op":"eq","value":value}}
+                }))
+                .unwrap()
+            };
+            let begin =
+                reg.begin_create("existing", &"outer_t".into(), "shape/existing", &predicate(7), None, true).unwrap();
+            let existing_sig = begin.seeds[0].0.clone();
+            reg.seed_chunk("existing", &existing_sig, vec![Row(vec![Value::Int(7), Value::Int(999)])]).await.unwrap();
+            reg.finish_create(
+                "existing",
+                vec![(existing_sig.clone(), crate::pg::SnapshotGate::passthrough())],
+                crate::pg::SnapshotGate::passthrough(),
+                0,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &predicate(8), None, true).unwrap();
+            let sig = begin.seeds[0].0.clone();
+            assert_eq!(reg.nodes[&sig].template_key, reg.nodes[&existing_sig].template_key);
+            (reg, sig, Some(existing_sig))
+        } else {
+            let (reg, deep, _) = registry_mid_nested_create();
+            (reg, deep, None)
+        };
+        let id = reg.nodes[&deep].node_id;
+        let release = reg.circuit.pause_for_test().await;
+        if before_enqueue {
+            reg.circuit.fill_queue_for_test();
+        }
+        {
+            let apply = reg.seed_chunk("s1", &deep, vec![Row(vec![Value::Int(7), Value::Int(1)])]);
+            tokio::pin!(apply);
+            assert!(std::future::poll_fn(|cx| std::task::Poll::Ready(apply.as_mut().poll(cx).is_pending())).await);
+        }
+        // The snapshot is still empty even though the insertion has been queued.
+        assert_eq!(reg.circuit_distinct(id), 0);
+        {
+            let rollback = reg.abort_create("s1");
+            tokio::pin!(rollback);
+            let pending =
+                std::future::poll_fn(|cx| std::task::Poll::Ready(rollback.as_mut().poll(cx).is_pending())).await;
+            release.send(()).unwrap();
+            if pending {
+                rollback.await;
+            }
+        }
+        // Flush the worker with an unrelated assertion before checking the old id. This is a
+        // test observation barrier, not the missing rollback barrier being tested.
+        reg.circuit
+            .apply(crate::subq_circuit::Assertions {
+                contributors: vec![Tup2(
+                    crate::subq_circuit::PkKey { id: 999, pk: 999 },
+                    crate::subq_circuit::Assert::Delete,
+                )],
+            })
+            .await;
+        assert_eq!(reg.circuit_distinct(id), 0, "the queued assertion must not outlive rollback");
+        if let Some(existing) = existing {
+            assert_eq!(reg.nodes.len(), 1, "only the pre-existing node survives");
+            assert!(reg.circuit.contains(reg.nodes[&existing].node_id, &Value::Int(7)));
+            assert_eq!(reg.nodes[&existing].refcount, 1);
+            assert_eq!(reg.circuit.contributor_entries(reg.nodes[&existing].node_id).len(), 1);
+            let template = &reg.templates[&reg.nodes[&existing].template_key];
+            assert_eq!(template.pk_nodes.len(), 1, "the cancelled send's pk must leave the retained template");
+            assert!(template.pk_nodes.values().all(|sigs| sigs.len() == 1 && sigs.contains(&existing)));
+        } else {
+            assert!(reg.nodes.is_empty());
+            assert!(reg.templates.is_empty());
+        }
+    }
+
+    /// Account row staging independently of retained contributor/key state. The legacy baseline
+    /// uses the old collect loop (append every chunk, retaining both nested node vectors); the
+    /// new path feeds those same chunks directly to the registry and retains no full-row vector.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wide_nested_seed_stages_one_chunk_and_defers_live_work() {
+        const ROWS: usize = 2048;
+        const CHUNK: usize = 16;
+        const PAYLOAD: usize = 4096;
+        let chunk = |start: usize| -> Vec<Row> {
+            (start..start + CHUNK)
+                .map(|i| Row(vec![Value::Int(i as i64), Value::Int(i as i64), Value::Text("x".repeat(PAYLOAD))]))
+                .collect()
+        };
+        let legacy: Vec<Vec<Row>> = (0..2)
+            .map(|_| {
+                let mut all = Vec::new();
+                for start in (0..ROWS).step_by(CHUNK) {
+                    all.append(&mut chunk(start));
+                }
+                all
+            })
+            .collect();
+        let legacy_bytes = legacy.heap_bytes();
+        drop(legacy);
+
+        let mut reg = SubqueryRegistry::new(DsClient::new("http://unused"), None);
+        let mut schemas = nested_schemas();
+        for name in ["mid_t", "deep_t"] {
+            let def = serde_json::from_value(serde_json::json!({
+                "columns": {"gid":{"type":"int"},"id":{"type":"int"},"payload":{"type":"text"}}, "primaryKey":"id"
+            }))
+            .unwrap();
+            schemas.insert(name.into(), TableSchema::from_def(&name.into(), &def).unwrap());
+        }
+        reg.set_schemas(Arc::new(schemas));
+        let predicate = serde_json::from_value(serde_json::json!({
+            "col":"gid", "in":{"table":"mid_t","project":"gid", "where":{"col":"gid","in":{"table":"deep_t","project":"gid"}}}
+        })).unwrap();
+        let begin = reg.begin_create("s1", &"outer_t".into(), "shape/s1", &predicate, None, true).unwrap();
+        let mut peak = 0;
+        for (sig, _, _) in &begin.seeds {
+            for start in (0..ROWS).step_by(CHUNK) {
+                let rows = chunk(start);
+                peak = peak.max(rows.heap_bytes());
+                reg.seed_chunk("s1", sig, rows).await.unwrap();
+                assert!(reg.nodes[sig].seed_buffer.is_some(), "chunks do not publish nodes");
+                assert!(reg.shapes.is_empty());
+            }
+        }
+        assert!(legacy_bytes >= 2 * ROWS * PAYLOAD);
+        assert!(peak <= CHUNK * (PAYLOAD + 256));
+        assert!(legacy_bytes > peak * 200);
+        let (deep, _, _) = &begin.seeds[0];
+        let (mid, _, _) = &begin.seeds[1];
+        let ts = reg.schemas[&"deep_t".into()].clone();
+        // A live deletion during the seed window buffers raw old images; it must not remove a
+        // partially installed member before all chunks have landed.
+        let old = Row(vec![Value::Int(7), Value::Int(7), Value::Text("x".repeat(PAYLOAD))]);
+        assert!(reg.on_table_delta(&ts, &[Tup2(old, -1)], 0x200, Some(50), None, None).await.unwrap().is_empty());
+        assert_eq!(reg.nodes[deep].seed_buffer.as_ref().unwrap().len(), 1);
+        assert!(reg.circuit.contains(reg.nodes[deep].node_id, &Value::Int(7)));
+        assert!(reg.queue_node_deferred(mid, DeferredNodeWork::Value { connecting_col: 0, value: Value::Int(7) }));
+        let seeds = begin
+            .seeds
+            .iter()
+            .map(|(sig, _, _)| (sig.clone(), crate::pg::SnapshotGate::parse("40:45:", "0/100")))
+            .collect();
+        let finished = reg
+            .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
+            .await
+            .unwrap();
+        assert!(!reg.circuit.contains(reg.nodes[deep].node_id, &Value::Int(7)));
+        assert_eq!(finished.work.len(), 1, "buffered raw deletion replays after the gate installs");
+        assert_eq!(finished.node_work.len(), 1, "child work waits for the complete parent seed");
+        eprintln!(
+            "0022 row-staging: legacy_nested_bytes={legacy_bytes} chunk_peak_bytes={peak} contributor_rows={}",
+            2 * ROWS
+        );
+        reg.abort_create("s1").await;
+        assert!(reg.nodes.is_empty());
     }
 
     /// The deferred replay is resumable for the same reason the live walk is: a failed item goes

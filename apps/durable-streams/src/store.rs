@@ -492,25 +492,30 @@ impl StreamState {
         }
     }
 
-    pub fn touch(&self) {
+    pub fn touch(&self) -> bool {
+        let lifecycle = self.lifecycle.lock().unwrap();
         let mut s = self.shared.write().unwrap();
-        s.last_access = SystemTime::now();
+        let now = SystemTime::now();
+        if lifecycle.retiring || s.soft_deleted || self.expired_at(s.last_access, now) {
+            return false;
+        }
+        s.last_access = now;
+        true
     }
 
+    #[cfg(test)]
     pub fn is_expired(&self) -> bool {
-        let now = SystemTime::now();
-        if let Some(exp) = self.config.expires_at {
-            if now > exp {
-                return true;
-            }
-        }
-        if let Some(ttl) = self.config.ttl_seconds {
-            let last = self.shared.read().unwrap().last_access;
-            if now > last + Duration::from_secs(ttl) {
-                return true;
-            }
-        }
-        false
+        self.expired_at(self.shared.read().unwrap().last_access, SystemTime::now())
+    }
+
+    fn expired_at(&self, last_access: SystemTime, now: SystemTime) -> bool {
+        self.config.expires_at.is_some_and(|deadline| now >= deadline)
+            || self.config.ttl_seconds.is_some_and(|ttl| {
+                // Invalid runtime state must fail closed, never panic or become
+                // immortal. Create and recovery reject this state in advance.
+                last_access.checked_add(Duration::from_secs(ttl)).map_or(true, |deadline| now >= deadline)
+                    || now.checked_add(Duration::from_secs(ttl)).is_none()
+            })
     }
 
     pub fn etag(&self, start: u64, end: u64, closed: bool) -> String {
@@ -554,6 +559,8 @@ pub struct Store {
     failed_creates: StdMutex<HashSet<String>>,
     #[cfg(test)]
     create_fault: std::sync::atomic::AtomicU8,
+    #[cfg(test)]
+    expiry_observed_hook: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 pub enum CreateResult {
@@ -573,6 +580,60 @@ struct RetirementContext {
 }
 
 impl RetirementContext {
+    fn schedule_expiry(self: &Arc<Self>, st: Arc<StreamState>) {
+        let context = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _retirement = st.retirement_lock.lock().unwrap();
+            let _metadata = st.meta_lock.lock().unwrap();
+            if !context.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), &st)) {
+                return;
+            }
+            let soft = {
+                let mut lifecycle = st.lifecycle.lock().unwrap();
+                let mut shared = st.shared.write().unwrap();
+                // Another retirement may have completed, or rolled back and
+                // admitted a renewal, before this owned worker took its locks.
+                if shared.soft_deleted || lifecycle.in_flight > 0 {
+                    return;
+                }
+                if !st.expired_at(shared.last_access, SystemTime::now()) {
+                    lifecycle.retiring = false;
+                    return;
+                }
+                lifecycle.retiring = true;
+                shared.soft_deleted = true;
+                shared.ref_count > 0
+            };
+            if soft {
+                #[cfg(test)]
+                let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
+                    Err(std::io::Error::other("injected expiry metadata failure"))
+                } else {
+                    write_meta_locked(&st, true)
+                };
+                #[cfg(not(test))]
+                let written = write_meta_locked(&st, true);
+                if let Err(error) = written {
+                    let mut lifecycle = st.lifecycle.lock().unwrap();
+                    st.shared.write().unwrap().soft_deleted = false;
+                    lifecycle.retiring = false;
+                    tracing::warn!(path = %st.path, error = %error, "expiry metadata failed; access may retry");
+                    return;
+                }
+                st.publish_deleted();
+            } else {
+                st.hard_delete.store(true, Ordering::Release);
+                st.publish_deleted();
+                match context.finish_hard(&st) {
+                    Ok(()) => context.release_parent(&st),
+                    Err(error) => {
+                        tracing::warn!(path = %st.path, error = %error, "expiry cleanup failed; DELETE may retry")
+                    }
+                }
+            }
+        });
+    }
+
     fn finish_hard(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
         remove_file_if_present(&meta_path(&st.file_path))?;
         remove_file_if_present(&st.file_path)?;
@@ -809,6 +870,8 @@ impl Store {
             failed_creates: StdMutex::new(HashSet::new()),
             #[cfg(test)]
             create_fault: std::sync::atomic::AtomicU8::new(0),
+            #[cfg(test)]
+            expiry_observed_hook: StdMutex::new(None),
         };
         store.recover(&streams_dir)?;
         Ok(store)
@@ -865,7 +928,9 @@ impl Store {
                 {
                     match std::fs::read(&p) {
                         Ok(bytes) => {
-                            if let Ok(meta) = serde_json::from_slice::<Meta>(&bytes) {
+                            if let Some(meta) =
+                                serde_json::from_slice::<Meta>(&bytes).ok().filter(Meta::valid_deadlines)
+                            {
                                 if data_path.exists() {
                                     metas.insert(meta.path.clone(), (meta, data_path));
                                 } else {
@@ -882,7 +947,7 @@ impl Store {
                                 // sidecar, keep the data file untouched, and skip
                                 // the stream loudly so an operator can repair.
                                 eprintln!(
-                                    "WARN: quarantining unparsable stream sidecar {} \
+                                    "WARN: quarantining unparsable or invalid-deadline stream sidecar {} \
                                      (stream skipped this boot; data file kept)",
                                     p.display()
                                 );
@@ -1070,7 +1135,9 @@ impl Store {
                 closed_by: meta.closed_by.clone(),
                 producers: meta.producers.clone(),
                 last_seq_header: meta.last_seq_header.clone(),
-                last_access: UNIX_EPOCH + Duration::from_secs(meta.last_access_unix),
+                last_access: UNIX_EPOCH
+                    .checked_add(Duration::from_secs(meta.last_access_unix))
+                    .expect("validated deadline"),
                 ref_count: meta.ref_count,
                 soft_deleted: meta.soft_deleted,
             }),
@@ -1103,7 +1170,9 @@ impl Store {
             config: StreamConfig {
                 content_type: meta.content_type.clone(),
                 ttl_seconds: meta.ttl_seconds,
-                expires_at: meta.expires_at_unix.map(|s| UNIX_EPOCH + Duration::from_secs(s)),
+                expires_at: meta
+                    .expires_at_unix
+                    .map(|s| UNIX_EPOCH.checked_add(Duration::from_secs(s)).expect("validated deadline")),
                 expires_at_raw: meta.expires_at_raw.clone(),
                 create_closed: meta.create_closed,
                 forked_from: meta.forked_from.clone(),
@@ -1139,36 +1208,92 @@ impl Store {
     /// still reference them). Soft-deleted entries ARE returned — callers decide
     /// between 410 (direct ops) and 409 (PUT re-create / fork source).
     pub fn get(&self, path: &str) -> Option<Arc<StreamState>> {
-        let st = self.streams.get(path)?.clone();
-        if st.shared.read().unwrap().soft_deleted {
-            return Some(st);
+        self.get_impl(path, false, None)
+    }
+
+    /// GET's expiry check and sliding-TTL renewal are one lifetime decision.
+    /// HEAD, fork-source lookup, DELETE and failed writes do not renew a TTL.
+    pub fn get_for_read(&self, path: &str) -> Option<Arc<StreamState>> {
+        self.get_impl(path, true, None)
+    }
+
+    fn get_impl(&self, path: &str, touch: bool, clock: Option<SystemTime>) -> Option<Arc<StreamState>> {
+        loop {
+            let st = self.streams.get(path)?.clone();
+            if st.shared.read().unwrap().soft_deleted {
+                return Some(st);
+            }
+            if st.config.ttl_seconds.is_none() && st.config.expires_at.is_none() {
+                return Some(st);
+            }
+            {
+                let lifecycle = st.lifecycle.lock().unwrap();
+                let mut shared = st.shared.write().unwrap();
+                if lifecycle.retiring || shared.soft_deleted {
+                    return None;
+                }
+                let now = clock.unwrap_or_else(SystemTime::now);
+                if !st.expired_at(shared.last_access, now) {
+                    let renewed = touch && st.config.ttl_seconds.is_some();
+                    if renewed {
+                        shared.last_access = now;
+                    }
+                    drop(shared);
+                    drop(lifecycle);
+                    if renewed {
+                        self.mark_meta_dirty(&st);
+                    }
+                    return Some(st);
+                }
+            }
+            #[cfg(test)]
+            if let Some(hook) = self.expiry_observed_hook.lock().unwrap().take() {
+                hook();
+            }
+            // Re-check behind every deletion barrier: an admitted append may
+            // have renewed the stream since the observation above.
+            match self.try_expire(&st, clock) {
+                Ok(false) => continue,
+                Ok(true) | Err(_) => return None,
+            }
         }
-        if st.is_expired() {
-            self.delete_or_soft_delete(&st);
-            return None;
+    }
+
+    fn try_expire(&self, st: &Arc<StreamState>, clock: Option<SystemTime>) -> std::io::Result<bool> {
+        let _retirement = st.retirement_lock.try_lock().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream retirement already in progress")
+        })?;
+        if !self.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), st)) {
+            return Ok(true);
         }
-        Some(st)
+        let _metadata = st
+            .meta_lock
+            .try_lock()
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream metadata write in progress"))?;
+        let mut lifecycle = st.lifecycle.lock().unwrap();
+        let shared = st.shared.read().unwrap();
+        if lifecycle.retiring || shared.soft_deleted {
+            return Ok(true);
+        }
+        if !st.expired_at(shared.last_access, clock.unwrap_or_else(SystemTime::now)) {
+            return Ok(false);
+        }
+        if lifecycle.in_flight > 0 {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream operations still in flight"));
+        }
+        lifecycle.retiring = true;
+        self.retirement_context().schedule_expiry(st.clone());
+        Ok(true)
     }
 
     /// Hard-delete when nothing references the stream; soft-delete otherwise.
-    ///
-    /// NON-durable, detached variant for the expiry sweep on the read path: the
-    /// on-disk removals / soft-meta write run on a fire-and-forget blocking
-    /// task, so a crash can undo them (an expired stream re-expires on the next
-    /// access — harmless). The DELETE handler must NOT use this: an acked
-    /// DELETE undone by a crash resurrects the stream with all its data — use
-    /// [`Store::delete_or_soft_delete_durable`] there.
-    pub fn delete_or_soft_delete(&self, st: &Arc<StreamState>) {
-        let _ = self.delete_impl(st, false);
-    }
-
-    /// [`Store::delete_or_soft_delete`] with the DELETE-ack durability contract:
+    /// The DELETE-ack durability contract holds:
     /// the file + sidecar unlinks (and their parent-directory entry) — or the
     /// soft-delete meta flag — are durable on disk before this returns, so a
     /// post-ack crash can never resurrect the stream. Synchronous file I/O +
     /// fsync: call from a blocking context.
     pub fn delete_or_soft_delete_durable(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
-        self.delete_impl(st, true)
+        self.delete_impl(st)
     }
 
     /// Drain async operations before occupying a blocking worker. In particular
@@ -1200,36 +1325,15 @@ impl Store {
         .map_err(std::io::Error::other)?
     }
 
-    fn delete_impl(&self, st: &Arc<StreamState>, durable: bool) -> std::io::Result<()> {
+    fn delete_impl(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
         // A retry owns the same incarnation, including after a partial unlink.
         // Serialize retries so the fork-parent release runs only once.
-        let _retirement = if durable {
-            st.retirement_lock.lock().unwrap()
-        } else {
-            st.retirement_lock.try_lock().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream retirement already in progress")
-            })?
-        };
+        let _retirement = st.retirement_lock.lock().unwrap();
         if !self.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), st)) {
             return Ok(());
         }
-        // A lazy attempt must acquire every potentially contended barrier
-        // before latching its fence. Otherwise a harmless checkpoint flush can
-        // leave the stream permanently fenced without starting deletion.
-        let lazy_metadata = if durable {
-            None
-        } else {
-            Some(st.meta_lock.try_lock().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream metadata write in progress")
-            })?)
-        };
         {
             let mut lifecycle = st.lifecycle.lock().unwrap();
-            // Lazy expiry runs on a request thread; it must never wait for an
-            // append which may require that same async worker to finish.
-            if !durable && lifecycle.in_flight > 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream operations still in flight"));
-            }
             lifecycle.retiring = true;
             while lifecycle.in_flight > 0 {
                 lifecycle = st.lifecycle_idle.wait(lifecycle).unwrap();
@@ -1237,7 +1341,7 @@ impl Store {
         }
         // Exclude any sidecar writer which already captured this stream. The
         // hard-delete flag below also excludes writers arriving after unlink.
-        let _metadata = lazy_metadata.unwrap_or_else(|| st.meta_lock.lock().unwrap());
+        let _metadata = st.meta_lock.lock().unwrap();
         let soft = {
             let mut s = st.shared.write().unwrap();
             if s.ref_count > 0 {
@@ -1248,34 +1352,23 @@ impl Store {
             }
         };
         if soft {
-            if durable {
-                // Test-only: stand an I/O error in for the sidecar write, so
-                // that the rollback below is what the test actually exercises.
-                #[cfg(test)]
-                let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
-                    Err(std::io::Error::other("injected soft-delete metadata failure"))
-                } else {
-                    write_meta_locked(st, true)
-                };
-                #[cfg(not(test))]
-                let written = write_meta_locked(st, true);
-
-                // The `soft_deleted = true` above is already in memory. If the
-                // sidecar write fails the client gets a 500, so that in-memory
-                // mark has to be rolled back: otherwise the stream is deleted
-                // for every subsequent request in this process but comes back
-                // on the next restart, and the client's retry can no longer see
-                // the stream it is trying to delete.
-                if let Err(error) = written {
-                    st.shared.write().unwrap().soft_deleted = false;
-                    st.lifecycle.lock().unwrap().retiring = false;
-                    return Err(error);
-                }
+            // Test-only: stand an I/O error in for the sidecar write, so
+            // that the rollback below is what the test actually exercises.
+            #[cfg(test)]
+            let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
+                Err(std::io::Error::other("injected soft-delete metadata failure"))
             } else {
-                let st2 = st.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _ = write_meta_sync(&st2, true);
-                });
+                write_meta_locked(st, true)
+            };
+            #[cfg(not(test))]
+            let written = write_meta_locked(st, true);
+
+            // A failed write must restore admission without publishing a
+            // terminal reader event, so an explicit DELETE can retry honestly.
+            if let Err(error) = written {
+                st.shared.write().unwrap().soft_deleted = false;
+                st.lifecycle.lock().unwrap().retiring = false;
+                return Err(error);
             }
             st.publish_deleted();
         } else {
@@ -1289,18 +1382,14 @@ impl Store {
             // already gone from memory — it then reappeared at the next restart
             // — and it left a window in which a concurrent PUT could recreate
             // the path while the old files were still being unlinked.
-            if durable {
-                #[cfg(test)]
-                if st.delete_fault.load(Ordering::Relaxed) == 2 {
-                    return Err(std::io::Error::other("injected hard-delete durability failure"));
-                }
-                // Both unlinks live in the same directory; one dir fsync makes
-                // them crash-durable together.
-                context.finish_hard(st)?;
-                context.release_parent(st);
-            } else {
-                context.schedule(st.clone());
+            #[cfg(test)]
+            if st.delete_fault.load(Ordering::Relaxed) == 2 {
+                return Err(std::io::Error::other("injected hard-delete durability failure"));
             }
+            // Both unlinks live in the same directory; one dir fsync makes
+            // them crash-durable together.
+            context.finish_hard(st)?;
+            context.release_parent(st);
         }
         Ok(())
     }
@@ -1312,6 +1401,9 @@ impl Store {
         parent: Option<Arc<StreamState>>,
         base_offset: u64,
     ) -> std::io::Result<CreateResult> {
+        if config.ttl_seconds.is_some_and(|ttl| SystemTime::now().checked_add(Duration::from_secs(ttl)).is_none()) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "unrepresentable Stream-TTL deadline"));
+        }
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in path.as_bytes() {
             hash ^= *byte as u64;
@@ -1652,6 +1744,14 @@ fn unix_secs(t: SystemTime) -> u64 {
 }
 
 impl Meta {
+    fn valid_deadlines(&self) -> bool {
+        let Some(last_access) = UNIX_EPOCH.checked_add(Duration::from_secs(self.last_access_unix)) else {
+            return false;
+        };
+        self.expires_at_unix.map_or(true, |secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)).is_some())
+            && self.ttl_seconds.map_or(true, |ttl| last_access.checked_add(Duration::from_secs(ttl)).is_some())
+    }
+
     fn capture(st: &StreamState) -> Meta {
         let seg_snapshot: (Vec<MetaSegment>, u64) = {
             let m = st.tier.manifest.lock().unwrap();
@@ -2673,7 +2773,7 @@ mod tier_tests {
         assert!(count_files(&cold) >= 1, "expected offloaded remote objects before delete");
 
         // Hard delete (ref_count == 0 → hard delete → gc_remote_segments).
-        store.delete_or_soft_delete(&st);
+        store.delete_or_soft_delete_durable(&st).unwrap();
 
         // The GC runs as a detached task — wait for it to reclaim everything.
         let mut waited = 0;
@@ -2776,6 +2876,220 @@ mod meta_sweep_tests {
 
     fn disk_meta(st: &StreamState) -> Meta {
         serde_json::from_slice(&std::fs::read(meta_path(&st.file_path)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn ttl_lookup_rechecks_after_an_admitted_append_renews() {
+        let dir = temp_dir("ttl-observation-race");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(60);
+        let st = match store.create("s", cfg, None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        // An append admitted while alive can finish after a lookup observed the
+        // previous deadline. Pin that exact interleaving without sleeping.
+        let operation = st.begin_operation().unwrap();
+        st.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(120);
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *store.expiry_observed_hook.lock().unwrap() = Some(Box::new(move || {
+            observed_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        }));
+        let lookup_store = store.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let lookup = std::thread::spawn(move || {
+            let _entered = runtime.enter();
+            lookup_store.get("s")
+        });
+        observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Same renewal/publication sequence as the admitted append path.
+        st.shared.write().unwrap().last_access = SystemTime::now();
+        drop(operation);
+        resume_tx.send(()).unwrap();
+        let got = lookup.join().unwrap().expect("renewal wins over the stale expiry observation");
+        assert!(Arc::ptr_eq(&got, &st));
+        assert!(!st.is_retiring());
+        assert!(!st.shared.read().unwrap().soft_deleted);
+        assert!(st.file_path.exists());
+    }
+
+    #[test]
+    fn ttl_recovery_quarantines_unrepresentable_deadlines() {
+        for field in ["ttl", "absolute", "access"] {
+            let dir = temp_dir("ttl-corrupt-recovery");
+            let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+            let st = create(&store, "s");
+            let mut meta = disk_meta(&st);
+            match field {
+                "ttl" => meta.ttl_seconds = Some(u64::MAX),
+                "absolute" => meta.expires_at_unix = Some(u64::MAX),
+                "access" => meta.last_access_unix = u64::MAX,
+                _ => unreachable!(),
+            }
+            std::fs::write(meta_path(&st.file_path), serde_json::to_vec(&meta).unwrap()).unwrap();
+            let file_path = st.file_path.clone();
+            let id = st.id;
+            drop(st);
+            drop(store);
+            for _ in 0..2 {
+                let restored = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+                assert!(!restored.streams.contains_key("s"), "invalid {field} must not be served");
+                assert!(restored.quarantined_ids.read().unwrap().contains(&id));
+                assert!(file_path.exists(), "quarantine must retain acknowledged data");
+                assert!(meta_path(&file_path).with_extension("meta.corrupt").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn ttl_store_create_rejects_extreme_input_before_allocating_files() {
+        let dir = temp_dir("ttl-create-invalid");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(u64::MAX);
+        let next_id = store.next_id.load(Ordering::Relaxed);
+        let error = store.create("invalid", cfg, None, 0).err().expect("invalid TTL rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(store.streams.is_empty());
+        assert_eq!(store.next_id.load(Ordering::Relaxed), next_id, "reject before allocating an identity or its files");
+    }
+
+    #[test]
+    fn ttl_read_renewal_is_persisted_and_lookup_does_not_renew() {
+        let dir = temp_dir("ttl-renew-restart");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(3600);
+        let st = match store.create("s", cfg, None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let old = SystemTime::now() - Duration::from_secs(600);
+        st.shared.write().unwrap().last_access = old;
+        assert!(store.get("s").is_some());
+        assert_eq!(st.shared.read().unwrap().last_access, old, "HEAD/fork-style lookup must not renew");
+        assert!(store.get_for_read("s").is_some());
+        let renewed = st.shared.read().unwrap().last_access;
+        assert!(renewed > old);
+        assert_eq!(store.sweep_meta_once(), 1);
+        let saved = disk_meta(&st).last_access_unix;
+        assert_eq!(saved, unix_secs(renewed));
+        drop(st);
+        drop(store);
+        let restored = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = restored.get("s").unwrap();
+        assert_eq!(unix_secs(st.shared.read().unwrap().last_access), saved);
+        assert!(!st.is_expired());
+    }
+
+    #[test]
+    fn ttl_renewal_just_before_deadline_moves_the_expiry_boundary() {
+        let dir = temp_dir("ttl-deadline-boundary");
+        let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(60);
+        let st = match store.create("s", cfg, None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let start = SystemTime::now();
+        st.shared.write().unwrap().last_access = start;
+        let deadline = start.checked_add(Duration::from_secs(60)).unwrap();
+        let before = deadline.checked_sub(Duration::from_nanos(1)).unwrap();
+        assert!(st.expired_at(start, deadline), "expiry is inclusive at the deadline");
+        assert!(!st.expired_at(start, before));
+        assert!(store.get_impl("s", true, Some(before)).is_some());
+        assert_eq!(st.shared.read().unwrap().last_access, before);
+        assert!(!st.expired_at(before, deadline), "an accepted read moves the old deadline");
+        assert!(st.expired_at(before, before.checked_add(Duration::from_secs(60)).unwrap()));
+    }
+
+    #[tokio::test]
+    async fn ttl_failed_soft_expiry_retains_parent_and_retries_without_terminal_event() {
+        let dir = temp_dir("ttl-soft-failure");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let grandparent = create(&store, "grandparent");
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(60);
+        cfg.forked_from = Some("grandparent".into());
+        let parent = match store.create("parent", cfg, Some(grandparent.clone()), 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let mut child_cfg = octet_cfg();
+        child_cfg.forked_from = Some("parent".into());
+        let child = match store.create("child", child_cfg, Some(parent.clone()), 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let mut deleted = parent.deletion_watch();
+        parent.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(120);
+        parent.delete_fault.store(1, Ordering::Relaxed);
+        assert!(store.get("parent").is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while parent.is_retiring() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!*deleted.borrow(), "failed expiry must not emit an irreversible terminal watch");
+        assert!(!parent.shared.read().unwrap().soft_deleted);
+        assert_eq!(parent.shared.read().unwrap().ref_count, 1);
+        assert_eq!(grandparent.shared.read().unwrap().ref_count, 1);
+        assert!(parent.file_path.exists());
+        parent.delete_fault.store(0, Ordering::Relaxed);
+        assert!(store.get("parent").is_none());
+        tokio::time::timeout(Duration::from_secs(2), deleted.changed()).await.unwrap().unwrap();
+        assert!(*deleted.borrow());
+        assert!(disk_meta(&parent).soft_deleted);
+        assert!(parent.file_path.exists(), "a fork still pins its expired parent's bytes");
+        store.delete_durable(&child).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while store.streams.contains_key("parent") || grandparent.shared.read().unwrap().ref_count != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0);
+        store.delete_durable(&child).await.unwrap();
+        assert_eq!(parent.shared.read().unwrap().ref_count, 0, "ancestor release happens exactly once");
+        assert_eq!(grandparent.shared.read().unwrap().ref_count, 0, "the expired parent releases its ancestor once");
+    }
+
+    #[tokio::test]
+    async fn ttl_failed_hard_expiry_keeps_the_incarnation_for_delete_retry() {
+        let dir = temp_dir("ttl-hard-failure");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let mut cfg = octet_cfg();
+        cfg.ttl_seconds = Some(60);
+        let st = match store.create("s", cfg.clone(), None, 0).unwrap() {
+            CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        let sidecar = meta_path(&st.file_path);
+        std::fs::remove_file(&sidecar).unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        st.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(120);
+        assert!(store.get("s").is_none());
+        let mut deleted = st.deletion_watch();
+        if !*deleted.borrow() {
+            tokio::time::timeout(Duration::from_secs(2), deleted.changed()).await.unwrap().unwrap();
+        }
+        assert!(store.streams.contains_key("s"));
+        assert!(st.file_path.exists());
+        assert!(st.begin_operation().is_none());
+        assert!(matches!(store.create("s", cfg, None, 0).unwrap(), CreateResult::Conflict));
+        std::fs::remove_dir(sidecar).unwrap();
+        store.delete_durable(&st).await.unwrap();
+        assert!(!store.streams.contains_key("s"));
+        let replacement = create(&store, "s");
+        assert!(store.try_expire(&st, None).unwrap(), "stale identity must not affect a replacement");
+        assert!(Arc::ptr_eq(&store.get("s").unwrap(), &replacement));
     }
 
     #[tokio::test]
@@ -2972,7 +3286,7 @@ mod meta_sweep_tests {
         let store = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
         let st = create(&store, "s");
         let writer = st.meta_lock.lock().unwrap();
-        assert_eq!(store.delete_impl(&st, false).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(store.try_expire(&st, None).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
         assert!(!st.is_retiring(), "a deferred expiry must not poison operation admission");
         assert!(st.begin_operation().is_some());
         drop(writer);

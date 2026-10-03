@@ -99,9 +99,12 @@ cursor (`query_raw`) and are appended to the still-**pending** shape stream in c
 table's size. Shape creation is already two-phase — a pending buffer, then a gated activation — so
 chunking needs no protocol change: nothing reads the stream until `ActivateShape` lands, and a
 failure part-way aborts the pending shape and rolls the whole creation back exactly as before. An
-**aggregate** folds each chunk into its seed and drops the rows; a **subquery** inner-set node's seed
-is the one thing genuinely collected in memory, because that set _is_ the state the node will
-maintain. The `REPEATABLE READ` bracket and the `SnapshotGate` capture are unchanged.
+**aggregate** folds each chunk into its seed and drops the rows; a **subquery** inner-set node
+installs contributors chunk by chunk while staying pending until its seed gate and buffered changes
+are reconciled. It retains membership/key state, rather than the whole inner relation's row vector.
+The chunk budget measures encoded bytes and permits one oversized row; it is not a total RSS limit
+for contributor state or buffered live changes. The `REPEATABLE READ` bracket and the
+`SnapshotGate` capture are unchanged.
 
 **An integer SUM is exact, and says so on the wire.** SUM/AVG accumulate integer values in `i128`, so
 a `bigint` column sums without the rounding an `f64` accumulator starts doing at `2^53` — which a

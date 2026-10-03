@@ -367,7 +367,9 @@ fn parse_ttl(v: &str) -> Result<u64, ()> {
     if v.len() > 1 && v.starts_with('0') {
         return Err(());
     }
-    v.parse().map_err(|_| ())
+    let ttl = v.parse().map_err(|_| ())?;
+    SystemTime::now().checked_add(Duration::from_secs(ttl)).ok_or(())?;
+    Ok(ttl)
 }
 
 /// Minimal RFC 3339 parser (YYYY-MM-DDTHH:MM:SS[.frac](Z|±hh:mm)).
@@ -439,7 +441,7 @@ fn parse_rfc3339(s: &str) -> Result<SystemTime, ()> {
     if secs < 0 {
         return Err(());
     }
-    Ok(SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64)).ok_or(())
 }
 
 async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
@@ -613,14 +615,24 @@ async fn handle_create(store: Arc<Store>, req: Req, path: String) -> Resp {
         let store = store.clone();
         match tokio::task::spawn_blocking(move || store.create(&path, config, parent, base_offset)).await {
             Ok(Ok(r)) => r,
-            Ok(Err(e)) => return text_response(500, &e.to_string()),
+            Ok(Err(e)) => {
+                return text_response(
+                    if e.kind() == std::io::ErrorKind::InvalidInput { 400 } else { 500 },
+                    &e.to_string(),
+                )
+            }
             Err(_) => return text_response(500, "create task failed"),
         }
     };
     match result {
         CreateResult::Conflict => text_response(409, "stream exists with different configuration"),
         CreateResult::Exists(st) => {
-            st.touch();
+            if !st.touch() {
+                return gone();
+            }
+            if st.config.ttl_seconds.is_some() {
+                store.mark_meta_dirty(&st);
+            }
             let t = st.tail();
             let mut b = ResponseBuilder::new(200)
                 .h("content-type", st.config.content_type.clone())
@@ -1650,18 +1662,12 @@ async fn materialize_resolved(
 // ---------- GET (catch-up / long-poll / SSE) ----------
 
 async fn handle_read(store: Arc<Store>, req: Req, path: String) -> Resp {
-    let st = match store.get(&path) {
+    let st = match store.get_for_read(&path) {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
     if st.shared.read().unwrap().soft_deleted {
         return gone();
-    }
-    // Only TTL is reset by a read, and touch() takes the write lock — skip it for
-    // non-TTL streams to keep their read path lock-free.
-    if st.config.ttl_seconds.is_some() {
-        st.touch();
-        store.mark_meta_dirty(&st); // sliding TTL must survive restarts
     }
     let q = match parse_query(req.query.as_deref()) {
         Ok(q) => q,
@@ -2713,6 +2719,71 @@ mod memory_mode_tests {
         }
 
         crate::handlers::set_long_poll_timeout(30_000);
+    }
+
+    #[tokio::test]
+    async fn ttl_maximum_input_is_rejected_without_publishing_a_stream() {
+        let dir = test_support::temp_dir("ttl-max-input");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let mut req = put_req("m/ttl-max", "application/octet-stream");
+        req.headers.push(("stream-ttl".into(), u64::MAX.to_string()));
+        let resp = handle(store.clone(), req).await;
+        assert_eq!(resp.status, 400, "unrepresentable deadline must reject input");
+        assert!(!store.streams.contains_key("m/ttl-max"));
+    }
+
+    #[tokio::test]
+    async fn ttl_head_fork_and_failed_post_do_not_renew_but_matching_put_does() {
+        let dir = test_support::temp_dir("ttl-request-renewal");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let mut req = put_req("m/source", "application/octet-stream");
+        req.headers.push((H_TTL.into(), "3600".into()));
+        assert_eq!(handle(store.clone(), req).await.status, 201);
+        let st = store.get("m/source").unwrap();
+        let old = SystemTime::now() - Duration::from_secs(600);
+        st.shared.write().unwrap().last_access = old;
+        let head =
+            Req { method: Method::Head, path: "m/source".into(), query: None, headers: vec![], body: Bytes::new() };
+        assert_eq!(handle(store.clone(), head).await.status, 200);
+        assert_eq!(st.shared.read().unwrap().last_access, old);
+        let mut fork = put_req("m/fork", "application/octet-stream");
+        fork.headers.push((H_FORKED_FROM.into(), "m/source".into()));
+        assert_eq!(handle(store.clone(), fork).await.status, 201);
+        assert_eq!(st.shared.read().unwrap().last_access, old);
+        assert_eq!(handle(store.clone(), post_req("m/source", "application/json", b"[]")).await.status, 409);
+        assert_eq!(st.shared.read().unwrap().last_access, old);
+        let mut renew = put_req("m/source", "application/octet-stream");
+        renew.headers.push((H_TTL.into(), "3600".into()));
+        assert_eq!(handle(store.clone(), renew).await.status, 200);
+        assert!(st.shared.read().unwrap().last_access > old);
+        assert!(
+            st.meta_dirty.load(std::sync::atomic::Ordering::Acquire),
+            "idempotent PUT's TTL renewal must reach the meta sweep"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_absolute_deadline_does_not_slide_and_survives_restart() {
+        let dir = test_support::temp_dir("ttl-absolute-restart");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        let raw = "9999-12-31T23:59:59Z";
+        let mut req = put_req("m/absolute", "application/octet-stream");
+        req.headers.push((H_EXPIRES_AT.into(), raw.into()));
+        assert_eq!(handle(store.clone(), req).await.status, 201);
+        let st = store.get("m/absolute").unwrap();
+        let last_access = st.shared.read().unwrap().last_access;
+        let deadline = parse_rfc3339(raw).unwrap();
+        let get =
+            Req { method: Method::Get, path: "m/absolute".into(), query: None, headers: vec![], body: Bytes::new() };
+        assert_eq!(handle(store.clone(), get).await.status, 200);
+        assert_eq!(st.shared.read().unwrap().last_access, last_access, "absolute expiry reads do not renew");
+        assert_eq!(st.config.expires_at, Some(deadline));
+        drop(st);
+        drop(store);
+        let restored = Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap();
+        let st = restored.get("m/absolute").unwrap();
+        assert_eq!(st.config.expires_at, Some(deadline));
+        assert_eq!(st.config.expires_at_raw.as_deref(), Some(raw));
     }
 
     /// #1: PROTOCOL.md §6.2 — every successful write slides a `Stream-TTL`

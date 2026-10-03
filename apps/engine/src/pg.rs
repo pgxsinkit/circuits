@@ -1152,10 +1152,9 @@ impl<'a> BackfillReader<'a> {
 
     /// Read the whole snapshot into memory.
     ///
-    /// For the few consumers whose RESULT is an in-memory set — a subquery inner-set node's seed, a
-    /// membership query-back's candidate rows — where the set is the engine state being built and
-    /// there is nothing to stream it to. Everything that writes to a stream must use
-    /// [`Self::next_chunk`] instead.
+    /// Used for membership query-back candidate rows. Shape backfills and subquery inner seeds
+    /// must use [`Self::next_chunk`] instead: contributors can be installed without retaining the
+    /// full snapshot rows. Query-back candidate staging is a separate resource-control concern.
     pub async fn collect(mut self) -> Result<(Vec<Row>, BackfillFences)> {
         let mut all = Vec::new();
         while let Some(mut chunk) = self.next_chunk().await? {

@@ -280,15 +280,21 @@ the `SELECT`. Live and backfill must then be reconciled so every change counts e
 
 **The snapshot is streamed, not materialised.** The rows arrive over a `query_raw` cursor (with
 tokio-postgres's own backpressure) and are appended to the still-**pending** shape stream in chunks
-bounded by `CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB), so engine memory per backfill is one
-chunk whatever the table's size. No protocol change was needed: shape creation is already two-phase
+budgeted by `CIRCUITS_BACKFILL_APPEND_BYTES` (16 MiB). This limits encoded chunk bytes, with a
+single oversized row allowed; it is not a heap or RSS cap. Full-row staging is one chunk plus the
+reader's lookahead row. No protocol change was needed: shape creation is already two-phase
 (`BeginShape` registers a pending buffer, `ActivateShape` goes live), so nothing reads the stream
 until activation and a failure part-way aborts the pending shape and rolls the creation back exactly
 as before. An **aggregate** folds each chunk into an `AggSeed` and drops the rows — the same
 `fold_agg_row` the live path uses, so the seed is arithmetically identical to feeding those rows
-through it. A **subquery inner-set node's** seed is the one thing still collected whole, because that
-set _is_ the state the node will maintain; a subquery _shape's_ outer backfill is chunked like any
-other, keeping only the pk set the gated replay is fenced against. The `REPEATABLE READ` bracket, the
+through it. A **subquery inner-set node's** seed also consumes chunks, reducing each to primary-key
+and projected-value contributor assertions before reading the next chunk. Nodes stay pending until
+all their chunks have landed and phase C installs their snapshot gates and replays buffered raw
+deltas and deferred child flips; seed flips are discarded. Nested seeds retain only signatures and
+gates between nodes, without staging full row vectors. Contributors, key indexes and pending live
+changes remain separate retained state, so this does not cap total engine memory. A subquery
+_shape's_ outer backfill is chunked like any other, keeping only the pk set the gated replay is fenced
+against. The `REPEATABLE READ` bracket, the
 fence capture and `row_json_expr`'s casts are unchanged.
 
 **LSN comparison alone is not sound.** `pg_current_wal_lsn()` is a WAL _write_ position, but snapshot
@@ -595,12 +601,17 @@ sequencer feeds every table's deltas into:
   in one registry step, so a flip either queues or finds the shape), which is what keeps an inner
   change committed after the backfill's snapshot from being lost for the new shape. The same holds
   one tier down: a flip reaching a _parent node_ the create is still seeding is **queued on that
-  node** (its set is empty until the seed lands, and the seed — from an older snapshot — would be
+  node** (its set is incomplete until all seed chunks land, and the seed — from an older snapshot — would be
   installed over the change), then re-derived and walked on down the DAG at install.
-- **Phase-C ownership** — the create's rollback state (compile log, buffers, fresh nodes) stays in
-  the registry across every await of the install, so a client disconnect anywhere in phase C —
+- **Seed/install ownership** — the create's rollback state (compile log, buffers, fresh nodes) stays in
+  the registry across every chunk's circuit step and phase-C await, so a client disconnect during
+  seeding or install —
   including after some node seeds have reached the membership circuit — leaves a pending entry the
   detached rollback unwinds exactly, retracting the partial seed with it.
+  Before inspecting contributors for a pending create, rollback awaits a FIFO circuit barrier:
+  a batch already submitted by a cancelled caller must land before the snapshot used to retract it
+  is read. Host template presence indexes are cleared independently, including entries made before
+  a cancelled batch could be submitted. This preserves other binds sharing the same template.
   Explicit error cleanup uses the same detached task ownership: cancelling a request while it is
   awaiting rollback cannot abandon the remaining cleanup. A failed join releases its provisional
   subscription through an owned task for the same reason.

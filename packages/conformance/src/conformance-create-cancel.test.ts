@@ -12,7 +12,16 @@
 import type { Schema } from "@circuits/protocol";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { createShape, lockTable, pgQuery, sleep, streamKeys, waitForLockWaiter } from "./engine-native.js";
+import {
+  createShape,
+  lockTable,
+  pgQuery,
+  sleep,
+  streamKeys,
+  tableLockWaiters,
+  waitFor,
+  waitForLockWaiter,
+} from "./engine-native.js";
 import { bootHarness, drainEngine, type Harness } from "./harness.js";
 
 const schema: Schema = {
@@ -67,7 +76,7 @@ describe("native: an aborted create does not poison later creates of the same sh
   }, 60000);
 });
 
-describe("native: cancellation while installing a large membership seed rolls back", () => {
+describe("native: cancellation after chunking a large membership seed rolls back before activation", () => {
   let h: Harness;
   beforeAll(async () => {
     h = await bootHarness(schema);
@@ -78,31 +87,55 @@ describe("native: cancellation while installing a large membership seed rolls ba
   afterAll(async () => await h?.shutdown());
 
   it("an identical create succeeds after the in-flight request is aborted", async () => {
-    const def = { table: "child", where: { col: "parent_id", in: activeParents } };
+    const def = { table: "child", where: { col: "parent_id", in: activeParents }, subscription: "large-seed-retry" };
     const lock = await lockTable(h, "child");
     const controller = new AbortController();
     const first = createShape(h, def, controller.signal).then(
       () => "completed" as const,
       () => "aborted" as const,
     );
+    const nodes = async () => {
+      const res = await fetch(`${h.engineUrl}/subqueries`);
+      return ((await res.json()) as { nodes: { distinct_values: number; refcount: number }[] }).nodes;
+    };
+    const shapes = async () => {
+      const res = await fetch(`${h.engineUrl}/graph`);
+      return ((await res.json()) as { shapes: { id: string }[] }).shapes;
+    };
 
     try {
-      await waitForLockWaiter(h, "the outer backfill to block after the membership seed");
+      // All inner chunks have reached the circuit before the outer backfill requests its table
+      // lock. Hold that lock through cancellation so completion cannot win a timer race.
+      await waitFor(
+        async () => (await tableLockWaiters(h, "child")).length > 0,
+        "the outer backfill to block after the large seed chunks",
+        60000,
+      );
+      expect(await nodes()).toEqual([expect.objectContaining({ distinct_values: 250000, refcount: 1 })]);
+      const pendingShapes = await shapes();
+      expect(pendingShapes).toHaveLength(1);
+      const cancelledId = pendingShapes[0]!.id;
+      expect((await fetch(`${h.dsUrl}/shape/${cancelledId}`, { method: "HEAD" })).status).toBe(200);
+      controller.abort();
+      expect(await first).toBe("aborted");
+      // Public removal alone precedes contributor retraction and stream deletion. Wait for each
+      // cleanup signal while the outer snapshot is still blocked, then reuse the subscription.
+      await waitFor(async () => (await shapes()).length === 0, "the cancelled public shape to disappear", 60000);
+      await waitFor(async () => (await nodes()).length === 0, "all large-seed contributors to retract", 60000);
+      await waitFor(
+        async () => (await fetch(`${h.dsUrl}/shape/${cancelledId}`, { method: "HEAD" })).status === 404,
+        "the cancelled shape stream to be removed",
+        60000,
+      );
     } finally {
       await lock.release();
     }
 
-    // The released backfill has one row; the large node seed makes installation long enough for a
-    // normal client disconnect to cancel the request after phase B without any engine-side hook.
-    await sleep(500);
-    controller.abort();
-    expect(await first).toBe("aborted");
-    // Rollback is detached from the disconnected handler. Give it ample time to remove the public
-    // share entry; a later conflict is then persistent leaked registration, not a joiner racing cleanup.
-    await sleep(3000);
-
     const again = await createShape(h, def);
     await drainEngine(h, 60000);
     expect(await streamKeys(again.streamUrl)).toEqual(["1"]);
+    expect(again.subscription).toBe("large-seed-retry");
+    expect(await nodes()).toEqual([expect.objectContaining({ distinct_values: 250000, refcount: 1 })]);
+    expect(await shapes()).toHaveLength(1);
   }, 120000);
 });

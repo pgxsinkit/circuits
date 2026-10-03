@@ -1511,12 +1511,13 @@ async fn an_abandoned_flip_batch_holds_the_barrier_and_degrades_the_engine() {
         .seeds
         .iter()
         // `TableSchema` orders columns alphabetically: (gid, id).
-        .map(|(sig, _, _)| {
-            (sig.clone(), vec![Row(vec![Value::Int(7), Value::Int(1)])], crate::pg::SnapshotGate::passthrough())
-        })
+        .map(|(sig, _, _)| (sig.clone(), crate::pg::SnapshotGate::passthrough()))
         .collect();
     {
         let mut reg = engine.subqueries.lock().await;
+        for (sig, _) in &seeds {
+            reg.seed_chunk("s1", sig, vec![Row(vec![Value::Int(7), Value::Int(1)])]).await.unwrap();
+        }
         let finished = reg
             .finish_create("s1", seeds, crate::pg::SnapshotGate::passthrough(), 0, Default::default())
             .await

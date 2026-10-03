@@ -382,9 +382,11 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   `CIRCUITS_BACKFILL_APPEND_BYTES`), so engine memory per backfill is one chunk however wide
   the table. A plain shape appends each chunk to its still-pending stream; an aggregate folds each
   chunk into an `AggSeed` (via the same `fold_agg_row` the live path uses) and drops the rows. The
-  ONLY legitimate `BackfillReader::collect` callers are the ones whose _result_ is an in-memory set
-  with nothing to stream it to — a subquery inner-set node's seed, a membership query-back's
-  candidate rows. If you add a backfill site, take chunks; if you find yourself building a
+  Subquery inner seeds install each chunk into contributor state while the node remains pending;
+  they never stage the whole inner relation as rows. Membership query-back candidate rows may
+  still use `BackfillReader::collect`. The chunk budget measures encoded bytes and allows one
+  oversized row; contributor/key state and buffered live changes have separate memory costs.
+  If you add a backfill site, take chunks; if you find yourself building a
   `Vec<Row>` of a whole table, that is the bug.
 - **`SIGTERM` drains; it never retires anything** (`src/shutdown.rs`). Order: `/ready` → 503
   `shutting_down` FIRST (so a load balancer drains) and the port stays open for the drain window;

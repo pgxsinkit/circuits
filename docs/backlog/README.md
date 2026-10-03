@@ -15,13 +15,14 @@ their evidence), improvement candidates, and escape-hatched designs. Same rules 
 
 ## Items
 
-The remaining upstream-audit work is unscheduled. Urgency describes the current local surface;
-parked leads need evidence before they become defect repairs.
+The upstream-audit backlog resumed on 2026-10-03 with fixes for 0020 and 0022. Urgency describes
+the remaining local surface; parked leads need evidence before they become defect repairs.
 
 | Entries    | Urgency                      | Reason                                                                                                                            |
 | ---------- | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| 0017, 0022 | Medium                       | Engine pending/replay and seed memory can grow with slow or large work; no OOM was reproduced.                                    |
-| 0018–0020  | Conditional medium           | Fork/TTL correctness concerns; the engine's ordinary read path does not use DS forks or depend on proactive TTL expiry.           |
+| 0017       | Medium                       | Engine pending/replay memory can grow with slow or large work; no OOM was reproduced.                                             |
+| 0018–0019  | Conditional medium           | Fork correctness concerns; the engine's ordinary read path does not use DS forks.                                                 |
+| 0020, 0022 | Fixed                        | Checked TTL deadlines and atomic expiry/renewal; chunked subquery seeds and cancellation-safe contributor retraction.             |
 | 0021, 0023 | Low                          | SSE terminal notification and conservative dormant-age semantics; no SSE failure or production retention incident was reproduced. |
 | 0024–0028  | Parked; no confirmed urgency | Crash/shutdown/ownership leads and checkpoint defense in depth require the recorded trigger and diagnosis.                        |
 | 0016       | Historical record            | Resolution boundaries, validation and deferred product choices; no new implementation authorization.                              |
@@ -45,9 +46,9 @@ parked leads need evidence before they become defect repairs.
 - [0017 — Pending shapes and dormant replay need resource accounting and bounds](0017-pending-buffer-and-replay-resource-controls.md) — candidate
 - [0018 — Fork reference updates can persist speculative parent append metadata](0018-fork-refcounts-persist-speculative-parent-metadata.md) — candidate
 - [0019 — Fork reference counts need graph-aware crash recovery](0019-fork-graph-and-reference-recovery.md) — candidate
-- [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — candidate
+- [0020 — TTL deadline arithmetic and touch/expiry decisions need one safe boundary](0020-ttl-deadline-arithmetic-and-atomic-touch.md) — dropped (fixed)
 - [0021 — Direct DELETE terminal notification is not wired through SSE serving](0021-direct-delete-sse-terminal-notification.md) — candidate
-- [0022 — Subquery inner seeding still materializes the whole row vector](0022-subquery-inner-seed-materializes-all-rows.md) — candidate
+- [0022 — Subquery inner seeding still materializes the whole row vector](0022-subquery-inner-seed-materializes-all-rows.md) — dropped (fixed)
 - [0023 — A restart resets the age used for dormant-shape TTL](0023-dormancy-age-restarts-at-boot.md) — parked
 - [0024 — Aggregate stream creation precedes catalog identity: unproven crash lead](0024-aggregate-stream-before-catalog-identity.md) — parked
 - [0025 — Failed log-server create compensation needs crash-image qualification](0025-failed-create-compensation-crash-recovery.md) — parked

@@ -198,6 +198,14 @@ fn process_alive(pid: u32) -> bool {
 }
 
 enum Cmd {
+    Barrier {
+        resp: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    Pause {
+        entered: oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
     Batch {
         asserts: Assertions,
         resp: oneshot::Sender<Vec<MemberDelta>>,
@@ -349,6 +357,35 @@ impl MembershipCircuit {
             return Vec::new();
         }
         resp_rx.await.unwrap_or_default()
+    }
+
+    /// Wait for previously submitted batches, including ones whose caller stopped awaiting the
+    /// reply. A rollback must inspect a contributor snapshot only after those assertions land.
+    pub(crate) async fn barrier(&self) {
+        let (resp, wait) = oneshot::channel();
+        if self.tx.send(Cmd::Barrier { resp }).await.is_ok() {
+            let _ = wait.await;
+        }
+    }
+
+    /// Stop the worker before its next command, so tests can cancel a queued assertion exactly.
+    #[cfg(test)]
+    pub(crate) async fn pause_for_test(&self) -> std::sync::mpsc::Sender<()> {
+        let (entered, wait) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        self.tx.send(Cmd::Pause { entered, release: held }).await.unwrap();
+        wait.await.unwrap();
+        release
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fill_queue_for_test(&self) {
+        loop {
+            let (resp, _) = oneshot::channel();
+            if self.tx.try_send(Cmd::Barrier { resp }).is_err() {
+                break;
+            }
+        }
     }
 
     /// Is `value` currently a member of node `node_id`'s set? (Contributor count > 0.)
@@ -517,6 +554,14 @@ fn circuit_thread(
 ) {
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
+            Cmd::Barrier { resp } => {
+                let _ = resp.send(());
+            }
+            #[cfg(test)]
+            Cmd::Pause { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             Cmd::Batch { asserts, resp } => {
                 for Tup2(k, upd) in asserts.contributors {
                     contrib_in.push(k, upd);

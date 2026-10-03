@@ -117,6 +117,18 @@ The invariant: **readers only ever observe durable bytes** (PROTOCOL.md §4.1). 
 
 An explicit DELETE runs in an owned task which fences new stream operations and asynchronously waits for admitted appends through their WAL wait, visibility publication, and response decision. Cancelling the caller detaches that cleanup. The drain and per-stream DELETE serialization occupy no blocking worker, so an admitted close can still use the blocking pool for its metadata commit. Fork creation holds the same operation admission while recording the parent's reference, and tier compaction holds it while changing the live file. Deletion then takes the stream's metadata writer barrier before unlinking, so an already running writer completes first and a delayed writer cannot recreate metadata afterwards. DELETE acknowledges only after both file unlinks and the parent-directory fsync succeed; an already absent file is safe on retry, while every other removal error returns a failure. Segment GC starts after that durable removal, preserving offloaded data if deletion fails. A partially removed stream keeps its fenced identity in the store, blocking appends and path reuse while allowing DELETE to retry. Soft deletion persists its flag before acknowledgment, and a failed soft-delete metadata write restores admission. Lazy expiry defers when an operation or deletion barrier is busy, without blocking an async request thread behind an append's durability wait. A soft parent's last released fork schedules owned cleanup which waits for its barriers, revalidates the parent's deleted state and zero refcount, and releases ancestor references only after successful removal; a queued candidate cannot act on a soft deletion which rolled back.
 
+TTL deadlines use checked arithmetic at request parsing, creation, expiry and recovery. An
+unrepresentable request deadline is refused with `400`; an invalid persisted deadline quarantines
+the sidecar and preserves its data and WAL identity using the ordinary corruption policy. Expiry is
+inclusive at the deadline. GET checks expiry and renews a sliding TTL under the stream's lifetime and
+shared-state locks; HEAD and fork-source lookup do not renew it. A matching PUT renews only an alive,
+unfenced incarnation and schedules its renewal for metadata persistence. Lazy expiry rechecks the
+deadline behind its barriers before fencing, so a completed admitted append or accepted renewal wins
+over an earlier observation. Its owned cleanup persists a pinned parent's soft deletion before
+publishing the terminal watch; metadata failure restores admission without that event, allowing the
+next access to retry. Hard-removal failure retains the fenced incarnation for explicit DELETE retry,
+and ancestor pins are released only after successful physical removal. There is no active TTL reaper.
+
 ### `memory` mode
 
 In `memory` mode no WAL is created or attached. Appends write directly to the per-stream file (the same buffered write as `wal` mode) and ack immediately after the page-cache write — no `fdatasync`, no WAL staging. The per-stream file is the data; the `.meta` sidecar records the stream configuration and tail. On restart, the server runs the same sidecar pass it runs in `wal` mode (rebuild each stream from its file + sidecar) — there is no WAL to replay. Durability is delegated to replication (not yet built).
