@@ -135,6 +135,8 @@ required; legacy plain catalogs refuse boot and older binaries cannot safely con
 
 ## Operator diagnostics follow-up: 0001 (resolved)
 
+Committed as `d3e5e80` on `develop`; the pre-commit validation gate also passed.
+
 After committing 0011, selection moved to [0001](0001-refused-shape-create-not-logged.md), the
 recorded silent shape-refusal incident. The bounded implementation covers `/shapes` and `/aggregate`
 creation refusals, including extractor rejection, with structured warnings and retained response
@@ -155,6 +157,65 @@ the existing two Rust ignores and six protocol skips. The focused router file pa
 unit tests 6/6. Real-engine integration output also emitted the warnings. No dependencies, tools,
 branches, PostgreSQL behavior or log-server implementation changed; output was captured directly.
 
+## Native process qualification follow-up: 0007 and 0013 (resolved)
+
+Whole-backlog selection after 0001 chose [0007](0007-three-refusal-paths-have-no-end-to-end-lane.md),
+native fail-closed test debt, over optional workload investigations and deployment choices. A
+read-only [0010](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) refresh confirms
+the harness is a live client consumer; production pgxsinkit's separate reader already recovers.
+Circuits' positive-lease renewal rebinds changed handles, while zero/non-renewing leases and
+false terminal responses retaining the same handle need their own executed qualification.
+
+Three new tests drive the real engine and Postgres: actual counts placement, ADD COLUMN exit 75
+and same-source/storage restart with correct re-seed/live counts and unrelated-stream continuity;
+a matching publication column list with native readiness/create refusal and named exit 78; and
+an isolated `wal_level=replica` cluster with named exit 78. A TRUNCATE companion reaches the
+seed-covered replay guard, observing the exact triggering xid and “Not restarting again,” then
+correct re-seed/live output. No production implementation or dependency configuration changed.
+
+The first focused run created a replacement aggregate before TRUNCATE replay completed and saw
+it retired, confirming [0006](0006-truncate-replay-window-re-retires-shapes.md)'s recorded resync
+window. The stable 0007 qualification creates its replacement after replay; it does not repair 0006. Both fatal cases and ADD COLUMN recovery already passed in that initial run. The corrected
+file passed all three tests and typecheck. Full validation first stopped on unsafe cleanup throws
+in `finally`; explicit aggregation now retains primary and teardown failures, attempts independent
+cleanup and preserves files when a process may remain alive. The corrected focused run passed
+again. Coordinator inspection and independent review found no blocker.
+
+The next full gate passed format, typecheck, lint, 440 engine Rust unit tests plus its 51 other
+cases, 225 log-server unit tests, eight CLI cases and 82 TS unit tests. Integration passed all
+three new tests and 252 cases overall, but [0013](0013-fail-closed-skip-test-times-out-under-load.md)
+recurred at the pre-drift skip counter: one failed case across 62 files. Protocol conformance
+had not run when the script stopped. This fires 0013's diagnosis trigger; it is not silently
+re-run or attributed to the new counts fixture without evidence.
+
+The bounded [0013](0013-fail-closed-skip-test-times-out-under-load.md) diagnosis reproduced the
+exact skip-counter failure twice by holding a retirement DELETE response. Shape 404 was already
+visible while the public table digest remained old and an actual old-digest page was held. The
+same controlled schedule passed after release ordering waited for the replacement schema digest
+before releasing reads. This proves an insufficient fixture barrier; the failed full run lacked
+these probes, so no claim is made that every historical timeout had this cause or that production
+decoding failed. Final ordinary/delayed-retirement cases require old-page capture before migration
+and new-schema publication before read release, retain the original 20-second counter budget and
+preserve the corruption park/restart/reset lane. Temporary environment pinning and its two-second
+diagnostic budget are removed. Both final files passed all six cases together; independent review
+found no blocker. No production implementation, dependency or tool configuration changed.
+
+The next full run passed every repaired 0013 case and 253 integration cases overall, but 0007
+created a replacement counts aggregate before the replayed Relation finished table resolution.
+The engine correctly returned retryable 503. Its existing exact-trigger-xid wait now precedes
+creation: the xid was absent before exit 75 and can enter the change log only after inline
+Relation handling finishes. No create retry or longer deadline hides the refusal. Independent
+review accepted the phase barrier; the final 0007 file passed all three cases again.
+
+Final `bun run validate:full` passed on that source: format, typecheck, lint, 440 engine Rust
+unit tests plus 51 other engine cases, 225 log-server unit tests, eight CLI cases, 82 TS unit
+tests, all 254 integration cases across 62 files and 332 protocol cases. The existing two Rust
+ignores and six protocol skips remain. Both 0007 and 0013 are resolved with their limits retained.
+
+Qualification uses normal process restart and a WAL-backed log server, not power-loss or injected
+filesystem failure. Replica fixture startup disables fsync and makes no durability claim. It
+does not add dynamic table discovery, layout changes or a guarantee of pre-exit HTTP availability.
+
 ## Constraints and deferred choices
 
 - Settling fixes the pre-registration/pre-HEAD hole that a shape's gate alone cannot recover. Record IDs before fan-out, capture the relevant record before opening the snapshot, release pooled connections during waits, preserve per-table refusal on overflow, and keep unrelated tables serving. Default settle wait is 10 seconds; waiter admission defaults to a quarter of the query pool (at least one), and the xid bitmap record is bounded. The settle deadline covers visibility waiting and pool reacquisition, not initial/retake PostgreSQL queries, rollback, or the complete request; statement timeout is a separate control. Seed/backfill memory and other waits remain separate. Sparse chunks, bookkeeping and captured snapshot clones add memory; the configured xid count is not a complete RSS ceiling.
@@ -164,4 +225,4 @@ branches, PostgreSQL behavior or log-server implementation changed; output was c
 - Optional adoption decisions are parked until an explicit consumer/deployment need: least-privilege managed PG sources, multi-source host, writer lease/handoff, authenticated runtime authority receipts, external raw change-log consumers with durable retention pins, OpenAPI expansion, store identity/readiness/inventory and advertised bounds, TLS/mTLS, log-server subscription services, proactive TTL reaping, OTLP/allocator tuning and separate lease/idle knobs. None is a proved defect in an absent feature. RLS policy needs role/snapshot/replication evidence, not blanket rejection of app-table RLS. A store identity check could detect a replaced/empty mount; it needs a chosen deployment contract, not upstream's fixed reserve/UUID defaults.
 - Boot/schema overrides, missing/closed-stream catalog restore, idle slot advancement, clean pool check-in, provider port, PG18 fixtures, shared durability barriers and paged log-server reads were already covered before this work. Upstream boot #28's additional unread-checkpoint guard is [0027](0027-checkpoint-only-after-a-completed-read.md). Removed Electric adapter/image defects are not native-path backlog issues.
 
-Remaining investigations are indexed individually in 0017–0034, with resolved entries retaining their qualification records. Existing [0010](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) client refetch, [0013](0013-fail-closed-skip-test-times-out-under-load.md) load-sensitive timing and [0014](0014-log-server-lock-test-failed-once-under-load.md) one-off lock test stay distinct. Scratch inventories/probes are under `tmp/agents/upstream-audit-2026-10-02/`; the observations above deliberately survive removal of that directory.
+Remaining investigations are indexed individually in 0017–0034, with resolved entries retaining their qualification records. Existing [0010](0010-harness-client-does-not-re-subscribe-on-a-retired-stream.md) client refetch and [0014](0014-log-server-lock-test-failed-once-under-load.md) one-off lock test stay distinct from the resolved [0013](0013-fail-closed-skip-test-times-out-under-load.md) fixture ordering defect. Scratch inventories/probes are under `tmp/agents/upstream-audit-2026-10-02/`; the observations above deliberately survive removal of that directory.

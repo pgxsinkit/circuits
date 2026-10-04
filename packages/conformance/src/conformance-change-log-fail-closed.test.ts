@@ -43,11 +43,17 @@ const matchAll = { col: "id", op: "gte", value: 0 };
  *
  * The RESPONSE is what is held, not the request: the sequencer's read is a long poll, so the request
  * that will deliver the next page is already in flight before the hold begins.
+ * Retirement DELETE replies can also be held AFTER storage has answered, to expose the interval
+ * between removing a shape and installing the replacement schema. Only this fixture's tiny change
+ * pages are buffered, so it can prove that an old-digest page is waiting before the migration.
  */
 interface ChangeReadProxy {
   url: string;
   holdChangeLogReads(hold: boolean): void;
   heldReads(): number;
+  holdRetirements(hold: boolean): void;
+  heldRetirements(): number;
+  heldChangeDigests(): string[];
   close(): Promise<void>;
 }
 
@@ -56,6 +62,10 @@ async function startChangeReadProxy(upstreamUrl: string): Promise<ChangeReadProx
   let hold = false;
   let held = 0;
   let waiters: Array<() => void> = [];
+  let holdRetirements = false;
+  let heldRetirements = 0;
+  let retirementWaiters: Array<() => void> = [];
+  const heldChangeDigests: string[] = [];
   const release = () => {
     const pending = waiters;
     waiters = [];
@@ -71,22 +81,54 @@ async function startChangeReadProxy(upstreamUrl: string): Promise<ChangeReadProx
   const server = createServer((incoming, outgoing) => {
     const target = new URL(incoming.url ?? "/", upstream);
     const isChangeRead = incoming.method === "GET" && target.pathname.startsWith("/changes/");
+    const fail = (error: Error) => {
+      if (outgoing.destroyed || outgoing.writableEnded) return;
+      if (outgoing.headersSent) outgoing.destroy(error);
+      else {
+        outgoing.writeHead(502, { "content-type": "text/plain" });
+        outgoing.end(String(error));
+      }
+    };
     const forwarded = request(
       target,
       { method: incoming.method, headers: { ...incoming.headers, host: upstream.host } },
       (response) => {
+        response.on("error", fail);
+        response.on("aborted", () => fail(new Error("upstream response aborted")));
         const deliver = () => {
+          if (outgoing.destroyed || outgoing.writableEnded) return;
           outgoing.writeHead(response.statusCode ?? 502, response.headers);
           response.pipe(outgoing);
         };
-        if (isChangeRead) void gate().then(deliver);
-        else deliver();
+        if (incoming.method === "DELETE" && holdRetirements) {
+          heldRetirements += 1;
+          retirementWaiters.push(deliver);
+        } else if (isChangeRead) {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk: Buffer) => chunks.push(chunk));
+          response.on("end", () => {
+            const body = Buffer.concat(chunks);
+            if (hold && response.statusCode === 200 && body.length > 0) {
+              try {
+                const changes = JSON.parse(body.toString()) as Array<{ headers?: { schema?: string } }>;
+                for (const change of changes) {
+                  if (change.headers?.schema) heldChangeDigests.push(change.headers.schema);
+                }
+              } catch (error) {
+                fail(error instanceof Error ? error : new Error(String(error)));
+                return;
+              }
+            }
+            void gate().then(() => {
+              if (outgoing.destroyed || outgoing.writableEnded) return;
+              outgoing.writeHead(response.statusCode ?? 502, response.headers);
+              outgoing.end(body);
+            });
+          });
+        } else deliver();
       },
     );
-    forwarded.on("error", (error) => {
-      if (!outgoing.headersSent) outgoing.writeHead(502, { "content-type": "text/plain" });
-      outgoing.end(String(error));
-    });
+    forwarded.on("error", fail);
     incoming.pipe(forwarded);
   });
 
@@ -104,9 +146,21 @@ async function startChangeReadProxy(upstreamUrl: string): Promise<ChangeReadProx
       if (!next) release();
     },
     heldReads: () => held,
+    holdRetirements: (next) => {
+      holdRetirements = next;
+      if (!next) {
+        for (const deliver of retirementWaiters) deliver();
+        retirementWaiters = [];
+      }
+    },
+    heldRetirements: () => heldRetirements,
+    heldChangeDigests: () => heldChangeDigests,
     close: async () => {
       hold = false;
+      holdRetirements = false;
       release();
+      for (const deliver of retirementWaiters) deliver();
+      retirementWaiters = [];
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
     },
   };
@@ -186,60 +240,87 @@ async function createStatus(): Promise<number> {
 }
 
 describe("a change the sequencer cannot process (ADR-0010)", () => {
-  it("skips the envelopes a migration outran, and keeps serving", async () => {
-    let proxy: ChangeReadProxy | undefined;
-    h = await bootHarness(schema, {
-      // The reconciler parked at an hour: the drift must go through the ingest path (the `Relation`
-      // message), which is the case where the sequencer can be behind it.
-      engineEnv: { CIRCUITS_SCHEMA_RECONCILE_SECS: "3600" },
-      wrapEngineDs: async (upstreamUrl) => {
-        proxy = await startChangeReadProxy(upstreamUrl);
-        return proxy;
-      },
-    });
+  it.each([
+    { retirement: "ordinary retirement replies", pinRetirement: false },
+    { retirement: "a held retirement reply", pinRetirement: true },
+  ])(
+    "skips the envelopes a migration outran, and keeps serving ($retirement)",
+    async ({ pinRetirement }) => {
+      let proxy: ChangeReadProxy | undefined;
+      h = await bootHarness(schema, {
+        // The reconciler parked at an hour: the drift must go through the ingest path (the `Relation`
+        // message), which is the case where the sequencer can be behind it.
+        engineEnv: { CIRCUITS_SCHEMA_RECONCILE_SECS: "3600" },
+        wrapEngineDs: async (upstreamUrl) => {
+          proxy = await startChangeReadProxy(upstreamUrl);
+          return proxy;
+        },
+      });
 
-    await pg("INSERT INTO items (id, n) VALUES (1, 1)");
-    await drainEngine(h);
-    const before = await createShape(h, { table: "items", where: matchAll });
-    expect((await foldStream(before.streamUrl)).has("1")).toBe(true);
+      await pg("INSERT INTO items (id, n) VALUES (1, 1)");
+      await drainEngine(h);
+      const before = await createShape(h, { table: "items", where: matchAll });
+      expect((await foldStream(before.streamUrl)).has("1")).toBe(true);
+      const oldDigest = await tableSchemaDigest("items");
 
-    // From here the sequencer sees nothing: it is behind its own change log, as it is under load.
-    proxy!.holdChangeLogReads(true);
-    await pg("UPDATE items SET n = 2 WHERE id = 1");
-    await pg("INSERT INTO items (id, n) VALUES (2, 2)");
-    // The migration. An int -> text change is what makes the envelopes above undecodable against the
-    // schema the engine will hold by the time it reads them.
-    await pg("ALTER TABLE items ALTER COLUMN n TYPE text");
-    await pg(`UPDATE items SET n = 'three' WHERE id = 1`);
+      // From here the sequencer sees nothing: it is behind its own change log, as it is under load.
+      proxy!.holdChangeLogReads(true);
+      if (pinRetirement) proxy!.holdRetirements(true);
+      await pg("UPDATE items SET n = 2 WHERE id = 1");
+      await pg("INSERT INTO items (id, n) VALUES (2, 2)");
+      await waitFor(
+        () => proxy!.heldChangeDigests().includes(oldDigest),
+        "an old-schema change-log page to be held before the migration",
+      );
+      // The migration. An int -> text change is what makes the envelopes above undecodable against the
+      // schema the engine will hold by the time it reads them.
+      await pg("ALTER TABLE items ALTER COLUMN n TYPE text");
+      await pg(`UPDATE items SET n = 'three' WHERE id = 1`);
 
-    // The ingestor handles the drift inline, so the old shape is retired while the sequencer is still
-    // parked on a read — which is exactly the state this test is about.
-    await waitFor(async () => (await shapeStatus(before.shapeId)) === 404, "the drifted shape to be retired");
-    expect(proxy!.heldReads()).toBeGreaterThan(0);
+      // The ingestor handles the drift inline, so the old shape is retired while the sequencer is still
+      // parked on a read — which is exactly the state this test is about.
+      await waitFor(async () => (await shapeStatus(before.shapeId)) === 404, "the drifted shape to be retired");
+      expect(proxy!.heldReads()).toBeGreaterThan(0);
+      if (pinRetirement) {
+        await waitFor(async () => proxy!.heldRetirements() > 0, "the retirement response to be held");
+        // Shape removal is observable before drift has finished: this schedule keeps the ingestor
+        // awaiting storage's DELETE reply while GET /shapes already answers 404.
+        expect(await tableSchemaDigest("items")).toBe(oldDigest);
+        expect(proxy!.heldChangeDigests()).toContain(oldDigest);
+        proxy!.holdRetirements(false);
+      }
 
-    proxy!.holdChangeLogReads(false);
+      // The schema digest, rather than shape retirement, fences this stale-schema scenario. Releasing
+      // the old page sooner can legitimately process it against the old schema and count no skips.
+      await waitFor(
+        async () => (await tableSchemaDigest("items")) !== oldDigest,
+        "the new schema digest to be installed",
+      );
+      proxy!.holdChangeLogReads(false);
 
-    // The pre-drift envelopes are consumed rather than decoded: counted, and never a failure.
-    await waitFor(
-      async () => (await counter("sequencer_stale_schema_skipped_total")) > 0,
-      "the pre-drift envelopes to be skipped",
-    );
-    expect(await changeLogFailure(), "a drift must never park the sequencer").toBeNull();
-    expect(await epochReason()).toBeNull();
-    expect((await readiness()).status).toBe("active");
+      // The pre-drift envelopes are consumed rather than decoded: counted, and never a failure.
+      await waitFor(
+        async () => (await counter("sequencer_stale_schema_skipped_total")) > 0,
+        "the pre-drift envelopes to be skipped",
+      );
+      expect(await changeLogFailure(), "a drift must never park the sequencer").toBeNull();
+      expect(await epochReason()).toBeNull();
+      expect((await readiness()).status).toBe("active");
 
-    // ...and the engine is serving the new schema: a shape created after the migration converges with
-    // what Postgres holds, live changes included. (Compared against a direct SELECT rather than the
-    // harness oracle, whose typed schema still says `n` is an int.)
-    const fresh = await createShape(h, { table: "items", where: matchAll });
-    await pg(`INSERT INTO items (id, n) VALUES (3, 'four')`);
-    await drainEngine(h);
-    await waitFor(async () => (await foldStream(fresh.streamUrl)).has("3"), "the live insert to arrive");
-    const rows = await foldStream(fresh.streamUrl);
-    const oracle = (await pg("SELECT id, n FROM items ORDER BY id")) as Row[];
-    expect([...rows.keys()].sort()).toEqual(oracle.map((r) => String(r.id)).sort());
-    for (const row of oracle) expect(rows.get(String(row.id))).toMatchObject({ id: row.id, n: row.n });
-  }, 120000);
+      // ...and the engine is serving the new schema: a shape created after the migration converges with
+      // what Postgres holds, live changes included. (Compared against a direct SELECT rather than the
+      // harness oracle, whose typed schema still says `n` is an int.)
+      const fresh = await createShape(h, { table: "items", where: matchAll });
+      await pg(`INSERT INTO items (id, n) VALUES (3, 'four')`);
+      await drainEngine(h);
+      await waitFor(async () => (await foldStream(fresh.streamUrl)).has("3"), "the live insert to arrive");
+      const rows = await foldStream(fresh.streamUrl);
+      const oracle = (await pg("SELECT id, n FROM items ORDER BY id")) as Row[];
+      expect([...rows.keys()].sort()).toEqual(oracle.map((r) => String(r.id)).sort());
+      for (const row of oracle) expect(rows.get(String(row.id))).toMatchObject({ id: row.id, n: row.n });
+    },
+    120000,
+  );
 
   it("parks on an envelope it cannot process, survives a restart there, and is recovered by a reset", async () => {
     h = await bootHarness(schema);

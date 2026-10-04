@@ -22,3 +22,17 @@ Retirement on TRUNCATE should only apply to shapes whose snapshot predates the T
 ## Not now because
 
 Rare and self-correcting. Surfaced in the slice-2b review (`docs/notes/2026-08-21-upstream-issue-triage.md`, follow-ups).
+
+## Executed observation during 0007 qualification (2026-10-04)
+
+The first real-process counts-recovery test created a replacement aggregate immediately after
+the post-TRUNCATE engine reported listening, before the triggering transaction replay finished.
+Replay correctly logged that its boot seed already reflected the transaction and avoided another
+exit, but retired the new aggregate; its subsequent graph placement assertion found no registered
+shape. ADD COLUMN recovery and both fatal boot-refusal cases had passed in that same run.
+
+The 0007 fixture now waits for the triggering xid to reach the change log before creating the
+replacement. This isolates circuit restart/re-seed qualification; it does not fix the redundant
+retirement recorded here. The observation used deliberate counts-pipeline exit 75 followed by
+restart, not an independently injected power-loss or one-second slot-ack crash. No durable-data
+corruption was observed, and this entry remains a candidate with its resync consequence.

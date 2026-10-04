@@ -19,4 +19,29 @@ Classify `Stream-Closed` / 404 / 410 in the client's read transport as **stream-
 
 ## Not now because
 
-No current consumer of this repository uses `packages/client` for live shapes (pgxsinkit has its own reader; its equivalent item is tracked there). Surfaced while implementing ADR-0007 (`docs/notes/2026-08-21-upstream-issue-triage.md`, follow-ups).
+The original reason claimed no live consumer, but the conformance harness does use this client
+for live shapes. Production pgxsinkit uses its separate reader, whose current source already
+wires stream end/closure to a restart. This Circuits entry remains distinct. Surfaced while
+implementing ADR-0007 (`docs/notes/2026-08-21-upstream-issue-triage.md`, follow-ups).
+
+## Consumer qualification (2026-10-04)
+
+Read-only source qualification confirms a remaining direct terminal-read gap across `shape()`,
+`aggregate()` and `subset()`. Shape creation installs `createStreamDB` without a terminal-read
+recreation callback; the aggregate and subset readers finish their async loops or log rejected
+reads without initiating replacement. The common lease scheduler in `subset.ts` is disabled
+for zero/absent lease durations. With a positive lease, all three renewal paths can re-create
+and rebind a changed handle; the timer clamps its cadence to 250 ms–5 minutes, so the default
+1800-second lease can leave recovery waiting for up to that cadence.
+
+A separate source-derived lead concerns a proxy's false 404/410 while the engine still owns
+the healthy stream. Renewal short-circuits when the shape id and stream path are unchanged,
+so a reader stopped by that response may stay stopped even with a positive lease. This is
+not an executed reproduction and must be distinguished from actual engine retirement.
+
+`conformance-native-subscription-ambiguity.test.ts` exercises the actual client, including explicit
+renewal/replacement and subset gap re-seeding. It does not qualify automatic recovery directly
+from a terminal stream read. No fresh client-level semantic red or production incident was run
+for this refresh. Priority is conditional medium: qualify a purge of an actual client with a
+zero/non-renewing lease before changing the transport/lifecycle contract. The native fail-closed
+process qualification in 0007 is selected first.
