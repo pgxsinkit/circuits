@@ -9,7 +9,196 @@ use axum::http::{Request, StatusCode};
 use circuits_engine::ds::DsClient;
 use circuits_engine::engine::Engine;
 use circuits_engine::http::router;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use tower::ServiceExt; // for `oneshot`
+use tracing::field::{Field, Visit};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::{Layer, Registry};
+
+#[derive(Clone, Default)]
+struct CapturedWarnings(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+#[derive(Default)]
+struct Fields(BTreeMap<String, String>);
+
+impl Visit for Fields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+impl<S: tracing::Subscriber> Layer<S> for CapturedWarnings {
+    fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+async fn captured_request(
+    engine: Engine,
+    method: &str,
+    route: &str,
+    body: String,
+) -> (axum::response::Response, Vec<BTreeMap<String, String>>) {
+    let warnings = CapturedWarnings::default();
+    let subscriber = Registry::default().with(warnings.clone());
+    let request = Request::builder()
+        .method(method)
+        .uri(route)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let response = router(engine).oneshot(request).with_subscriber(subscriber).await.unwrap();
+    let events = warnings.0.lock().unwrap().clone();
+    (response, events)
+}
+
+#[tokio::test]
+async fn refused_shape_create_logs_one_warning_with_request_context() {
+    let (response, warnings) = captured_request(
+        library_engine(),
+        "POST",
+        "/shapes",
+        r#"{"table":"nope","where":{"col":"id","op":"eq","value":"private-literal"}}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_string(response).await, r#"{"error":"unknown table 'public.nope'"}"#);
+    assert_eq!(warnings.len(), 1, "every refused create must produce one WARN: {warnings:?}");
+    let warning = &warnings[0];
+    assert_eq!(warning["operation"], "create_shape");
+    assert_eq!(warning["route"], "/shapes");
+    assert_eq!(warning["status"], "400");
+    assert_eq!(warning["table"], "\"public.nope\"");
+    assert_eq!(warning["error"], "\"unknown table 'public.nope'\"");
+    assert_eq!(warning["predicate"], "root=leaf nodes=1 depth=1 truncated=false");
+    assert!(!format!("{warnings:?}").contains("private-literal"));
+}
+
+const CREATE_ROUTES: &[(&str, &str)] = &[("/shapes", "create_shape"), ("/aggregate", "create_aggregate")];
+
+#[tokio::test]
+async fn both_create_routes_log_validation_boot_and_degradation_refusals() {
+    for &(route, operation) in CREATE_ROUTES {
+        for case in ["unknown_table", "subscription", "booting", "degraded"] {
+            let engine = if case == "booting" || case == "subscription" {
+                Engine::new_pg(DsClient::new("http://127.0.0.1:1"), "postgres://x/y".into())
+            } else {
+                library_engine()
+            };
+            if case == "degraded" {
+                engine.force_degraded();
+            }
+            let mut body = serde_json::json!({"table": "nope", "fn": "count"});
+            if case == "subscription" {
+                body["subscription"] = serde_json::json!("private-subscription\n");
+            }
+            let (response, warnings) = captured_request(engine, "POST", route, body.to_string()).await;
+            let (status, error, retry_after) = match case {
+                "unknown_table" => (400, "unknown table 'public.nope'", None),
+                "subscription" => (400, "subscription must not contain control characters", None),
+                "booting" => {
+                    (503, "engine is still booting (the durable shape catalog is not restored yet); retry", Some("1"))
+                }
+                _ => (503, "degraded: subquery membership effects were lost; restart required", None),
+            };
+            assert_eq!(response.status().as_u16(), status, "{route} {case}");
+            assert_eq!(response.headers().get("retry-after").map(|v| v.to_str().unwrap()), retry_after);
+            assert_eq!(body_string(response).await, serde_json::json!({"error": error}).to_string());
+            assert_eq!(warnings.len(), 1, "{route} {case}: {warnings:?}");
+            let warning = &warnings[0];
+            assert_eq!(warning["operation"], operation);
+            assert_eq!(warning["route"], route);
+            assert_eq!(warning["status"], status.to_string());
+            assert_eq!(warning["error"], format!("{error:?}"));
+            assert_eq!(warning["table"], "\"public.nope\"");
+            assert_eq!(warning["predicate"], "root=all nodes=0 depth=0 truncated=false");
+            assert!(!format!("{warnings:?}").contains("private-subscription"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_extractor_refusals_log_category_without_inferred_context() {
+    for &(route, operation) in CREATE_ROUTES {
+        for (body, status, category, diagnostic) in [
+            (
+                r#"{"table":"private-table","fn":"count","where":"#,
+                400,
+                "json_syntax",
+                "Failed to parse the request body as JSON",
+            ),
+            (r#"{"table":"a.b.c","fn":"count"}"#, 422, "json_data", "contains a '.'"),
+            (
+                r#"{"table":"private-table","fn":"count","where":{"invalid":"private-literal"}}"#,
+                422,
+                "json_data",
+                "did not match any variant",
+            ),
+        ] {
+            let (response, warnings) = captured_request(library_engine(), "POST", route, body.to_owned()).await;
+            assert_eq!(response.status().as_u16(), status);
+            assert!(response.headers().get("retry-after").is_none());
+            assert_eq!(response.headers()["content-type"], "text/plain; charset=utf-8");
+            assert!(body_string(response).await.contains(diagnostic));
+            assert_eq!(warnings.len(), 1, "{route}: {warnings:?}");
+            let warning = &warnings[0];
+            assert_eq!(warning["operation"], operation);
+            assert_eq!(warning["route"], route);
+            assert_eq!(warning["status"], status.to_string());
+            assert_eq!(warning["rejection"], category);
+            assert_eq!(warning["context"], "unavailable");
+            assert!(!warning.contains_key("table"));
+            assert!(!warning.contains_key("predicate"));
+            assert!(!format!("{warnings:?}").contains("private-"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn refusal_context_is_bounded_and_control_characters_are_escaped() {
+    let table = format!("先\n{}", "界".repeat(2000));
+    let body = serde_json::json!({"table": table, "fn": "count"});
+    for &(route, _) in CREATE_ROUTES {
+        let (response, warnings) = captured_request(library_engine(), "POST", route, body.to_string()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Bounds apply to logs only: the complete diagnostic is still returned to the caller.
+        assert_eq!(
+            body_string(response).await,
+            serde_json::json!({"error": format!("unknown table 'public.{table}'")}).to_string()
+        );
+        assert_eq!(warnings.len(), 1);
+        let warning = &warnings[0];
+        let expected_table = format!("public.先\n{}…", "界".repeat(246));
+        assert_eq!(warning["table"], format!("{expected_table:?}"));
+        assert_eq!(warning["error"].chars().count(), 1027); // 1024 capped chars + debug quotes + escaped newline
+        assert!(warning["error"].ends_with("…\""));
+        assert!(!warning["table"].contains('\n'));
+        assert!(!warning["error"].contains('\n'));
+    }
+}
+
+#[tokio::test]
+async fn unrelated_refusals_and_probes_do_not_gain_create_warnings() {
+    for (method, route, body, status) in [
+        ("GET", "/health", "", StatusCode::OK),
+        ("GET", "/shapes/missing", "", StatusCode::NOT_FOUND),
+        ("POST", "/query", r#"{"table":"nope"}"#, StatusCode::INTERNAL_SERVER_ERROR),
+    ] {
+        let (response, warnings) = captured_request(library_engine(), method, route, body.to_owned()).await;
+        assert_eq!(response.status(), status);
+        assert!(warnings.is_empty(), "{method} {route}: {warnings:?}");
+    }
+}
 
 fn library_engine() -> Engine {
     Engine::new(DsClient::new("http://127.0.0.1:1"))

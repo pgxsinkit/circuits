@@ -1,5 +1,6 @@
 //! Control-plane HTTP API (the swappable interface in front of the engine).
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -298,15 +299,21 @@ async fn list_tables(State(engine): State<Engine>) -> Json<TablesResp> {
     Json(TablesResp { tables })
 }
 
-async fn create_shape(
-    State(engine): State<Engine>,
-    Json(req): Json<CreateShapeReq>,
-) -> Result<Json<ShapeResp>, AppError> {
-    let subscription = validate_new_subscription(req.subscription)?;
-    // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
-    let (rec, sub) =
-        engine.create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription).await?;
-    Ok(Json(ShapeResp::created(&engine, rec, sub)))
+async fn create_shape(State(engine): State<Engine>, payload: Result<Json<CreateShapeReq>, JsonRejection>) -> Response {
+    let req = match create_json(payload, "create_shape", "/shapes") {
+        Ok(req) => req,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let context = CreateContext::new("create_shape", "/shapes", &req.table, req.where_.as_ref());
+    let result: Result<_, AppError> = async {
+        let subscription = validate_new_subscription(req.subscription)?;
+        // share = true: identical reference shapes from multiple clients collapse to one maintained stream.
+        let (rec, sub) =
+            engine.create_shape_as(&req.table, req.where_, req.columns, req.changes_only, true, subscription).await?;
+        Ok(Json(ShapeResp::created(&engine, rec, sub)))
+    }
+    .await;
+    context.respond(result)
 }
 
 #[derive(Deserialize)]
@@ -326,11 +333,136 @@ struct AggregateReq {
 /// Create a scalar aggregation shape.
 async fn create_aggregate(
     State(engine): State<Engine>,
-    Json(req): Json<AggregateReq>,
-) -> Result<Json<ShapeResp>, AppError> {
-    let subscription = validate_new_subscription(req.subscription)?;
-    let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
-    Ok(Json(ShapeResp::created(&engine, rec, sub)))
+    payload: Result<Json<AggregateReq>, JsonRejection>,
+) -> Response {
+    let req = match create_json(payload, "create_aggregate", "/aggregate") {
+        Ok(req) => req,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let context = CreateContext::new("create_aggregate", "/aggregate", &req.table, req.where_.as_ref());
+    let result: Result<_, AppError> = async {
+        let subscription = validate_new_subscription(req.subscription)?;
+        let (rec, sub) = engine.create_aggregate_as(&req.table, req.where_, req.func, req.col, subscription).await?;
+        Ok(Json(ShapeResp::created(&engine, rec, sub)))
+    }
+    .await;
+    context.respond(result)
+}
+
+/// Extractor errors have no validated request context. Keep axum's response intact and record
+/// only its category: its diagnostic body can contain arbitrary fragments of the invalid input.
+fn create_json<T>(
+    payload: Result<Json<T>, JsonRejection>,
+    operation: &'static str,
+    route: &'static str,
+) -> Result<T, JsonRejection> {
+    payload.map(|Json(req)| req).inspect_err(|rejection| {
+        let category = match rejection {
+            JsonRejection::JsonDataError(_) => "json_data",
+            JsonRejection::JsonSyntaxError(_) => "json_syntax",
+            JsonRejection::MissingJsonContentType(_) => "missing_json_content_type",
+            JsonRejection::BytesRejection(_) => "body_bytes",
+            _ => "json_rejection",
+        };
+        tracing::warn!(
+            operation,
+            route,
+            status = rejection.status().as_u16(),
+            rejection = category,
+            context = "unavailable",
+            "create request refused"
+        );
+    })
+}
+
+struct CreateContext {
+    operation: &'static str,
+    route: &'static str,
+    table: String,
+    predicate: String,
+}
+
+impl CreateContext {
+    fn new(operation: &'static str, route: &'static str, table: &TableRef, predicate: Option<&PredicateJson>) -> Self {
+        Self {
+            operation,
+            route,
+            table: bounded_log_string(table.as_str(), 256),
+            predicate: predicate_summary(predicate),
+        }
+    }
+
+    fn respond<T: IntoResponse>(self, result: Result<T, AppError>) -> Response {
+        match result {
+            Ok(response) => response.into_response(),
+            Err(error) => {
+                // Debug string fields escape control characters; only these log copies are capped.
+                // The diagnostic cause and client response retain their existing semantics.
+                tracing::warn!(operation = self.operation, route = self.route, status = error.status.as_u16(),
+                    error = ?bounded_log_string(&error.msg, 1024), table = ?self.table,
+                    predicate = %self.predicate, "create request refused");
+                error.into_response()
+            }
+        }
+    }
+}
+
+fn bounded_log_string(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut bounded: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        bounded.pop();
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Describe structure, never column names, subquery tables, or literal values. Both traversal
+/// work and stack depth are capped, including very wide combinators.
+fn predicate_summary(predicate: Option<&PredicateJson>) -> String {
+    fn kind(predicate: &PredicateJson) -> &'static str {
+        match predicate {
+            PredicateJson::Leaf { .. } => "leaf",
+            PredicateJson::IsNull { .. } => "is_null",
+            PredicateJson::And { .. } => "and",
+            PredicateJson::Or { .. } => "or",
+            PredicateJson::Not { .. } => "not",
+            PredicateJson::In { .. } => "in",
+        }
+    }
+    fn visit(predicate: &PredicateJson, depth: usize, nodes: &mut usize, max_depth: &mut usize, truncated: &mut bool) {
+        if *nodes == 64 || depth > 8 {
+            *truncated = true;
+            return;
+        }
+        *nodes += 1;
+        *max_depth = (*max_depth).max(depth);
+        match predicate {
+            PredicateJson::And { and: children } | PredicateJson::Or { or: children } => {
+                for child in children {
+                    visit(child, depth + 1, nodes, max_depth, truncated);
+                    if *truncated {
+                        break;
+                    }
+                }
+            }
+            PredicateJson::Not { not } => visit(not, depth + 1, nodes, max_depth, truncated),
+            PredicateJson::In { subquery, .. } => {
+                if let Some(inner) = &subquery.where_ {
+                    visit(inner, depth + 1, nodes, max_depth, truncated);
+                }
+            }
+            _ => {}
+        }
+    }
+    let (mut nodes, mut depth, mut truncated) = (0, 0, false);
+    let root = if let Some(predicate) = predicate {
+        visit(predicate, 1, &mut nodes, &mut depth, &mut truncated);
+        kind(predicate)
+    } else {
+        "all"
+    };
+    format!("root={root} nodes={nodes} depth={depth} truncated={truncated}")
 }
 
 async fn get_shape(State(engine): State<Engine>, Path(id): Path<String>) -> Result<Json<ShapeResp>, AppError> {
@@ -874,7 +1006,38 @@ impl IntoResponse for AppError {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppError, StatusCode, health_json};
+    use super::{AppError, StatusCode, bounded_log_string, health_json, predicate_summary};
+    use crate::predicate::{PredicateJson, SubqueryJson};
+
+    #[test]
+    fn refusal_predicate_summary_caps_wide_and_deep_structures() {
+        let leaf = PredicateJson::IsNull { col: "private-column".to_owned(), is_null: true };
+        let wide = PredicateJson::And { and: vec![leaf.clone(); 10_000] };
+        assert_eq!(predicate_summary(Some(&wide)), "root=and nodes=64 depth=2 truncated=true");
+        let mut deep = leaf.clone();
+        for _ in 0..20 {
+            deep = PredicateJson::Not { not: Box::new(deep) };
+        }
+        assert_eq!(predicate_summary(Some(&deep)), "root=not nodes=8 depth=8 truncated=true");
+        let subquery = PredicateJson::In {
+            col: "private-column".to_owned(),
+            subquery: SubqueryJson {
+                table: "private-table".into(),
+                project: "private-project".to_owned(),
+                where_: Some(Box::new(leaf)),
+            },
+            negated: false,
+        };
+        assert_eq!(predicate_summary(Some(&subquery)), "root=in nodes=2 depth=2 truncated=false");
+        assert_eq!(predicate_summary(None), "root=all nodes=0 depth=0 truncated=false");
+    }
+
+    #[test]
+    fn refusal_log_strings_cap_unicode_without_changing_short_messages() {
+        assert_eq!(bounded_log_string("cause\nwith control", 1024), "cause\nwith control");
+        assert_eq!(bounded_log_string("世界世界", 3), "世界…");
+        assert_eq!(bounded_log_string("世界世", 3), "世界世");
+    }
 
     // A probe may string-compare the body, so byte-for-byte exactness (no whitespace) matters more
     // than JSON equivalence.

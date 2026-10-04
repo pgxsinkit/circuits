@@ -93,6 +93,8 @@ Both required gates passed: 425 engine Rust unit tests and its other binaries, 2
 
 ## Native correctness follow-up: 0011 (resolved for plain Postgres shapes)
 
+Committed as `a19c915` on `develop`; the pre-commit validation gate also passed.
+
 After committing 0021 and backlog status/priority clarification as `410f317`, selection returned
 to the whole backlog. [0011](0011-a-forced-exit-replays-the-checkpoint-window.md) precedes optional
 fork recovery because the native pgxsinkit reader deduplicates stream offsets, not source versions.
@@ -130,6 +132,28 @@ seven-case shutdown file also passed independently. Reviews found no remaining b
 dependencies, tools or branches changed. Each plain output append adds a HEAD; this is not a
 throughput, power-loss or fresh downstream lifecycle qualification. The new paired binaries are
 required; legacy plain catalogs refuse boot and older binaries cannot safely consume the new WAL.
+
+## Operator diagnostics follow-up: 0001 (resolved)
+
+After committing 0011, selection moved to [0001](0001-refused-shape-create-not-logged.md), the
+recorded silent shape-refusal incident. The bounded implementation covers `/shapes` and `/aggregate`
+creation refusals, including extractor rejection, with structured warnings and retained response
+semantics. Predicate context is structural and bounded; unrelated HTTP routes are not given blanket
+warning logging. The already fixed pool check-in warning and downstream control-plane error mapping
+are separate. A real-router regression first reproduced zero WARN events despite the correct
+unknown-table 400; the same assertion is now green. Seven new tests cover both creation endpoints,
+validation/admission precedence, extraction responses, bounded Unicode/control-safe context and
+unrelated-route silence. Original AppError classification and Retry-After remain intact. Predicate
+summaries omit request values; existing diagnostic causes can still contain offending input, so
+bounded logging is not universal redaction. Source inspection covers the successful response branch;
+no dedicated success logging fixture or historical deployment reproduction is claimed.
+
+Coordinator inspection and independent review found no blockers. Both required gates passed on the
+final source: 440 engine Rust unit tests plus its 51 other cases, 225 log-server unit tests, eight
+CLI cases, 82 TS unit tests, 250 integration cases across 61 files and 332 protocol cases, retaining
+the existing two Rust ignores and six protocol skips. The focused router file passed 15/15 and HTTP
+unit tests 6/6. Real-engine integration output also emitted the warnings. No dependencies, tools,
+branches, PostgreSQL behavior or log-server implementation changed; output was captured directly.
 
 ## Constraints and deferred choices
 

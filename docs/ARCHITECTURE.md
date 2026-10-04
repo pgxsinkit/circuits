@@ -907,6 +907,14 @@ than the mechanism.
 
 ## 10. Telemetry
 
+- **Creation refusals:** failed `POST /shapes` and `/aggregate` responses emit one structured
+  warning at the HTTP boundary, including pre-engine validation and JSON/type extraction failures.
+  Route, status, bounded diagnostic text and available canonical-table/structural-predicate context
+  identify the refusal without serializing the predicate or subscription. Extractor failures do not
+  infer context from malformed input. Responses retain their status, body and retry headers;
+  successful requests and unrelated endpoints do not gain blanket warning logging. Error text may
+  itself describe an invalid value, so the structural summary is not universal message redaction.
+
 - `GET /metrics` — atomic counters (`envelopes_processed`, `shape_appends`, `family_steps`,
   `txn_spills_total` / `txn_spill_bytes` / `txn_chunked_appends_total` for large transactions,
   `backfill_chunked_appends_total` for streamed backfills, `sequencer_orphan_fragments_total`) +

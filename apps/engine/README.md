@@ -220,7 +220,16 @@ streams therefore destroys nothing a restart would have kept.
 Shape creation requests naming an unknown table or column in a resolved schema answer `400`. A table
 whose schema is resolving or unresolved after drift answers `503` with `Retry-After: 1` before column validation;
 the caller can retry once resolution succeeds. Boot and degraded admission checks also take
-precedence over invalid-input classification.
+precedence over schema-request error classification; JSON extraction and subscription validation
+occur at the HTTP boundary first.
+
+Failed `POST /shapes` and `POST /aggregate` requests emit one structured warning with the route,
+status, bounded diagnostic message, canonical table and structural predicate summary. Malformed
+JSON or typed input rejected during extraction has unavailable table/predicate context. The HTTP
+status, body and `Retry-After` are unchanged. Predicate summaries omit literal values and
+subscription IDs; existing error messages can still describe invalid input values. Successful
+creation requests and unrelated endpoints do not acquire request-body logging. For an unknown-table
+refusal, compare the logged table with `GET /tables` and the configured table selectors.
 
 **Creating a subquery shape** (`POST /shapes` with an `IN (SELECT …)` predicate) registers the
 shape's dependency edges before it reads Postgres, so a membership change can reach it mid-create:
