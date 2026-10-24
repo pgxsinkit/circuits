@@ -19,8 +19,9 @@ crates.io, npm or Docker Hub: the packages there under this name are upstream's.
 
 ## Quickstart
 
-**Build prerequisites:** a Rust toolchain — stable, **≥ 1.75** (the MSRV; edition
-2021). Just `cargo`/`rustc` + a C linker; no system libraries and no default cargo
+**Build prerequisites:** a Rust toolchain — stable, **≥ 1.89** (the dependency minimum;
+edition 2021). This workspace builds and tests with **Rust 1.99.1**, pinned in
+`rust-toolchain.toml`. Just `cargo`/`rustc` + a C linker; no system libraries and no default cargo
 features. Builds on Linux and macOS, x64 and arm64.
 
 ```bash
@@ -171,6 +172,12 @@ Opt-in via the **`telemetry` Cargo feature** (off by default — a default build
 The instrumentation is deliberately lean and aimed at finding bottlenecks: a single `ds.request` span (bounded attributes only — never the stream path/id) plus metrics. The two most useful are **`ds.append.fsync.batch_size`** (group-commit health — how many appends fold into one fsync) and **`ds.read.offload.wait`** (blocking-pool queue wait, the cold-read pressure signal); alongside append fsync/lock-wait/total duration, read duration by mode, tail-cache hit ratio, and a request counter. All labels are bounded (engine, live, cache, outcome, …).
 
 ## Conformance
+
+The suite runs with the workspace's Vitest 5. Published conformance package `0.3.7` declares
+Vitest 4 as a regular dependency, which otherwise loads a second runner and fails during test
+collection. The root `package.json` overrides only that package's Vitest dependency to `$vitest`
+(the root's declared version). Remove the override when upgrading to an upstream release that
+uses a Vitest peer dependency supporting version 5.
 
 ```bash
 bun install

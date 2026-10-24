@@ -34,16 +34,21 @@
     "validate:full": "bun run validate && bun run test:integration"
   },
   "devDependencies": {
-    "@types/node": "26.6.3",
-    "oxfmt": "0.71.0",
-    "oxlint": "1.86.0",
-    "oxlint-tsgolint": "7.0.2003",
+    "@types/node": "26.6.5",
+    "oxfmt": "0.74.0",
+    "oxlint": "1.89.0",
+    "oxlint-tsgolint": "7.0.2005",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
-    "vitest": "4.1.11"
+    "vitest": "5.0.5"
+  },
+  "overrides": {
+    "@durable-streams/server-conformance-tests@0.3.7": {
+      "vitest": "$vitest"
+    }
   },
   "engines": {
     "node": ">=26"
   },
-  "packageManager": "bun@1.4.2"
+  "packageManager": "bun@1.4.4"
 }

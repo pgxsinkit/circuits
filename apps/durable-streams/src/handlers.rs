@@ -1333,7 +1333,7 @@ async fn handle_append_inner(store: Arc<Store>, req: Req, path: String) -> (Resp
         let pending_sequence = if let Some(seq) = &seq_header {
             let s = st.shared.read().unwrap();
             if s.last_seq_header.as_deref().is_some_and(|last| seq.as_str() <= last) {
-                if s.committed_last_seq_header.as_deref().map_or(true, |committed| seq.as_str() > committed) {
+                if s.committed_last_seq_header.as_deref().is_none_or(|committed| seq.as_str() > committed) {
                     true
                 } else {
                     // Body must read "Sequence conflict" to match the reference

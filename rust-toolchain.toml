@@ -1,4 +1,5 @@
-# The pinned toolchain: Rust 1.99.0, the first stable release after 1.96.0 that compiles dbsp.
+# The pinned toolchain: Rust 1.99.1. Rust 1.99.0 was the first stable release after 1.96.0
+# that compiled dbsp; this pin includes its latest patch release.
 #
 # Why a pin at all: every stable rustc from 1.97.0 to 1.98.1 hits an internal compiler error (a
 # rustc_next_trait_solver panic in structural_traits.rs) while compiling dbsp. The workspace sat on
@@ -6,8 +7,8 @@
 # 1.99.0 fixed the panic. The dependency updates were prepared and validated on its beta,
 # 1.99.0-beta.6 (the dated toolchain beta-2026-09-18), before switching to stable on 2026-10-01.
 #
-# 1.99.0 is also what CI installs (actions-rust-lang/setup-rust-toolchain reads this file) and what
-# the two container/Containerfile.* build stages use (`FROM docker.io/amd64/rust:1.99.0-trixie`),
+# 1.99.1 is also what CI installs (actions-rust-lang/setup-rust-toolchain reads this file) and what
+# the two container/Containerfile.* build stages use (`FROM docker.io/amd64/rust:1.99.1-trixie`),
 # so local, CI and image builds all share one compiler. The images are published for amd64 only.
 #
 # The pin covers the whole workspace, the log server (apps/durable-streams) included. The log
@@ -19,4 +20,4 @@
 # mise.toml turns on `idiomatic_version_file_enable_tools` for rust, so mise takes the
 # version from this file instead.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"

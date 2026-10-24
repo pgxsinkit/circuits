@@ -118,12 +118,12 @@ impl Shared {
     pub(crate) fn commit_append_metadata(&mut self, producer: Option<(&str, ProducerState)>, seq: Option<&str>) {
         if let Some((id, state)) = producer {
             let entry = self.producers.get_mut(id).expect("accepted producer has a writer entry");
-            if entry.committed.map_or(true, |old| (state.epoch, state.last_seq) > (old.epoch, old.last_seq)) {
+            if entry.committed.is_none_or(|old| (state.epoch, state.last_seq) > (old.epoch, old.last_seq)) {
                 entry.committed = Some(state);
             }
         }
         if let Some(seq) = seq {
-            if self.committed_last_seq_header.as_deref().map_or(true, |old| seq > old) {
+            if self.committed_last_seq_header.as_deref().is_none_or(|old| seq > old) {
                 self.committed_last_seq_header = Some(seq.to_owned());
             }
         }
@@ -610,9 +610,7 @@ impl StreamState {
     pub(crate) fn publish_tail(&self, candidate: Tail, chunk: Option<(u64, bytes::Bytes)>) {
         debug_assert!(chunk.is_some() || candidate.closed, "a publication without bytes must be durable EOF");
         debug_assert!(
-            chunk
-                .as_ref()
-                .map_or(true, |(start, bytes)| start.checked_add(bytes.len() as u64) == Some(candidate.bytes)),
+            chunk.as_ref().is_none_or(|(start, bytes)| start.checked_add(bytes.len() as u64) == Some(candidate.bytes)),
             "a published chunk must end at the candidate tail"
         );
         let changed = self.tail_tx.send_if_modified(|current| {
@@ -696,7 +694,7 @@ impl StreamState {
             || self.config.ttl_seconds.is_some_and(|ttl| {
                 // Invalid runtime state must fail closed, never panic or become
                 // immortal. Create and recovery reject this state in advance.
-                last_access.checked_add(Duration::from_secs(ttl)).map_or(true, |deadline| now >= deadline)
+                last_access.checked_add(Duration::from_secs(ttl)).is_none_or(|deadline| now >= deadline)
                     || now.checked_add(Duration::from_secs(ttl)).is_none()
             })
     }
@@ -2003,8 +2001,8 @@ impl Meta {
         let Some(last_access) = UNIX_EPOCH.checked_add(Duration::from_secs(self.last_access_unix)) else {
             return false;
         };
-        self.expires_at_unix.map_or(true, |secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)).is_some())
-            && self.ttl_seconds.map_or(true, |ttl| last_access.checked_add(Duration::from_secs(ttl)).is_some())
+        self.expires_at_unix.is_none_or(|secs| UNIX_EPOCH.checked_add(Duration::from_secs(secs)).is_some())
+            && self.ttl_seconds.is_none_or(|ttl| last_access.checked_add(Duration::from_secs(ttl)).is_some())
     }
 
     fn capture(st: &StreamState) -> Meta {
@@ -2113,7 +2111,7 @@ pub(crate) fn commit_close_sync(st: &StreamState, candidate: &CloseCandidate) ->
         meta.producers.insert(id.clone(), *state);
     }
     if let Some(seq) = &candidate.seq_header {
-        if meta.last_seq_header.as_deref().map_or(true, |old| seq.as_str() > old) {
+        if meta.last_seq_header.as_deref().is_none_or(|old| seq.as_str() > old) {
             meta.last_seq_header = Some(seq.clone());
         }
     }

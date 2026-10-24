@@ -38,6 +38,7 @@ use dbsp::dynamic::DowncastTrait;
 use dbsp::trace::{BatchReader as DynBatchReaderTrait, Cursor};
 use dbsp::typed_batch::{BatchReader, OrdIndexedZSet, OrdZSet, SpineSnapshot};
 use dbsp::{MapHandle, OutputHandle, Runtime};
+use feldera_types::size::ConfigSize;
 use tokio::sync::{mpsc, oneshot};
 
 use feldera_macros::{IsNone, OrdRepr};
@@ -114,11 +115,11 @@ struct SpillConfig {
     dir: String,
     /// Spine batches above this size go to layer files (smaller ones stay in memory).
     min_storage_bytes: usize,
-    /// Storage buffer-cache budget, in MiB, passed to dbsp as `StorageOptions::cache_mib`.
+    /// Storage buffer-cache budget, in MiB, converted to `StorageOptions::cache_size`.
     ///
     /// dbsp treats a `Some` value as the **grand TOTAL** cache size and uses it verbatim — no
     /// further multiplication by worker count or thread-type (see `RuntimeInner::new` in
-    /// dbsp 0.357: `Some(cache_mib) => cache_mib * 1 MiB`, full stop). The ×nworkers×thread-types
+    /// dbsp 0.369: `Some(cache_size) => cache_size.as_usize()`). The ×nworkers×thread-types
     /// scaling dbsp describes in its own docs only fires on ITS unset-default (`None` ⇒
     /// `256 MiB × nworkers × ThreadType::LENGTH(=2)`); for our 1-worker circuit that default is
     /// 512 MiB, which is why we always pass an explicit value here (see
@@ -293,8 +294,8 @@ impl MembershipCircuit {
             let storage = CircuitStorageConfig::for_config(
                 StorageConfig { path: sp.dir.clone(), cache: StorageCacheConfig::default() },
                 StorageOptions {
-                    min_storage_bytes: Some(sp.min_storage_bytes),
-                    cache_mib: Some(sp.cache_mib),
+                    min_spill_size: Some(ConfigSize::from_bytes(sp.min_storage_bytes as u64)),
+                    cache_size: Some(ConfigSize::from_mib(sp.cache_mib as u64)),
                     ..StorageOptions::default()
                 },
             )
@@ -463,14 +464,14 @@ impl MembershipCircuit {
     }
 }
 
-/// `(approximate_byte_size, len)` of the snapshot a slot currently holds (0 if unpublished).
+/// `(approximate_byte_size, len_upper_bound)` of the snapshot a slot holds (0 if unpublished).
 /// `approximate_byte_size` is dbsp's per-batch columnar size summed over the batches the
-/// `ro_snapshot` pins; `len` is the total tuple count across those batches (superseded,
+/// `ro_snapshot` pins; `len_upper_bound` counts tuples across those batches (superseded,
 /// uncompacted `(k,+w)`/`(k,-w)` pairs included). Cheap — no circuit round-trip.
 fn snap_size<T: BatchReader>(slot: &Slot<T>) -> (usize, usize) {
     let guard = slot.read().expect("snapshot slot");
     match guard.as_ref() {
-        Some(s) => (s.inner().approximate_byte_size(), s.inner().len()),
+        Some(s) => (s.inner().approximate_byte_size(), s.inner().len_upper_bound()),
         None => (0, 0),
     }
 }

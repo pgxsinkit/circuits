@@ -278,9 +278,9 @@ mod tests {
 
         let mut seg = Vec::new();
         encode_header_into(&mut seg, 1, RecordKind::Append, 42, 0, len as u32, PAYLOAD_CHECKSUMMED, payload_crc);
-        seg.extend(std::iter::repeat(0xAB).take(prefix)); // written payload prefix
-        seg.extend(std::iter::repeat(0u8).take(len - prefix)); // torn (fallocate zeros)
-        seg.extend(std::iter::repeat(0u8).take(1 << 20)); // rest of fallocate'd segment
+        seg.extend(std::iter::repeat_n(0xAB, prefix)); // written payload prefix
+        seg.extend(std::iter::repeat_n(0u8, len - prefix)); // torn (fallocate zeros)
+        seg.extend(std::iter::repeat_n(0u8, 1 << 20)); // rest of fallocate'd segment
 
         assert!(
             matches!(decode_at(&seg, 0), Decoded::Torn),
@@ -302,7 +302,7 @@ mod tests {
             payload: b"checksummed-payload",
         };
         encode_into(&mut b, &r); // sets PAYLOAD_CHECKSUMMED + correct payload_crc
-        b.extend(std::iter::repeat(0u8).take(64)); // fallocate'd tail
+        b.extend(std::iter::repeat_n(0u8, 64)); // fallocate'd tail
         match decode_at(&b, 0) {
             Decoded::Record { payload_off, len, .. } => {
                 assert_eq!(&b[payload_off..payload_off + len], b"checksummed-payload");

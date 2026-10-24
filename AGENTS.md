@@ -253,7 +253,7 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   re-delivery cannot become an exit loop. Never serve stale: no additive tolerance, no whole-engine
   reset.
 - **The replication slot is bound to a catalog epoch** (ADR 0004; `engine/epoch.rs`). A `SlotBound
-{ system_identifier, timeline_id, slot }` record in the durable catalog names the epoch every shape
+  { system_identifier, timeline_id, slot }` record in the durable catalog names the epoch every shape
   belongs to, and the slot is verified against it before **every** connection — boot and each ingestor
   reconnect. Slot gone, `wal_status = 'lost'`, foreign output plugin, or a different cluster
   `system_identifier` = **epoch break**: the gap cannot be filled, so either every shape is retired

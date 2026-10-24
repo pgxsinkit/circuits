@@ -18,7 +18,7 @@ path = "src/main.rs"
 # one shared circuit whose arrangements spill to disk when tables grow. The crates below it are
 # coupled to it: cargo has to unify them with dbsp's own tree, so that the rkyv/size-of/
 # feldera-macros derive macros and the trait impls our cell types use are the ones dbsp expects.
-dbsp = "0.357.0"
+dbsp = "0.369.0"
 # rkyv 0.7, not 0.8 (latest): dbsp archives with rkyv 0.7, and its `ArchivedDBData` bounds are on
 # 0.7's traits. default-features=false avoids rkyv's default `size_32`, which is mutually exclusive
 # with the `size_64` that dbsp selects (cargo unions features across dependents).
@@ -26,7 +26,9 @@ rkyv = { version = "0.7.46", default-features = false, features = ["std", "size_
 # dbsp uses Feldera's fork of size-of. The `SizeOf` derive emits hardcoded `size_of::` paths,
 # so the crate must be in scope under the name `size_of` (dbsp renames it the same way).
 size_of = { package = "feldera-size-of", version = "0.1.7" }
-feldera-macros = "0.357.0"
+feldera-macros = "0.369.0"
+# DBSP's typed storage-size configuration, kept on the same Feldera release.
+feldera-types = "0.369.0"
 # `OrderedFloat` gives `Value::Float` the `Eq`/`Ord`/`Hash` a bare f64 lacks (map keys:
 # aggregate multisets, routing indexes). 4.x, not 5.x (latest), because it has to be the
 # ordered-float dbsp depends on: dbsp implements `OrdRepr` (the archived-vs-unarchived ordering
@@ -37,8 +39,8 @@ anyhow = "1.0.104"
 
 # Service layer: control-plane HTTP + durable-streams client + async runtime.
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-tokio = { version = "1.53.1", features = ["full"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
 # BroadcastStream adapter for the /trace SSE endpoint.
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 axum = "0.8.9"
@@ -53,18 +55,18 @@ tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 memory-stats = "1.2.0"
-opentelemetry = "0.33.0"
-opentelemetry_sdk = { version = "0.33.0", features = ["metrics"] }
-opentelemetry-prometheus = "0.33.0"
+opentelemetry = "0.33.1"
+opentelemetry_sdk = { version = "0.33.1", features = ["metrics"] }
+opentelemetry-prometheus = "0.33.1"
 prometheus = "0.14.0"
-pgwire-replication = { version = "0.4.1", default-features = false, features = ["scram"] }
+pgwire-replication = { version = "0.5.0", default-features = false, features = ["scram"] }
 url = "2.5.8"
-libc = "0.2.189"
+libc = "0.2.191"
 # Host-side per-feed key sets (Task 2.2, dbsp-ds-dh6): `FeedSet` holds each shape's feed
 # membership as a `HashMap<feed_id, RoaringBitmap>` keyed by `u32` pk-id — the delete gate is a
 # synchronous `remove()`-returns-`true` check, no longer an in-circuit relation. Already in the
 # tree transitively (dbsp -> roaring). See docs/notes/2026-07-16-feed-set-representation-spike.md.
-# 0.11.4, not 0.11.5 (latest): dbsp 0.357 requires exactly `=0.11.4`, and a graph holds one 0.11.x.
+# 0.11.4, not 0.11.5 (latest): dbsp 0.369 requires exactly `=0.11.4`, and a graph holds one 0.11.x.
 roaring = "0.11.4"
 
 [dev-dependencies]

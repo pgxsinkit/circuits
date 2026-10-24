@@ -13,7 +13,7 @@
 # builds use (and rustup has nothing to download).
 # Build and runtime stages both use Debian 13 (Trixie), keeping their glibc and libgcc compatible.
 # images.yml publishes amd64 only; use Docker's official per-architecture repository directly.
-FROM docker.io/amd64/rust:1.99.0-trixie AS build
+FROM docker.io/amd64/rust:1.99.1-trixie AS build
 RUN apt-get update && apt-get install -y --no-install-recommends cmake pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /repo
 # Cargo loads every workspace member's manifest, so both members are copied; only the engine is

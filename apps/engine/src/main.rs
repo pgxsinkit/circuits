@@ -24,7 +24,7 @@
 //! forever, answering `GET /ready` with `503 {"status":"waiting"}` throughout. Kubernetes gates
 //! traffic on readiness, so a restart buys nothing an operator would want.
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
 use std::io::Write;
 use std::time::Duration;
 
@@ -204,13 +204,11 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
         // catalog and reads the change log, and any of those can be slow against a server that is
         // coming up. A signal must not have to wait for it to finish — abandoning it costs nothing,
         // because nothing is published until it returns Ok.
-        let attempted = tokio::select! {
-            biased;
-            _ = shutdown.wait() => {
-                tracing::info!("boot: shutdown requested during the Postgres setup; abandoning it");
-                return false;
-            }
-            r = engine.setup_postgres(&config.tables, &config.slot) => r,
+        let Some(attempted) =
+            postgres_setup_attempt(&shutdown, engine.setup_postgres(&config.tables, &config.slot)).await
+        else {
+            tracing::info!("boot: shutdown requested during the Postgres setup; abandoning it");
+            return false;
         };
         let err = match attempted {
             Ok(()) => return true,
@@ -242,6 +240,23 @@ async fn setup_postgres_until_ready(engine: &Engine, config: &Config) -> bool {
                 return false;
             }
         }
+    }
+}
+
+/// `None` means startup was abandoned for shutdown, rather than failing configuration checks.
+async fn postgres_setup_attempt(
+    shutdown: &ShutdownToken,
+    setup: impl Future<Output = Result<()>>,
+) -> Option<Result<()>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => None,
+        result = setup => {
+            // `biased` checks shutdown first, but setup can observe a signal that arrives
+            // after that check and return its own cancellation error in the same poll.
+            // Do not classify that error as fatal configuration on the way out.
+            if shutdown.is_shutting_down() { None } else { Some(result) }
+        },
     }
 }
 
@@ -357,4 +372,32 @@ fn init_tracing(filter: &str) {
     // `filter` is CIRCUITS_LOG, or `info` (see config.rs).
     let env_filter = EnvFilter::try_new(filter).unwrap_or_else(|_| EnvFilter::new("info"));
     fmt().with_env_filter(env_filter).with_writer(std::io::stderr).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn shutdown_during_setup_poll_is_not_a_boot_refusal() {
+        let shutdown = ShutdownToken::new();
+        let result = postgres_setup_attempt(&shutdown, async {
+            // The outer select already polled shutdown as pending; the nested setup now
+            // observes cancellation and returns its own error in the same poll.
+            shutdown.begin();
+            anyhow::bail!("engine is shutting down");
+        })
+        .await;
+        assert!(result.is_none(), "shutdown must win over the setup error");
+    }
+
+    #[tokio::test]
+    async fn setup_failure_without_shutdown_remains_a_failure() {
+        let shutdown = ShutdownToken::new();
+        let result = postgres_setup_attempt(&shutdown, async {
+            anyhow::bail!("invalid publication");
+        })
+        .await;
+        assert_eq!(result.unwrap().unwrap_err().to_string(), "invalid publication");
+    }
 }

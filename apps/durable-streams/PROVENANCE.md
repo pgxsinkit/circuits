@@ -52,7 +52,9 @@ Only provenance and packaging metadata:
   both are now repo-relative. Base image pinned to `rust:1.96.0-bookworm` (was `rust:1-bookworm`).
 - Added `rust-toolchain.toml` pinning rustc 1.96.0, matching `pgxsinkit/electric-circuits` so both
   Rust services build on one toolchain. Circuits pins that version because rustc >= 1.97.0 ICEs on
-  `dbsp`; this crate has no dbsp and a declared MSRV of 1.75, so it is held here only for parity.
+  `dbsp`; this crate has no dbsp and had a declared MSRV of 1.75 at extraction, so it was held
+  there only for parity. The current workspace toolchain and dependency minimum are recorded in
+  `rust-toolchain.toml` and this crate's `Cargo.toml`.
 - Added `.github/workflows/ci.yml` and `docker.yml`, ported from the monorepo (see below).
 - `.gitignore` now covers `node_modules`, which the monorepo root used to.
 

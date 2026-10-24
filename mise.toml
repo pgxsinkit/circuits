@@ -7,6 +7,6 @@ idiomatic_version_file_enable_tools = ["rust"]
 
 [tools]
 # The TypeScript workspace's package manager and script runner (bun install, bun run …).
-bun = "1.4.2"
+bun = "1.4.4"
 # vitest runs under node; `bun run test` only launches it.
 node = "26"

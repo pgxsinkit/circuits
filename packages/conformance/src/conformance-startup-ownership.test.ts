@@ -147,7 +147,7 @@ describe("startup waits for replication-slot ownership", () => {
     expect((await fetch(`${coldUrl}/changes/0`, { method: "HEAD" })).status).toBe(404);
 
     second!.signal();
-    expect((await second!.waitForExit(4000)).code).toBe(0);
+    expect((await second!.waitForExit(4000)).code, second!.stderr()).toBe(0);
     expect(proxy!.writes).toEqual([]);
     expect((await fetch(`${h.engineUrl}/ready`)).status).toBe(200);
   });

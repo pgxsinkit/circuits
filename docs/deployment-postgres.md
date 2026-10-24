@@ -40,7 +40,7 @@ The engine sets everything else up for you on startup, per configured table:
 - `ALTER TABLE <t> REPLICA IDENTITY FULL` — so an UPDATE/DELETE carries the **full old row** (needed to
   compute the exact delta). The role you connect with must own the tables (or be superuser) for this.
 - `pg_create_logical_replication_slot('<slot>', 'pgoutput')` + `CREATE PUBLICATION <slot>_pub FOR
-ALL TABLES` (superuser) — the replication slot and its publication, created once
+  ALL TABLES` (superuser) — the replication slot and its publication, created once
   and reused.
 
 > **Each table needs a single-column primary key.** The engine introspects columns, types, and the pk

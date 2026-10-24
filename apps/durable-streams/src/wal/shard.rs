@@ -170,7 +170,7 @@ impl DurableFrontier {
     pub(crate) fn merge(&mut self, tail: u64, sequence: Option<&str>) {
         self.tail = self.tail.max(tail);
         if let Some(sequence) = sequence {
-            if self.sequence.as_deref().map_or(true, |old| sequence > old) {
+            if self.sequence.as_deref().is_none_or(|old| sequence > old) {
                 self.sequence = Some(sequence.to_owned());
             }
         }
