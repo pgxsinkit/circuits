@@ -96,7 +96,7 @@ The scripts are check-default: a bare verb never changes a file.
 bun run validate                           # the pre-commit gate: format + typecheck + lint + test
 bun run validate:full                      # explicit full validation and CI: validate + test:integration
 
-bun run format                             # check: oxfmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
+bun run format                             # check: bun fmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
 bun run format:write                       # apply both
 bun run lint                               # check: oxlint (type-aware), then clippy -D warnings: the log server (release profile), the engine (dev profile)
 bun run lint:fix                           # oxlint --fix

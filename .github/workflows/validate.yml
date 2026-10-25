@@ -33,18 +33,18 @@ jobs:
           components: rustfmt, clippy
           rustflags: ""
 
-      # oxfmt and oxlint are dev dependencies. No `bun-version`: setup-bun reads package.json's
+      # Bun includes the formatter; oxlint is a dev dependency. No `bun-version`: setup-bun reads package.json's
       # `packageManager`, which mise.toml matches.
       - uses: oven-sh/setup-bun@v2
 
-      # oxfmt and oxlint start under node; the version is mise.toml's.
+      # oxlint starts under node; the version is mise.toml's.
       - uses: actions/setup-node@v7
         with:
           node-version: 26
 
       - run: bun install --frozen-lockfile
 
-      # oxfmt over everything it formats, then `cargo fmt --check` (rustfmt.toml at the root).
+      # bun fmt over everything it formats, then `cargo fmt --check` (rustfmt.toml at the root).
       - name: Formatting
         run: bun run format
 

@@ -15,8 +15,8 @@
     "durable-streams:build": "bash scripts/with-toolchain.sh cargo build -p durable-streams",
     "engine:build": "bash scripts/with-toolchain.sh cargo build -p circuits-engine",
     "engine:test": "bash scripts/with-toolchain.sh cargo test -p circuits-engine",
-    "format": "oxfmt --config .oxfmtrc.jsonc --check . && bash scripts/with-toolchain.sh cargo fmt --check",
-    "format:write": "oxfmt --config .oxfmtrc.jsonc --write . && bash scripts/with-toolchain.sh cargo fmt",
+    "format": "bun fmt --no-script --config .oxfmtrc.jsonc --check . && bash scripts/with-toolchain.sh cargo fmt --check",
+    "format:write": "bun fmt --no-script --config .oxfmtrc.jsonc --write . && bash scripts/with-toolchain.sh cargo fmt",
     "lint": "oxlint -c .oxlintrc.jsonc . && bash scripts/with-toolchain.sh cargo clippy -p durable-streams --profile release-durable-streams --all-targets -- -D warnings && bash scripts/with-toolchain.sh cargo clippy -p circuits-engine --all-targets -- -D warnings",
     "lint:fix": "oxlint --fix -c .oxlintrc.jsonc .",
     "loop": "bash scripts/with-toolchain.sh bash scripts/conformance-loop.sh",
@@ -35,7 +35,6 @@
   },
   "devDependencies": {
     "@types/node": "26.6.5",
-    "oxfmt": "0.74.0",
     "oxlint": "1.89.0",
     "oxlint-tsgolint": "7.0.2005",
     "tsx": "4.23.15",
@@ -48,6 +47,7 @@
     }
   },
   "engines": {
+    "bun": ">=1.4.4",
     "node": ">=26"
   },
   "packageManager": "bun@1.4.4"
