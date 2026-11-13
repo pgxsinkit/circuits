@@ -28,10 +28,12 @@ The integration suites need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
 (`/usr/lib/postgresql/18/bin` on Debian and Ubuntu). `bun install` installs the pre-commit hook;
 there is no local pre-push hook. CI still runs full validation.
 
-**Finishing a task that touches the engine or the log server requires `bun run validate:full` green
-— see "Testing checklist before claiming done" in AGENTS.md, which also lists the focused scripts.**
+**Finishing a task that touches the engine or the log server requires `bun run validate` and
+`bun run validate:full` green — see "Build and verification" in AGENTS.md.** Focused scripts and
+the full testing checklist are in [docs/engineering-invariants.md](docs/engineering-invariants.md).
 
-The invariants and the gotchas are in **AGENTS.md**. Read it before touching the engine.
+Before changing the engine, log server, client or protocol, read **AGENTS.md** and the normative
+[engineering invariants](docs/engineering-invariants.md), including its pipeline design rules and gotchas.
 
 ## Architecture Overview
 
