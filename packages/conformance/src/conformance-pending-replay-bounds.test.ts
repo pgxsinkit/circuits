@@ -27,14 +27,14 @@ interface Memory {
   };
 }
 
-// Hold actual HTTP requests at the service boundary. Shape POSTs park snapshot installation;
-// non-live changes GETs park replay, while the sequencer's live reads continue independently.
+// Hold actual HTTP requests at the service boundary. Shape POSTs park snapshot installation,
+// non-live changes GETs park dormant replay, and the closed-tail gate parks the live sequencer.
 async function startProxy(upstreamUrl: string) {
   const upstream = new URL(upstreamUrl);
   let holdShapes = false;
   let holdReplay = false;
   let holdClosedTail = false;
-  let closedTailReads = 0;
+  let closedTailReached = false;
   let replayReads = 0;
   let replayActive = 0;
   let replayPeak = 0;
@@ -46,6 +46,7 @@ async function startProxy(upstreamUrl: string) {
     const target = new URL(incoming.url ?? "/", upstream);
     const replay =
       incoming.method === "GET" && target.pathname.startsWith("/changes/") && !target.searchParams.has("live");
+    const tailPoll = incoming.method === "GET" && target.pathname === "/changes/0" && target.searchParams.has("live");
     if (replay) {
       replayReads += 1;
       replayActive += 1;
@@ -73,13 +74,10 @@ async function startProxy(upstreamUrl: string) {
           };
           if (
             holdClosedTail &&
-            incoming.method === "GET" &&
-            target.pathname === "/changes/0" &&
-            target.searchParams.has("live") &&
-            response.statusCode === 204 &&
-            response.headers["stream-closed"] === "true"
+            tailPoll &&
+            (closedTailReached || (response.statusCode === 204 && response.headers["stream-closed"] === "true"))
           ) {
-            closedTailReads += 1;
+            closedTailReached = true;
             held.set(key, { path: target.pathname, replay: false, deliver: sendResponse });
           } else sendResponse();
         },
@@ -91,7 +89,13 @@ async function startProxy(upstreamUrl: string) {
       });
       incoming.pipe(forwarded);
     };
-    if ((holdShapes && incoming.method === "POST" && target.pathname.startsWith("/shape/")) || (holdReplay && replay)) {
+    // Shape lifecycle commands can cancel the held tail poll. Park replacements at the same
+    // point even after deleting the segment would change its response from 204 to 404.
+    if (
+      (holdShapes && incoming.method === "POST" && target.pathname.startsWith("/shape/")) ||
+      (holdReplay && replay) ||
+      (holdClosedTail && closedTailReached && tailPoll)
+    ) {
       held.set(key, { path: target.pathname, replay, deliver });
     } else deliver();
   });
@@ -117,9 +121,12 @@ async function startProxy(upstreamUrl: string) {
     replayPeak: () => replayPeak,
     closedTail: (hold: boolean) => {
       holdClosedTail = hold;
-      if (!hold) release(false);
+      if (!hold) {
+        closedTailReached = false;
+        release(false);
+      }
     },
-    closedTailReads: () => closedTailReads,
+    closedTailReached: () => closedTailReached,
     close: async () => {
       holdShapes = false;
       holdReplay = false;
@@ -219,7 +226,7 @@ describe("pending payload and dormant replay resource controls", () => {
       const shape = await createShape(h!, { table: "items" });
       proxy.closedTail(true);
       await pgQuery(h!, "INSERT INTO items VALUES (2, 2, $1)", ["rotate".repeat(2000)]);
-      await waitFor(() => proxy.closedTailReads() > 0, "live cursor to reach and remain at the closed segment tail");
+      await waitFor(proxy.closedTailReached, "live cursor to reach and remain at the closed segment tail");
       await park(shape);
       const closed = await fetch(`${h!.dsUrl}/changes/0`, { method: "HEAD" });
       expect(closed.headers.get("stream-closed")).toBe("true");
@@ -243,6 +250,12 @@ describe("pending payload and dormant replay resource controls", () => {
       }[];
       expect(catalog.some((event) => event.t === "dropped" && event.id === shape.shapeId)).toBe(true);
       expect((await memory()).resources.replay.active).toBe(0);
+
+      // With shape retirement proved, let the sequencer discover the same loss and fail closed.
+      proxy.closedTail(false);
+      await waitFor(async () => (await fetch(`${h!.engineUrl}/ready`)).status === 503, "sequencer to fail closed");
+      const replication = await fetch(`${h!.engineUrl}/replication/lsn`);
+      expect(await replication.json()).toMatchObject({ epoch: { state: "broken", reason: "change_log_missing" } });
     },
     60000,
   );
