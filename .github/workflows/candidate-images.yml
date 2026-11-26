@@ -1,0 +1,54 @@
+name: candidate images
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        type: boolean
+        default: false
+
+# The caller grants packages:write only for image publication.
+jobs:
+  qualify:
+    name: test candidate images
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+
+      - name: Set up Podman
+        run: |
+          command -v podman || { sudo apt-get update && sudo apt-get install --yes podman; }
+          podman --version
+
+      - name: Build and test both release images
+        id: candidates
+        run: bun run test:images
+
+      - name: Log in to GHCR
+        if: inputs.publish
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$TOKEN" | podman login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Publish the tested image IDs
+        if: inputs.publish
+        env:
+          ENGINE_ID: ${{ steps.candidates.outputs.engine }}
+          STREAMS_ID: ${{ steps.candidates.outputs.streams }}
+        run: |
+          tags=("sha-${GITHUB_SHA::7}" dev)
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then tags=("$GITHUB_REF_NAME" latest "${tags[0]}"); fi
+          for name in engine durable-streams; do
+            id=$ENGINE_ID
+            if [[ "$name" == durable-streams ]]; then id=$STREAMS_ID; fi
+            for tag in "${tags[@]}"; do
+              dest="ghcr.io/$GITHUB_REPOSITORY/$name:$tag"
+              podman push "$id" "docker://$dest"
+              echo "- \`$dest\`" >> "$GITHUB_STEP_SUMMARY"
+            done
+          done

@@ -47,6 +47,9 @@ use size_of::SizeOf;
 
 use crate::value::{Row, Tup2, Value};
 
+mod spill_dir;
+use spill_dir::OwnedSpillDirectory;
+
 /// An absolute assertion into one of the upsert maps: the key's current value, or absence.
 pub type Assert = dbsp::operator::Update<Value, Value>;
 
@@ -125,10 +128,9 @@ struct SpillConfig {
     /// 512 MiB, which is why we always pass an explicit value here (see
     /// [`spill_config_from_env`]/[`storage_cache_mib`]) instead of ever leaving this `None`.
     cache_mib: usize,
-    /// Engine-owned temp dir (removed at circuit shutdown — without checkpointing the
-    /// on-disk state is a cache, worthless across boots). `false` = user-specified dir,
-    /// never deleted.
-    auto: bool,
+    /// Holds the engine-owned directory until the circuit has stopped. Explicit paths stay
+    /// operator-owned and are never removed by this guard.
+    owner: Option<OwnedSpillDirectory>,
 }
 
 /// The engine's own default for [`SpillConfig::cache_mib`] when
@@ -150,7 +152,7 @@ fn storage_cache_mib(raw: Option<&str>) -> usize {
 
 /// Spilling is ON by default: without checkpointing the layer files are a disposable cache,
 /// so the default location is a per-circuit temp dir (unique per process + circuit, removed
-/// on shutdown; stale dirs from dead processes are swept best-effort at start).
+/// on shutdown; directories whose OS ownership lease was released are swept at start).
 ///
 /// - `CIRCUITS_SUBQ_STORAGE=0` — disable (fully in-memory relations).
 /// - `CIRCUITS_SUBQ_STORAGE_DIR=<path>` — explicit location (kept on shutdown).
@@ -163,39 +165,14 @@ fn spill_config_from_env() -> Result<Option<SpillConfig>> {
     }
     let min_kb: usize = std::env::var("CIRCUITS_SUBQ_MIN_STORAGE_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
     let cache_mib = storage_cache_mib(std::env::var("CIRCUITS_SUBQ_STORAGE_CACHE_MIB").ok().as_deref());
-    let (dir, auto) = match std::env::var("CIRCUITS_SUBQ_STORAGE_DIR") {
-        Ok(d) if !d.is_empty() => (d, false),
-        _ => (default_spill_dir(), true),
-    };
-    Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib, auto }))
-}
-
-/// A unique engine-owned spill dir: `<tmp>/circuits-subq/<pid>-<seq>`. Sweeps sibling
-/// dirs whose owning process is gone (best-effort — a crash leaves the dir behind, and the
-/// next boot on the machine reclaims it).
-fn default_spill_dir() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join("circuits-subq");
-    if let Ok(entries) = std::fs::read_dir(&base) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let Some(pid) = name.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
-                continue;
-            };
-            if pid != std::process::id() && !process_alive(pid) {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
+    let (dir, owner) = match std::env::var("CIRCUITS_SUBQ_STORAGE_DIR") {
+        Ok(d) if !d.is_empty() => (d, None),
+        _ => {
+            let owner = OwnedSpillDirectory::create()?;
+            (owner.path().to_string_lossy().into_owned(), Some(owner))
         }
-    }
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    base.join(format!("{}-{}", std::process::id(), seq)).to_string_lossy().into_owned()
-}
-
-/// Is `pid` a live process? (`kill -0` semantics.)
-fn process_alive(pid: u32) -> bool {
-    // SAFETY: kill with signal 0 performs only the existence/permission check.
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    };
+    Ok(Some(SpillConfig { dir, min_storage_bytes: min_kb * 1024, cache_mib, owner }))
 }
 
 enum Cmd {
@@ -277,7 +254,7 @@ impl MembershipCircuit {
     }
 
     /// [`start`], with everything explicit (tests).
-    fn start_full(spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
+    fn start_full(mut spill: Option<SpillConfig>) -> Result<MembershipCircuit> {
         let members: Slot<MemberSnapshot> = Slot::default();
         let contributors: Slot<MapSnapshot> = Slot::default();
         let (m_slot, c_slot) = (members.clone(), contributors.clone());
@@ -286,7 +263,7 @@ impl MembershipCircuit {
         // files under `dir`, keeping a bounded in-memory cache — RAM becomes O(cache)
         // instead of O(relation). In-memory (no dir) remains the default.
         let mut config = CircuitConfig::with_workers(1);
-        let cleanup_dir = spill.as_ref().filter(|sp| sp.auto).map(|sp| sp.dir.clone());
+        let spill_owner = spill.as_mut().and_then(|sp| sp.owner.take());
         if let Some(sp) = spill {
             use dbsp::circuit::{CircuitStorageConfig, StorageCacheConfig, StorageConfig, StorageOptions};
             std::fs::create_dir_all(&sp.dir)
@@ -334,12 +311,8 @@ impl MembershipCircuit {
         std::thread::Builder::new()
             .name("dbsp-subq".into())
             .spawn(move || {
+                let _spill_owner = spill_owner;
                 circuit_thread(dbsp, contrib_in, flips_out, rx);
-                // The default spill dir is a per-boot cache (no checkpointing yet): remove it
-                // once the circuit is gone. Explicit dirs are the user's to manage.
-                if let Some(dir) = cleanup_dir {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
             })
             .map_err(|e| anyhow::anyhow!("spawning dbsp-subq thread: {e}"))?;
 
@@ -731,7 +704,7 @@ mod tests {
             dir: dir.to_string_lossy().into_owned(),
             min_storage_bytes: 1, // spill aggressively so even tiny batches hit disk
             cache_mib: 8,
-            auto: false, // the test owns and removes this dir itself
+            owner: None, // the test owns and removes this dir itself
         }))
         .unwrap();
         // Enough contributor entries to force at least one on-disk batch.

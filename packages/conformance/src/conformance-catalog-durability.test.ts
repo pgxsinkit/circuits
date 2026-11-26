@@ -357,7 +357,7 @@ describe("native catalog durability under a durable-streams status failure", () 
       (await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status,
       "an acknowledged purge must not resurrect permanently when the supported zero-lease mode is configured",
     ).toBe(404);
-    expect((await fetch(shape.streamUrl)).status).toBe(404);
+    await waitFor(async () => (await fetch(shape.streamUrl)).status === 404, "purged stream deletion after restart");
   }, 90000);
 
   it("retires a purged stream after the client abandons its durability wait", async () => {
@@ -433,7 +433,7 @@ describe("native catalog durability under a durable-streams status failure", () 
     proxy!.failCatalogAppends(false);
     const [purged, joined] = await Promise.all([purging, joining]);
     expect(purged.ok).toBe(true);
-    expect((await fetch(first.streamUrl)).status).toBe(404);
+    await waitFor(async () => (await fetch(first.streamUrl)).status === 404, "purged shared stream deletion");
     expect(
       (await fetch(`${h.engineUrl}/shapes/${joined.shapeId}`)).status,
       "a successful native join must return a shape that still exists",
@@ -713,7 +713,7 @@ describe("native catalog durability under a durable-streams status failure", () 
       (await fetch(`${h.engineUrl}/shapes/${shape.shapeId}`)).status,
       "the caller can retry the unacknowledged identified release after restart",
     ).toBe(404);
-    expect((await fetch(shape.streamUrl)).status).toBe(404);
+    await waitFor(async () => (await fetch(shape.streamUrl)).status === 404, "released shape stream deletion");
   }, 90000);
 
   it("does not acknowledge release before durability when leases are disabled", async () => {

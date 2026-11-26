@@ -3,7 +3,7 @@
 //
 // PostgreSQL flushes a commit record (and a logical walsender may decode it) BEFORE the backend
 // leaves the ProcArray, and only leaving the ProcArray makes a transaction visible to snapshots
-// taken afterwards. This file holds a transaction T in exactly that window, on stock PostgreSQL 18:
+// taken afterwards. This file holds a transaction T in exactly that window on stock PostgreSQL:
 // the cluster names a synchronous standby that never connects (`phantom_standby`), T commits with
 // `synchronous_commit = on` and blocks in `SyncRepWaitForLSN` after its commit record is flushed
 // and clog-marked, and `pg_cancel_backend` later ends the wait ("already committed locally") so T

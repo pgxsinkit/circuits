@@ -9,9 +9,10 @@ replication → engine → durable-streams → client), against the
 
 ## What the harness boots (`src/harness.ts`)
 
-A vitest `globalSetup` builds the engine once and starts **one ephemeral Postgres** with
-`wal_level=logical` (each harness then creates its own database + replication slot inside it, so
-test files stay isolated). Per harness:
+Vitest builds the engine and log server once. Each integration file gets an ephemeral
+PostgreSQL 19 cluster with `wal_level=logical`. Slot creation can wait for an open transaction
+in another database on the same cluster. A separate cluster per file lets the idle-WAL test
+hold a write open while other files boot their engines. Each harness starts these components:
 
 - a per-test Postgres database (the system of record _and_, via `createPgOracle`, the truth),
 - a `DurableStreamTestServer` (the log),
@@ -37,7 +38,7 @@ Comparison (`src/compare.ts`) is set equality over declared columns, keyed by st
 
 ## Running
 
-Requires PostgreSQL 16 binaries on `PATH` (`initdb`/`pg_ctl`) — the suite boots its own cluster.
+Requires PostgreSQL 19 server binaries (`initdb` and `pg_ctl`). The suite boots its own clusters.
 From the repo root:
 
 ```bash

@@ -5,5 +5,5 @@
 import { execFileSync } from "node:child_process";
 
 export default function setup(): void {
-  execFileSync("cargo", ["build", "-p", "durable-streams"], { stdio: "inherit" });
+  execFileSync("cargo", ["build", "--locked", "-p", "durable-streams"], { stdio: "inherit" });
 }

@@ -10,8 +10,11 @@
     "packages/*/src/**/*.ts",
     "packages/conformance/scripts/**/*.ts",
     "apps/api/src/**/*.ts",
+    "apps/durable-streams/conformance/**/*.ts",
+    "scripts/**/*.ts",
     "vitest.config.ts",
     "vitest.global-setup.ts",
+    "vitest.integration-setup.ts",
     "vitest.unit-setup.ts"
   ],
   "exclude": ["**/node_modules", "**/dist", "target", "tmp"]

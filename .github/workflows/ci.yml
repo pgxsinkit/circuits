@@ -16,3 +16,7 @@ concurrency:
 jobs:
   validate:
     uses: ./.github/workflows/validate.yml
+
+  images:
+    needs: validate
+    uses: ./.github/workflows/candidate-images.yml

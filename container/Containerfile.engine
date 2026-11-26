@@ -19,8 +19,9 @@ WORKDIR /repo
 # Cargo loads every workspace member's manifest, so both members are copied; only the engine is
 # built, with cargo's default release profile.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY apps/engine apps/engine
-COPY apps/durable-streams apps/durable-streams
+COPY apps/durable-streams/Cargo.toml apps/durable-streams/
+COPY apps/engine/Cargo.toml apps/engine/
+COPY apps/engine/src apps/engine/src
 RUN cargo build --release --locked -p circuits-engine
 
 FROM debian:trixie-slim

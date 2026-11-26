@@ -26,12 +26,18 @@
     "test:durable-streams": "bash scripts/with-toolchain.sh cargo test -p durable-streams",
     "test:durable-streams:conformance": "bun run durable-streams:build --profile release-durable-streams && bun run --cwd apps/durable-streams test:conformance",
     "test:fuzz": "bash scripts/with-toolchain.sh vitest run packages/conformance/src/conformance-fuzz.test.ts",
+    "test:images": "bun scripts/qualify-images.ts",
     "test:integration": "bun run test:integration:harness && bun run test:durable-streams:conformance",
     "test:integration:harness": "bash scripts/with-toolchain.sh vitest run --project integration",
     "test:unit:ts": "bash scripts/with-toolchain.sh vitest run --project unit",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "validate": "bun run format && bun run check",
-    "validate:full": "bun run validate && bun run test:integration"
+    "validate": "bun scripts/validate.ts commit",
+    "validate:full": "bun scripts/validate.ts full",
+    "validate:harness": "bun scripts/validate.ts harness",
+    "validate:lifecycle": "bun scripts/validate.ts lifecycle",
+    "validate:protocol": "bun scripts/validate.ts protocol",
+    "validate:protocol:matrix": "bun scripts/validate.ts matrix",
+    "validate:rust": "bun scripts/validate.ts rust"
   },
   "devDependencies": {
     "@types/node": "26.6.5",

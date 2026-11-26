@@ -515,6 +515,7 @@ fn main() {
 
         let addr: SocketAddr = (host, port).into();
         let listener = TcpListener::bind(addr).await.expect("bind failed");
+        let addr = listener.local_addr().expect("bound listener address unavailable");
         println!("durable-streams-server listening on http://{addr} (data: {})", data_dir.display());
         tokio::select! {
             _ = engine_raw::serve(store, listener) => {}

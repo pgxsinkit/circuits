@@ -28,6 +28,7 @@ const common = {
   pool: "forks",
   testTimeout: 60000,
   hookTimeout: 60000,
+  sequence: { hooks: "stack" },
 } as const;
 
 export default defineConfig({
@@ -52,6 +53,7 @@ export default defineConfig({
           name: "integration",
           exclude: [...exclude, ...unitFiles],
           globalSetup: ["./vitest.global-setup.ts"],
+          setupFiles: ["./vitest.integration-setup.ts"],
         },
       },
     ],

@@ -10,15 +10,20 @@ use circuits_engine::ds::DsClient;
 use circuits_engine::engine::Engine;
 use circuits_engine::http::router;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tower::ServiceExt; // for `oneshot`
 use tracing::field::{Field, Visit};
-use tracing::instrument::WithSubscriber;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::{Layer, Registry};
 
 #[derive(Clone, Default)]
 struct CapturedWarnings(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+tokio::task_local! {
+    static REQUEST_WARNINGS: CapturedWarnings;
+}
+
+struct RequestWarningCapture;
 
 #[derive(Default)]
 struct Fields(BTreeMap<String, String>);
@@ -33,14 +38,26 @@ impl Visit for Fields {
     }
 }
 
-impl<S: tracing::Subscriber> Layer<S> for CapturedWarnings {
+impl<S: tracing::Subscriber> Layer<S> for RequestWarningCapture {
     fn on_event(&self, event: &tracing::Event<'_>, _: Context<'_, S>) {
         if *event.metadata().level() == tracing::Level::WARN {
-            let mut fields = Fields::default();
-            event.record(&mut fields);
-            self.0.lock().unwrap().push(fields.0);
+            let _ = REQUEST_WARNINGS.try_with(|warnings| {
+                let mut fields = Fields::default();
+                event.record(&mut fields);
+                warnings.0.lock().unwrap().push(fields.0);
+            });
         }
     }
+}
+
+fn install_warning_capture() {
+    static INSTALLED: OnceLock<()> = OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        // Callsite interest is process-wide. A transient scoped subscriber can miss a callsite
+        // first registered by a concurrent unscoped request. Keep one global subscriber alive,
+        // matching the server, and use task-local buffers to isolate concurrent request assertions.
+        tracing::subscriber::set_global_default(Registry::default().with(RequestWarningCapture)).unwrap();
+    });
 }
 
 async fn captured_request(
@@ -49,17 +66,51 @@ async fn captured_request(
     route: &str,
     body: String,
 ) -> (axum::response::Response, Vec<BTreeMap<String, String>>) {
+    install_warning_capture();
     let warnings = CapturedWarnings::default();
-    let subscriber = Registry::default().with(warnings.clone());
     let request = Request::builder()
         .method(method)
         .uri(route)
         .header("content-type", "application/json")
         .body(Body::from(body))
         .unwrap();
-    let response = router(engine).oneshot(request).with_subscriber(subscriber).await.unwrap();
+    let response = REQUEST_WARNINGS.scope(warnings.clone(), router(engine).oneshot(request)).await.unwrap();
     let events = warnings.0.lock().unwrap().clone();
     (response, events)
+}
+
+#[tokio::test]
+async fn capture_survives_first_warning_from_an_unscoped_request() {
+    install_warning_capture();
+    let request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/shapes")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"table":"nope"}"#))
+            .unwrap()
+    };
+    assert_eq!(router(library_engine()).oneshot(request()).await.unwrap().status(), StatusCode::BAD_REQUEST);
+    let (response, events) = captured_request(library_engine(), "POST", "/shapes", r#"{"table":"nope"}"#.into()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(events.len(), 1, "scoped request must be captured after unscoped first callsite: {events:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_requests_keep_their_warning_contexts_separate() {
+    let first = tokio::spawn(captured_request(library_engine(), "POST", "/shapes", r#"{"table":"first"}"#.into()));
+    let second = tokio::spawn(captured_request(
+        library_engine(),
+        "POST",
+        "/aggregate",
+        r#"{"table":"second","fn":"count"}"#.into(),
+    ));
+    for (request, expected_table) in [(first, "\"public.first\""), (second, "\"public.second\"")] {
+        let (response, warnings) = request.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(warnings.len(), 1, "each request must capture exactly its own warning: {warnings:?}");
+        assert_eq!(warnings[0]["table"], expected_table);
+    }
 }
 
 #[tokio::test]

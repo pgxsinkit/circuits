@@ -49,14 +49,14 @@ compiling dbsp. Every package script that reaches cargo runs it through `scripts
 (`mise exec` when mise is on `PATH`, the bare command otherwise, which is what CI does), so
 `bun run …` gets the pinned toolchain from any shell; a bare `cargo …` in a shell that has not
 activated mise for this directory does not, so run it as `mise exec -- cargo …`. The integration
-suites boot their own ephemeral Postgres and need PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
-(`/usr/lib/postgresql/18/bin` on Debian and Ubuntu).
+suites boot ephemeral PostgreSQL 19 clusters. The server binaries are in
+`/usr/lib/postgresql/19/bin` on Debian and Ubuntu.
 
 The scripts are check-default: a bare verb never changes a file.
 
 ```bash
 bun run validate                           # the pre-commit gate: format + typecheck + lint + test
-bun run validate:full                      # explicit full validation and CI: validate + test:integration
+bun run validate:full                      # explicit pre-release gate shared with CI
 
 bun run format                             # check: bun fmt, then cargo fmt --check (rustfmt.toml: 120 cols, Max heuristics)
 bun run format:write                       # apply both
@@ -82,8 +82,19 @@ bun run loop [N]                           # fuzz until failure; replay with SEE
 **Commit checks and CI run automatically.** `bun install` points git at `.githooks/` (the
 `prepare` script): the pre-commit hook runs `bun run validate`, and CI
 (`.github/workflows/validate.yml`) runs the full validation scripts split across its jobs. There
-is no local pre-push hook. Run `bun run validate:full` explicitly when full local verification is
-needed, with PostgreSQL 18's server binaries on `PATH` as described above.
+is no local pre-push hook. Run `bun run validate:full` on Linux amd64 with Podman, `taskset`
+and PostgreSQL 19 installed. The full check uses a frozen dependency install.
+
+- `validate:rust` runs format, engine Rust tests, the locked release build and Rust tests of the log server, and lint.
+- `validate:harness` runs typecheck, TypeScript unit tests and the complete PG19 engine suite at host concurrency. It also runs `validate:lifecycle`, a focused check on at most four CPUs.
+- `validate:protocol` runs the five log-server configurations against the release binary. Pass a configuration name such as `wal-small-chunk` to reproduce one failure.
+- `test:images` exercises both release images against Emergent’s pinned CloudNativePG image, with durable storage across restart. CI publishes the same tested image IDs.
+
+The membership circuit’s default spill directory can outlive a process after a crash.
+Reclaim it only after acquiring its ownership lock. A PID can refer to different live
+engines sharing a temporary filesystem across namespaces. Explicit membership paths
+remain operator-managed. Transaction and pending spill directories have their own
+per-engine deployment requirements.
 
 **vitest does not typecheck** — it runs through esbuild, which strips types without reading them.
 `bun run typecheck` is the gate (one root `tsconfig.json` over every TS package + the test files; CI
@@ -93,6 +104,10 @@ runs it right after install, before the suites).
 list of files that need neither the engine, a log server nor a Postgres server; its setup, `vitest.unit-setup.ts`, only builds the log server, which
 `packages/ds-rust/src/binary.test.ts` resolves but never starts. `integration` is every other file,
 so a new test file lands there unless it is added to the list.
+
+Give each integration file its own PostgreSQL cluster. Logical slot creation waits for older
+transactions across databases. A test that deliberately leaves a transaction open must not
+block engine startup in another file.
 
 **The harness runs the log server built here.** `vitest.global-setup.ts`, the `integration`
 project's setup, builds the engine and the log server once before the workers start, and
@@ -108,7 +123,7 @@ report exactly which ran and why the rest could not) before closing the task.**
 
 ```bash
 bun run validate                           # format, typecheck (vitest cannot see type errors), lint, both crates' Rust tests, TS unit tests
-bun run validate:full                      # validate + the engine conformance harness + the protocol suite
+bun run validate:full                      # release-profile tests, engine harness, protocol matrix and image qualification
 ```
 
 The `integration` project includes `packages/conformance` — the engine-vs-oracle harness — and

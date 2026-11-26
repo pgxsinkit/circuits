@@ -16,7 +16,8 @@ import { buildEngine, spawnRawEngine, type RawEngine } from "./harness.js";
 
 function adminUrl(): string {
   const url = process.env.CIRCUITS_TEST_PG_URL;
-  if (!url) throw new Error("CIRCUITS_TEST_PG_URL not set (integration globalSetup must boot Postgres)");
+  if (!url)
+    throw new Error("CIRCUITS_TEST_PG_URL not set (vitest.integration-setup.ts should boot Postgres for this file)");
   return url;
 }
 

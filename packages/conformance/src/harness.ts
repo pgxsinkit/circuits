@@ -3,7 +3,7 @@
 // materialized by the streamdb client. The SAME Postgres answers `SELECT … WHERE pred` as the oracle.
 //
 // Topology:
-//   Vitest worker:  per-test Postgres database (in the shared ephemeral PG) + DurableStreamTestServer
+//   Vitest worker:  per-test Postgres database (in the file's isolated PG cluster) + DurableStreamTestServer
 //                   + tRPC API + streamdb client + pg-backed oracle
 //   child process:  circuits-engine (Rust) in Postgres mode (ingestor + query-back backfill)
 
@@ -22,6 +22,12 @@ import pgpkg from "pg";
 import { compareShapeSets, type CompareResult } from "./compare.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function redactCredentials(text: string): string {
+  return text
+    .replace(/\b((?:postgres(?:ql)?|https?):\/\/)[^/\s@]+@/gi, "$1<REDACTED>@")
+    .replace(/\bpassword=(?:'[^']*'|[^\s&]+)/gi, "password=<REDACTED>");
+}
 
 function repoRoot(): string {
   let d = dirname(fileURLToPath(import.meta.url));
@@ -92,14 +98,23 @@ export function spawnRawEngine(env: Record<string, string>): RawEngine {
     exited = { code, signal: sig };
   });
 
+  const failure = (message: string): Error => {
+    const binding = stdoutBuf.match(/ENGINE_BINDING (\S+)/)?.[1] ?? "unbound";
+    return new Error(
+      redactCredentials(
+        `${message}; child pid=${proc.pid ?? "unknown"}, bound URL=${binding}\nEngine stderr tail:\n${stderrBuf.slice(-8192)}`,
+      ),
+    );
+  };
+
   const waitFor = (marker: string, timeoutMs: number) =>
     new Promise<string>((resolve, reject) => {
       const deadline = Date.now() + timeoutMs;
       const poll = () => {
         const m = stdoutBuf.match(new RegExp(`${marker} (\\S+)`));
         if (m) return resolve(m[1]!);
-        if (exited) return reject(new Error(`engine exited (code ${exited.code}) before printing ${marker}`));
-        if (Date.now() > deadline) return reject(new Error(`engine did not print ${marker} within ${timeoutMs}ms`));
+        if (exited) return reject(failure(`engine exited (code ${exited.code}) before printing ${marker}`));
+        if (Date.now() > deadline) return reject(failure(`engine did not print ${marker} within ${timeoutMs}ms`));
         setTimeout(poll, 25);
       };
       poll();
@@ -147,11 +162,40 @@ async function spawnEngine(
     ...(fault ? { CIRCUITS_FAULT: fault } : {}),
     ...(extraEnv ?? {}),
   });
-  const url = await raw.waitForListening(20000).catch((e: Error) => {
+  const url = await raw.waitForListening(20000).catch(async (error: Error) => {
+    const diagnostics = await postgresBootDiagnostics(pgUrl);
     raw.proc.kill("SIGKILL"); // don't leak the child if it never reports listening
-    throw e;
+    throw new Error(`${error.message}\n${diagnostics}`, { cause: error });
   });
   return { url, proc: raw.proc, stderr: raw.stderr, raw };
+}
+
+async function postgresBootDiagnostics(pgUrl: string): Promise<string> {
+  const client = new pgpkg.Client({
+    connectionString: pgUrl,
+    connectionTimeoutMillis: 1000,
+    query_timeout: 1000,
+    statement_timeout: 1000,
+  });
+  try {
+    await client.connect();
+    const result = await client.query(`
+      SELECT pid, datname, state, wait_event_type, wait_event,
+             backend_xid::text, pg_blocking_pids(pid) AS blocking_pids,
+             query ILIKE '%pg_create_logical_replication_slot%' AS creating_slot
+        FROM pg_stat_activity
+       WHERE pid <> pg_backend_pid() AND (backend_xid IS NOT NULL OR wait_event_type = 'Lock')
+       ORDER BY xact_start NULLS LAST
+       LIMIT 12
+    `);
+    return `PostgreSQL boot diagnostics (transaction holders and lock waiters): ${JSON.stringify(result.rows)}`;
+  } catch (error) {
+    return redactCredentials(
+      `PostgreSQL boot diagnostics unavailable: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    await client.end().catch(() => {});
+  }
 }
 
 export interface Harness {
@@ -222,7 +266,8 @@ export interface BootOptions {
 
 function adminUrl(): string {
   const url = process.env.CIRCUITS_TEST_PG_URL;
-  if (!url) throw new Error("CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)");
+  if (!url)
+    throw new Error("CIRCUITS_TEST_PG_URL not set (vitest.integration-setup.ts should boot Postgres for this file)");
   return url;
 }
 
@@ -235,8 +280,8 @@ function uniqueDbName(): string {
 export async function bootHarness(schema: Schema, opts: BootOptions = {}): Promise<Harness> {
   buildEngine();
 
-  // 1. Create a dedicated database in the shared ephemeral Postgres (per-test isolation; slots are
-  //    per-database). Create the tables (with REPLICA IDENTITY FULL) before the engine starts so its
+  // 1. Create a dedicated database in the file's ephemeral Postgres cluster (per-test isolation).
+  //    Create the tables (with REPLICA IDENTITY FULL) before the engine starts so its
   //    startup introspection + slot creation see them.
   const admin = new pgpkg.Client({ connectionString: adminUrl() });
   await admin.connect();

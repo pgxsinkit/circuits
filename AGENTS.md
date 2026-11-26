@@ -64,7 +64,7 @@ Scripts are check-default; only `format:write` and `lint:fix` mutate files.
 
 ```bash
 bun run validate                         # pre-commit: format + typecheck + lint + unit tests
-bun run validate:full                    # validate + engine harness + protocol integration suite
+bun run validate:full                    # shared CI lanes, five release storage configurations and candidate-image test
 bun run format                           # Bun format check + cargo fmt --check
 bun run format:write                     # apply both formatters
 bun run lint                             # type-aware oxlint + clippy -D warnings for both crates
@@ -81,8 +81,8 @@ could not. Every log-server change needs both integration suites: protocol confo
 cannot establish engine compatibility. Typechecking is mandatory; Vitest strips types without
 checking them.
 
-Integration boots ephemeral Postgres and requires PostgreSQL 18's `initdb` and `pg_ctl` on `PATH`
-(`/usr/lib/postgresql/18/bin` on Debian/Ubuntu). The always-on circuit is exercised on every run;
+Integration boots ephemeral PostgreSQL 19 (`/usr/lib/postgresql/19/bin` on Debian/Ubuntu).
+Full qualification also requires Linux amd64, `taskset` and Podman. The always-on circuit is exercised on every run;
 `CIRCUITS_DBSP_INDEXES`/`_COUNTS` select serving tiers, not whether the circuit exists.
 
 `vitest.config.ts` assigns every file to `unit` (explicit allowlist) or `integration` (everything
@@ -92,7 +92,7 @@ binary, never an unrelated binary on `PATH`. `DS_RUST_BIN` is an explicit overri
 `DS_MEMORY=1` removes durability on Linux; macOS falls back to WAL.
 
 `bun install` installs `.githooks/` via `prepare`; pre-commit runs `validate`. There is **no local
-pre-push hook**. CI's `.github/workflows/validate.yml` runs full validation across its jobs.
+pre-push hook**. CI runs the shared validation lanes and tests the candidate image IDs before publishing them.
 Focused test/build commands and retention-test knobs are in
 [the engineering reference](docs/engineering-invariants.md#build--test).
 

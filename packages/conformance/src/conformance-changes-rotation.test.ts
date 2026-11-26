@@ -274,7 +274,7 @@ describe("conformance: the change log rotates into segments and old segments are
     await waitFor(async () => (await shapeState(a.shapeId)).status === 404, "the pinning shape to be evicted");
     await waitFor(async () => (await segmentStatus(pinned!)) === 404, "the unpinned segment to be deleted");
     // Eviction is terminal, so its stream went with it — an extended-API client recreates.
-    expect((await fetch(a.streamUrl)).status).toBe(404);
+    await waitFor(async () => (await fetch(a.streamUrl)).status === 404, "the evicted shape stream to be deleted");
   }, 90000);
 
   // The disk bound must hold for an engine nobody has ever created a shape on: the ingestor is

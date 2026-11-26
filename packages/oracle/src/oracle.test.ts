@@ -4,11 +4,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { createPgOracle, createPgTables, type Oracle } from "./index.js";
 
-// The oracle is a real Postgres, so its tests need one: the cluster the integration project's global
-// setup boots. Each suite gets a database of its own and drops it afterwards.
+// The oracle is a real Postgres, so its tests use the integration setup's per-file cluster.
+// Each suite gets a database of its own and drops it afterwards.
 function adminUrl(): string {
   const url = process.env.CIRCUITS_TEST_PG_URL;
-  if (!url) throw new Error("CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)");
+  if (!url)
+    throw new Error("CIRCUITS_TEST_PG_URL not set (vitest.integration-setup.ts should boot Postgres for this file)");
   return url;
 }
 

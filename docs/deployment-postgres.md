@@ -15,7 +15,7 @@ is no separate write API and no in-memory table copy to keep in sync — Postgre
 
 ## What you need
 
-- **Postgres 10+** with logical decoding (the built-in `pgoutput` plugin — no extensions to
+- **PostgreSQL 19** with logical decoding (the built-in `pgoutput` plugin — no extensions to
   install). Managed Postgres works if it allows `wal_level = logical` and a logical replication slot
   (RDS, Cloud SQL, Supabase, Neon, etc. all do).
 - **A durable-streams server** (the transport/persistence layer). Set its base URL in

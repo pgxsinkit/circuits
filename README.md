@@ -68,22 +68,24 @@ with one value: a version (`1.2.3`), or a commit (`sha-0123abc`). Building them 
 ## Working on it
 
 The toolchain is pinned: Rust by `rust-toolchain.toml`, bun and node by `mise.toml`. The
-integration suites boot their own ephemeral Postgres, so they need PostgreSQL 18's `initdb` and
-`pg_ctl` on `PATH` (on Debian and Ubuntu they are in `/usr/lib/postgresql/18/bin`).
+engine harness boots ephemeral PostgreSQL 19 clusters. Install its server binaries
+(`/usr/lib/postgresql/19/bin` on Debian and Ubuntu). Full qualification also uses Linux
+amd64, `taskset`, and Podman.
 
 ```bash
 mise install
 bun install                                # also installs the pre-commit hook
 
 bun run validate                           # before a commit (the pre-commit hook runs it): format, typecheck, lint, unit tests
-bun run validate:full                      # explicit full validation and CI: validate + the integration suites
+bun run validate:full                      # release-profile Rust tests, PG19 harness, five storage configurations, candidate images
 bun run test                               # the unit tests: both crates' Rust tests and the TypeScript tests that boot nothing
 bun run test:integration                   # the engine conformance harness and the Durable Streams protocol suite
 bun run test:fuzz                          # random predicates against the oracle
 ```
 
 There is no local pre-push hook. CI runs full validation for pull requests, pushes to `develop`,
-and release tags, and image publication requires validation to pass.
+and release tags. Before publication, the two candidate images must replicate a change, restart
+with their data intact and complete a purge against the CloudNativePG image pinned by Emergent.
 
 The conformance invariant, asserted through the real stack: for any shape and any stream of
 operations, the set a client materialises equals what `SELECT … WHERE <predicate>` returns from a

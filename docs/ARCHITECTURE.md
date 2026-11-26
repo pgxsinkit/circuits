@@ -713,7 +713,11 @@ bullet). Neither circuit checkpoints: both reseed on boot.
   Postgres like any backfill. The contributor relation **spills to disk by default** (dbsp's
   storage backend: spine batches page to layer files under a per-boot temp dir with a bounded
   buffer cache; without checkpointing the files are a disposable cache, auto-removed at
-  shutdown). `CIRCUITS_SUBQ_STORAGE=0` keeps it fully in-memory;
+  shutdown). Each engine-owned circuit directory holds an exclusive filesystem lock for its
+  lifetime. Engines sharing temporary storage can reclaim a crashed circuit’s directory
+  even when their PID namespaces overlap. The old `circuits-subq/<pid>-<seq>` format has
+  no ownership lock. Operators can remove old caches once all engines using that format
+  have stopped. `CIRCUITS_SUBQ_STORAGE=0` keeps it fully in-memory;
   `CIRCUITS_SUBQ_STORAGE_DIR` pins an explicit location.
 
 - **Counts pipelines** — `CIRCUITS_DBSP_COUNTS=table:col+col,…` compiles, per table (at

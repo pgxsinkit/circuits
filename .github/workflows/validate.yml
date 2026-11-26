@@ -1,10 +1,9 @@
 # Everything that has to pass before a change is accepted or an image is published. Called by
 # ci.yml (pull requests) and by images.yml (pushes to develop, and release tags).
 #
-# The jobs run the package scripts, so CI and a local `bun run validate:full` are the same commands,
-# split across three jobs: `rust` is `format`, `lint` and the Rust half of `test`; `harness` is
-# `typecheck`, the TypeScript half of `test` and the engine conformance harness; the matrix is the
-# Durable Streams protocol suite, once per run configuration. CI has no mise, so
+# The jobs call the same lane scripts as a local `bun run validate:full`. scripts/validate.ts owns
+# the commands, release profile and protocol configuration matrix. The image workflow subsequently
+# qualifies the candidate image pair before publishing it. CI has no mise, so
 # scripts/with-toolchain.sh runs cargo as it is and rustup takes the version from rust-toolchain.toml.
 #
 # The engine and the log server are tested from the one workspace at the one commit, so the engine's
@@ -22,6 +21,8 @@ jobs:
     name: format + lint + Rust tests
     runs-on: ubuntu-26.04
     timeout-minutes: 60
+    outputs:
+      protocol-matrix: ${{ steps.protocol-matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
 
@@ -44,24 +45,12 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      # bun fmt over everything it formats, then `cargo fmt --check` (rustfmt.toml at the root).
-      - name: Formatting
-        run: bun run format
+      - name: Protocol configurations
+        id: protocol-matrix
+        run: bun run validate:protocol:matrix
 
-      - name: Engine tests
-        run: bun run engine:test --locked
-
-      # The log server is tested as it ships: its release profile, link-time optimisation included.
-      - name: Log server build
-        run: bun run durable-streams:build --profile release-durable-streams --locked
-
-      - name: Log server tests
-        run: bun run test:durable-streams --profile release-durable-streams --locked
-
-      # oxlint over the TypeScript, then clippy with warnings denied: the log server in its release
-      # profile, then the engine in its dev profile.
-      - name: Lint
-        run: bun run lint
+      - name: Format, lint and Rust tests
+        run: bun run validate:rust
 
       - name: Upload the log server binary
         uses: actions/upload-artifact@v7
@@ -89,41 +78,32 @@ jobs:
         with:
           node-version: 26
 
-      # The runner image ships PostgreSQL 18 but does not put its server binaries on PATH. The
-      # harness boots its own ephemeral server with initdb and pg_ctl.
-      - name: Put the PostgreSQL 18 server binaries on PATH
+      # Install the supported server major from PostgreSQL's official Ubuntu repository.
+      # Disable automatic cluster creation; the harness owns its ephemeral cluster.
+      - name: Install PostgreSQL 19 server binaries
         run: |
-          echo /usr/lib/postgresql/18/bin >> "$GITHUB_PATH"
-          /usr/lib/postgresql/18/bin/initdb --version
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-common
+          echo 'create_main_cluster = false' | sudo tee -a /etc/postgresql-common/createcluster.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get update
+          sudo apt-get install --yes postgresql-19
+          echo /usr/lib/postgresql/19/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/19/bin/initdb --version
 
       - run: bun install --frozen-lockfile
 
-      - name: Typecheck
-        run: bun run typecheck
-
-      # The TypeScript half of `bun run test`: no Postgres, no engine, no log server running.
-      - name: TypeScript unit tests
-        run: bun run test:unit:ts
-
-      # Builds the engine and the log server once, then runs every suite that boots the stack.
-      - name: Engine conformance
-        run: bun run test:integration:harness
+      - name: Typecheck, TypeScript tests and engine conformance
+        run: bun run validate:harness
 
   durable-streams-conformance:
-    name: log server conformance (${{ matrix.config.name }})
+    name: log server conformance (${{ matrix.config }})
     needs: rust
     runs-on: ubuntu-26.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix:
-        # Keep in sync with the run-configuration matrix in apps/durable-streams/README.md.
-        config:
-          - { name: wal-default, args: "" }
-          - { name: wal-resident-cache, args: "--tail-cache-bytes 65536" }
-          - { name: wal-read-offload-always, args: "--read-offload always" }
-          - { name: memory, args: "--durability memory" }
-          - { name: wal-small-chunk, args: "--max-chunk-bytes 4096" }
+      matrix: ${{ fromJSON(needs.rust.outputs.protocol-matrix) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -144,10 +124,6 @@ jobs:
       - name: Make the binary executable
         run: chmod +x "$RUNNER_TEMP/durable-streams/durable-streams-server"
 
-      # The suite half of `bun run test:durable-streams:conformance`: the build half is the `rust`
-      # job's, whose binary RUST_SERVER_BIN names.
-      - name: Run conformance (${{ matrix.config.name }})
-        env:
-          RUST_SERVER_BIN: ${{ runner.temp }}/durable-streams/durable-streams-server
-          RUST_SERVER_ARGS: ${{ matrix.config.args }}
-        run: bun run --cwd apps/durable-streams test:conformance
+      # Reuse the release binary built and tested by the Rust lane.
+      - name: Run conformance (${{ matrix.config }})
+        run: bun run validate:protocol ${{ matrix.config }} "$RUNNER_TEMP/durable-streams/durable-streams-server"

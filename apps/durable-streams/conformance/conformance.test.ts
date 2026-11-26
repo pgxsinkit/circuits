@@ -25,11 +25,13 @@ import { afterAll, beforeAll, describe } from "vitest";
 
 // Manual mode: run against an externally-started server. Otherwise spawn our own.
 const externalUrl = process.env.RUST_SERVER_URL;
-const port = Number(process.env.RUST_SERVER_PORT ?? 4562);
+const port = Number(process.env.RUST_SERVER_PORT ?? 0);
 const longPollTimeoutMs = 500;
+// The binary drains live HTTP requests for up to 25s before joining WAL committers.
+const shutdownTimeoutMs = 35_000;
 
 const config = {
-  baseUrl: externalUrl ?? `http://localhost:${port}`,
+  baseUrl: externalUrl ?? "",
   longPollTimeoutMs,
   // This server implements the core protocol only; the subscription/control-plane
   // suite is out of scope, so skip it rather than report it as failing.
@@ -37,6 +39,8 @@ const config = {
 };
 
 let server: ChildProcess | null = null;
+let listening = false;
+let startupError: Error | undefined;
 // Hoisted so afterAll can remove it: a full suite run leaves up to ~1 GB of
 // stream data under this directory, and nothing else ever collects it.
 let dataDir: string | null = null;
@@ -54,6 +58,8 @@ beforeAll(async () => {
     server = spawn(
       binary,
       [
+        `--host`,
+        `127.0.0.1`,
         `--port`,
         String(port),
         `--data-dir`,
@@ -65,33 +71,61 @@ beforeAll(async () => {
       ],
       { stdio: [`ignore`, `pipe`, `pipe`] },
     );
+    let output = "";
+    server.stdout?.on(`data`, (data: Buffer) => {
+      if (listening) return;
+      output = (output + data.toString()).slice(-4096);
+      const address = output.match(/durable-streams-server listening on (http:\/\/127\.0\.0\.1:\d+) /)?.[1];
+      if (address) {
+        config.baseUrl = address;
+        listening = true;
+      }
+    });
+    server.on(`error`, (error) => {
+      startupError = error;
+    });
     server.stderr?.on(`data`, (d: Buffer) => process.stderr.write(`[rust] ${d.toString()}`));
     server.on(`exit`, (code) => {
       if (code) process.stderr.write(`[rust] server exited with code ${code}\n`);
     });
   }
-  await waitForServer(config.baseUrl, 15000);
+  await waitForServer(15000);
 }, 20000);
 
 afterAll(async () => {
-  if (server) {
-    server.kill(`SIGTERM`);
-    await new Promise((resolve) => setTimeout(resolve, 300));
+  let shutdownTimedOut = false;
+  try {
+    if (server?.pid && server.exitCode === null && server.signalCode === null) {
+      const child = server;
+      await new Promise<void>((resolve) => {
+        const timeout = setTimeout(() => {
+          shutdownTimedOut = true;
+          child.kill("SIGKILL");
+        }, shutdownTimeoutMs);
+        child.once("exit", () => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        child.kill(`SIGTERM`);
+      });
+    }
+  } finally {
+    // Only remove storage this fixture owns, after the child exits even if SIGKILL was necessary.
+    if (dataDir) {
+      rmSync(dataDir, { recursive: true, force: true });
+      dataDir = null;
+    }
   }
-  // Only the directory this harness created: in manual mode the data dir
-  // belongs to the server the operator started, and is not ours to delete.
-  // Removal waits until after the grace period above, so the server has
-  // released the data-dir lock and finished its last writes.
-  if (dataDir) {
-    rmSync(dataDir, { recursive: true, force: true });
-    dataDir = null;
+  if (shutdownTimedOut) throw new Error(`Conformance server did not shut down within ${shutdownTimeoutMs}ms`);
+  if (server?.pid && server.exitCode !== 0) {
+    throw new Error(`Conformance server exited with ${server.signalCode ?? server.exitCode}`);
   }
-});
+}, shutdownTimeoutMs + 10_000);
 
 function resolveServerBinary(): string {
   if (process.env.RUST_SERVER_BIN) return process.env.RUST_SERVER_BIN;
   const metadata = JSON.parse(
-    execFileSync(`cargo`, [`metadata`, `--format-version=1`, `--no-deps`], {
+    execFileSync(`cargo`, [`metadata`, `--locked`, `--format-version=1`, `--no-deps`], {
       cwd: path.join(__dirname, `..`),
       encoding: `utf8`,
     }),
@@ -103,16 +137,23 @@ describe(`Rust Server Implementation`, () => {
   runConformanceTests(config);
 });
 
-async function waitForServer(baseUrl: string, timeoutMs: number): Promise<void> {
+async function waitForServer(timeoutMs: number): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    try {
-      // Any HTTP response (a 404 on `/` included) means the listener is up.
-      await fetch(baseUrl);
-      return;
-    } catch {
-      await new Promise((resolve) => setTimeout(resolve, 100));
+    if (startupError) throw startupError;
+    if (server && (server.exitCode !== null || server.signalCode !== null)) {
+      throw new Error(`Owned conformance server exited before readiness (${server.exitCode ?? server.signalCode})`);
     }
+    try {
+      // A child-owned bind must precede the probe, so an unrelated listener cannot pass readiness.
+      if (externalUrl || listening) {
+        await fetch(config.baseUrl);
+        return;
+      }
+    } catch {
+      // The process has bound but may still be entering its serving loop.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Rust server did not become ready within ${timeoutMs}ms`);
 }

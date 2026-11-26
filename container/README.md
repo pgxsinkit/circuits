@@ -30,6 +30,12 @@ engine with cargo's default release profile.
 
 Pin the pair with one value, for example `sha-0123abc` for both.
 
+`bun run test:images` builds both candidates and tests their image IDs against the public
+CloudNativePG PostgreSQL 19 image used by Emergent. The smoke test reads the initial shape,
+observes a committed update, restarts the services with persistent data, verifies the same
+stream and offset, replicates another update, then purges the shape and waits for deletion.
+CI pushes both tested IDs after this check passes.
+
 ## Configuration
 
 The engine is configured through `CIRCUITS_*` environment variables; the full list is in

@@ -35,7 +35,8 @@ const BLACKHOLE_PG = "postgres://u:p@10.255.255.1:5432/db";
 
 function adminUrl(): string {
   const url = process.env.CIRCUITS_TEST_PG_URL;
-  if (!url) throw new Error("CIRCUITS_TEST_PG_URL not set (vitest globalSetup should boot Postgres)");
+  if (!url)
+    throw new Error("CIRCUITS_TEST_PG_URL not set (vitest.integration-setup.ts should boot Postgres for this file)");
   return url;
 }
 

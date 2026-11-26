@@ -15,8 +15,9 @@
 import type { Row, Schema, StreamEnvelope } from "@circuits/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { createShape, foldStream, pgQuery, sleep, waitFor } from "./engine-native.js";
+import { createShape, foldStream, pgQuery, waitFor } from "./engine-native.js";
 import { bootHarness, drainEngine, type Harness } from "./harness.js";
+import { holdStreamDeletion } from "./retirement-proxy.js";
 
 const schema: Schema = {
   tables: {
@@ -32,15 +33,17 @@ const schema: Schema = {
 const matchAll = { col: "n", op: "gte", value: 0 };
 
 let h: Harness | undefined;
+let retirement: Awaited<ReturnType<typeof holdStreamDeletion>>;
 afterEach(async () => {
   await h?.shutdown();
   h = undefined;
 });
 
 /** Boot with the reconciler parked at an hour unless the test is the one testing it. */
-async function boot(engineEnv: Record<string, string> = {}): Promise<Harness> {
+async function boot(engineEnv: Record<string, string> = {}, withDeletionGate = false): Promise<Harness> {
   h = await bootHarness(schema, {
     engineEnv: { CIRCUITS_SCHEMA_RECONCILE_SECS: "3600", ...engineEnv },
+    wrapEngineDs: withDeletionGate ? async (url) => (retirement = await holdStreamDeletion(url)) : undefined,
   });
   return h;
 }
@@ -111,7 +114,7 @@ async function expectOtherStillLive(streamUrl: string, id: number): Promise<void
 
 describe("schema drift retires every dependent of the affected table (ADR-0005)", () => {
   it("ADD COLUMN + a write retires the table's shapes; a new shape carries the new column", async () => {
-    await boot();
+    await boot({}, true);
     await pg("INSERT INTO items (id, n, label) VALUES (1, 10, $1)", ["a"]);
     await pg("INSERT INTO other (id, n) VALUES (1, 1)");
     await drainEngine(h!);
@@ -120,22 +123,22 @@ describe("schema drift retires every dependent of the affected table (ADR-0005)"
     const other = await createShape(h!, { table: "other", where: matchAll });
     expect(await foldStream(items.streamUrl)).toHaveProperty("size", 1);
 
-    // ADR-0007: park a live read at the tail — the retirement must release it with `stream-closed`
-    // rather than leave it blocked until the 30 s long-poll timeout.
+    // Keep the retired stream until this direct HTTP reader has observed the durable close.
+    retirement.hold(items.streamPath);
     const tail = await tailOffset(items.streamUrl);
     const started = Date.now();
     const parked = fetch(`${items.streamUrl}?offset=${encodeURIComponent(tail)}&live=long-poll`);
-    await sleep(250);
 
     await pg("ALTER TABLE items ADD COLUMN extra text");
     await pg("INSERT INTO items (id, n, label, extra) VALUES (2, 20, $1, $2)", ["b", "x"]);
-    await drainEngine(h!);
 
     const released = await parked;
     await released.text();
     expect(Date.now() - started).toBeLessThan(15000);
     expect(released.headers.get("stream-closed")).toBe("true");
 
+    retirement.release();
+    await drainEngine(h!);
     await waitRetired(items.shapeId, items.streamUrl);
     await expectOtherStillLive(other.streamUrl, 2);
 

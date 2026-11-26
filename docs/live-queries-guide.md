@@ -48,7 +48,7 @@ via snapshot reads. (The engine can also run without Postgres — writes go thro
 
 ### Postgres prerequisites
 
-- **PostgreSQL 16** with `wal_level = logical`.
+- **PostgreSQL 19** with `wal_level = logical`.
 - Each replicated table needs `REPLICA IDENTITY FULL` so updates/deletes carry the **old** row
   (the engine sets this during setup; see `docs/deployment-postgres.md`).
 - Each replicated table needs a **primary key** (single or composite).

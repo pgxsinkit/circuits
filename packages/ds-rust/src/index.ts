@@ -16,8 +16,7 @@
 //   - `dataDir` omitted (the Node "in-memory" mode) → a fresh temp dir, deleted on stop().
 //     On Linux we additionally pass `--durability memory` (no WAL/fsync — matches the Node
 //     server's non-durable semantics); the flag is Linux-only, so macOS runs `wal`.
-//   - `port: 0` → the wrapper picks a free port itself (the binary logs the *requested*
-//     address, so OS-assigned ports would be unreadable); bind races are retried.
+//   - `port: 0` → the wrapper picks and retains a port for crash/restart; bind races are retried.
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";

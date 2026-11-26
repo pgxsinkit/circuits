@@ -2750,6 +2750,56 @@ mod memory_mode_tests {
     }
 
     #[tokio::test]
+    async fn close_wakes_registered_long_poll_before_stream_deletion() {
+        let _guard = test_support::DurabilityGuard::memory();
+        let dir = test_support::temp_dir("close-long-poll-before-delete");
+        let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+        assert_eq!(handle(store.clone(), put_req("s", "application/octet-stream")).await.status, 201);
+        let st = store.get("s").unwrap();
+        let mut read = tokio::spawn(handle(
+            store.clone(),
+            Req {
+                method: Method::Get,
+                path: "s".into(),
+                query: Some("offset=now&live=long-poll".into()),
+                headers: vec![],
+                body: Bytes::new(),
+            },
+        ));
+        // A receiver proves the handler has reached the actual wait path. Sleeping before the
+        // close would allow a late request to read an already-closed stream and miss a wake bug.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while st.tail_tx.receiver_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut close = post_req("s", "application/octet-stream", b"");
+        close.headers.push((H_CLOSED.into(), "true".into()));
+        assert!((200..300).contains(&handle(store.clone(), close).await.status));
+        let woken = tokio::time::timeout(Duration::from_secs(2), &mut read).await;
+        if woken.is_err() {
+            read.abort();
+            let _ = read.await;
+        }
+        let response = woken.expect("closing must wake the registered reader before deletion").unwrap();
+        assert_eq!(response.status, 204);
+        assert!(response.headers.iter().any(|(name, value)| *name == H_CLOSED && value == "true"));
+        assert!(store.get("s").is_some(), "reader observes closure while the stream still exists");
+        assert_eq!(
+            handle(
+                store.clone(),
+                Req { method: Method::Delete, path: "s".into(), query: None, headers: vec![], body: Bytes::new() }
+            )
+            .await
+            .status,
+            204
+        );
+        assert!(store.get("s").is_none(), "DELETE completes storage cleanup");
+    }
+
+    #[tokio::test]
     async fn direct_delete_wakes_caught_up_long_poll_as_gone() {
         let _guard = test_support::DurabilityGuard::memory();
         let dir = test_support::temp_dir("delete-long-poll-wake");

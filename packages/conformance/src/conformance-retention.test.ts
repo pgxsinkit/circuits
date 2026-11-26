@@ -9,9 +9,10 @@
 
 import type { Row, Schema, StreamEnvelope } from "@circuits/protocol";
 import pgpkg from "pg";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { bootHarness, drainEngine, type Harness } from "./harness.js";
+import { holdStreamDeletion } from "./retirement-proxy.js";
 
 const schema: Schema = {
   tables: { items: { columns: { id: { type: "int" }, n: { type: "int" } }, primaryKey: "id" } },
@@ -20,17 +21,19 @@ const schema: Schema = {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let h: Harness;
-beforeEach(async () => {
+let retirement: Awaited<ReturnType<typeof holdStreamDeletion>>;
+async function boot(withDeletionGate = false) {
   h = await bootHarness(schema, {
+    wrapEngineDs: withDeletionGate ? async (url) => (retirement = await holdStreamDeletion(url)) : undefined,
     engineEnv: {
       CIRCUITS_SHAPE_IDLE_SECS: "1",
       CIRCUITS_SHAPE_DORMANT_TTL_SECS: "4",
       CIRCUITS_RETENTION_SWEEP_SECS: "1",
     },
   });
-});
+}
 afterEach(async () => {
-  await h.shutdown();
+  await h?.shutdown();
 });
 
 async function pg(sql: string, params: unknown[] = []): Promise<Row[]> {
@@ -120,6 +123,7 @@ async function tailOffset(streamUrl: string): Promise<string> {
 
 describe("shape retention lifecycle (active / dormant / evicted)", () => {
   it("idle unsubscribed shape goes dormant; rejoin reactivates with the changes missed while dormant", async () => {
+    await boot();
     await pg("INSERT INTO items (id, n) VALUES (1, 10), (2, 20), (3, 5)");
     await drainEngine(h);
 
@@ -160,6 +164,7 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
   });
 
   it("a data read (rows fold) reactivates a dormant shape", async () => {
+    await boot();
     await pg("INSERT INTO items (id, n) VALUES (1, 10)");
     await drainEngine(h);
 
@@ -179,6 +184,7 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
   });
 
   it("DELETE ?purge=true immediately removes the native shape and eventually retires its stream", async () => {
+    await boot();
     await pg("INSERT INTO items (id, n) VALUES (1, 10)");
     await drainEngine(h);
 
@@ -192,10 +198,7 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
     const purged = await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: "DELETE" });
     expect(purged.ok).toBe(true);
     expect((await shapeInfo(a.shapeId)).status).toBe(404);
-    await waitFor(async () => {
-      const stream = await fetch(a.streamUrl);
-      return stream.status === 404 || stream.status === 410;
-    }, "purged stream to reach a terminal state");
+    await waitFor(async () => (await fetch(a.streamUrl)).status === 404, "purged stream deletion");
 
     // Recreation works (fresh shape, fresh stream, fresh backfill).
     const b = await createShape(where);
@@ -203,22 +206,26 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
     expect((await foldStream(b.streamUrl)).has("1")).toBe(true);
   });
 
-  // Engine-initiated retirement CLOSES the shape stream before deleting it (ADR 0007): a client
-  // parked on a long-poll is released immediately with `stream-closed` instead of blocking until the
-  // durable-streams long-poll timeout (30 s) and then finding a deleted stream.
-  it("purge closes the stream before deleting it: a waiting long-poll is released with stream-closed", async () => {
+  // Engine-initiated retirement CLOSES the shape stream before deleting it (ADR 0007). The handler
+  // unit test close_wakes_registered_long_poll_before_stream_deletion proves a registered waiter
+  // wakes. Here the real HTTP path proves the notification survives the asynchronous purge/delete gap.
+  it("purge closes the stream before deleting it: a pending tail read observes stream-closed", async () => {
+    await boot(true);
     await pg("INSERT INTO items (id, n) VALUES (1, 10)");
     await drainEngine(h);
 
     const a = await createShape({ col: "n", op: "gte", value: 10 });
 
-    // Park a live read at the tail, the position a subscribed client tails from.
+    // Prevent deletion until the reader sees the close. The close remains visible if the HTTP
+    // request reaches storage after purge, so scheduling cannot turn this into a missing-stream read.
+    retirement.hold(a.streamPath);
     const tail = await tailOffset(a.streamUrl);
     const started = Date.now();
     const pending = fetch(`${a.streamUrl}?offset=${encodeURIComponent(tail)}&live=long-poll`);
-    await sleep(250); // let the long-poll actually block on the server before retiring the stream
-
-    await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: "DELETE" });
+    const purged = await fetch(`${h.engineUrl}/shapes/${a.shapeId}?purge=true`, { method: "DELETE" });
+    expect(purged.ok).toBe(true);
+    expect((await shapeInfo(a.shapeId)).status).toBe(404);
+    await waitFor(async () => retirement.deletionStarted(), "retirement DELETE to reach storage proxy");
 
     const res = await pending;
     const elapsed = Date.now() - started;
@@ -230,15 +237,23 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
     // pending data returns 200 + the data, carrying the same header.
     expect([200, 204]).toContain(res.status);
 
-    // Retirement is close THEN delete: the stream is gone afterwards.
-    expect((await fetch(a.streamUrl)).status).toBe(404);
+    // Purge promises durable intent before storage cleanup. Prove that the close is observable
+    // while the actual DELETE is still held, then require completed cleanup once it is released.
+    const closed = await fetch(a.streamUrl);
+    expect(closed.status).toBe(200);
+    expect(closed.headers.get("stream-closed")).toBe("true");
+    await closed.text();
+    retirement.release();
+    await waitFor(async () => (await fetch(a.streamUrl)).status === 404, "purged stream deletion");
   });
 
   it("TTL eviction closes the stream before deleting it: a tailing long-poll is released with stream-closed", async () => {
+    await boot(true);
     await pg("INSERT INTO items (id, n) VALUES (1, 10)");
     await drainEngine(h);
 
     const a = await createShape({ col: "n", op: "gte", value: 10 });
+    retirement.hold(a.streamPath);
     await release(a.shapeId);
     await waitFor(async () => (await shapeInfo(a.shapeId)).state === "dormant", "shape to go dormant");
 
@@ -253,10 +268,12 @@ describe("shape retention lifecycle (active / dormant / evicted)", () => {
     expect(res.headers.get("stream-closed")).toBe("true");
     expect([200, 204]).toContain(res.status);
 
+    retirement.release();
     await waitFor(async () => (await fetch(a.streamUrl)).status === 404, "stream deletion");
   });
 
   it("the dormancy TTL evicts: record 404s, stream is deleted, rejoin creates a fresh shape", async () => {
+    await boot();
     await pg("INSERT INTO items (id, n) VALUES (1, 10)");
     await drainEngine(h);
 
