@@ -2540,7 +2540,7 @@ fn handle_head(store: Arc<Store>, path: String) -> Resp {
 // ---------- DELETE ----------
 
 async fn handle_delete(store: Arc<Store>, path: String) -> Resp {
-    let st = match store.get(&path) {
+    let st = match store.get_for_delete(&path) {
         Some(s) => s,
         None => return text_response(404, "stream not found"),
     };
@@ -2970,6 +2970,27 @@ mod memory_mode_tests {
         let resp = handle(store.clone(), req).await;
         assert_eq!(resp.status, 400, "unrepresentable deadline must reject input");
         assert!(!store.streams.contains_key("m/ttl-max"));
+    }
+
+    #[test]
+    fn ttl_put_recreates_expired_stream_with_one_blocking_worker() {
+        let runtime =
+            tokio::runtime::Builder::new_current_thread().enable_all().max_blocking_threads(1).build().unwrap();
+        runtime.block_on(async {
+            let dir = test_support::temp_dir("ttl-put-recreate");
+            let store = Arc::new(Store::new_with_tier(dir.path().to_path_buf(), TierConfig::default()).unwrap());
+            let path = "m/recreate";
+            let mut put = put_req(path, "application/octet-stream");
+            put.headers.push((H_TTL.into(), "60".into()));
+            assert_eq!(handle(store.clone(), put).await.status, 201);
+            let expired = store.get(path).unwrap();
+            expired.shared.write().unwrap().last_access = SystemTime::now() - Duration::from_secs(120);
+
+            assert_eq!(handle(store.clone(), put_req(path, "application/octet-stream")).await.status, 201);
+            let replacement = store.get(path).unwrap();
+            assert_ne!(replacement.id, expired.id);
+            assert!(!expired.file_path.exists(), "recreation follows physical cleanup");
+        });
     }
 
     #[tokio::test]

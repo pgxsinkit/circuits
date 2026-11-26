@@ -753,6 +753,12 @@ pub enum CreateResult {
     Conflict,
 }
 
+enum StreamLookup {
+    Observe,
+    Read,
+    Create,
+}
+
 /// Owned context for a retirement which outlives the requesting operation.
 /// It retains only the registry and tier-GC configuration, not the whole store.
 struct RetirementContext {
@@ -764,58 +770,67 @@ struct RetirementContext {
 }
 
 impl RetirementContext {
-    fn schedule_expiry(self: &Arc<Self>, st: Arc<StreamState>) {
+    fn schedule_expiry(self: &Arc<Self>, st: Arc<StreamState>, observed_at: SystemTime) {
         let context = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _retirement = st.retirement_lock.lock().unwrap();
-            let _metadata = st.meta_lock.lock().unwrap();
-            if !context.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), &st)) {
-                return;
-            }
-            let soft = {
-                let mut lifecycle = st.lifecycle.lock().unwrap();
-                let mut shared = st.shared.write().unwrap();
-                // Another retirement may have completed, or rolled back and
-                // admitted a renewal, before this owned worker took its locks.
-                if shared.soft_deleted || lifecycle.in_flight > 0 {
-                    return;
-                }
-                if !st.expired_at(shared.last_access, SystemTime::now()) {
-                    lifecycle.retiring = false;
-                    return;
-                }
-                lifecycle.retiring = true;
-                shared.soft_deleted = true;
-                shared.ref_count > 0
-            };
-            if soft {
-                #[cfg(test)]
-                let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
-                    Err(std::io::Error::other("injected expiry metadata failure"))
-                } else {
-                    write_meta_locked(&st, true)
-                };
-                #[cfg(not(test))]
-                let written = write_meta_locked(&st, true);
-                if let Err(error) = written {
-                    let mut lifecycle = st.lifecycle.lock().unwrap();
-                    st.shared.write().unwrap().soft_deleted = false;
-                    lifecycle.retiring = false;
-                    tracing::warn!(path = %st.path, error = %error, "expiry metadata failed; access may retry");
-                    return;
-                }
-                st.publish_deleted();
-            } else {
-                st.hard_delete.store(true, Ordering::Release);
-                st.publish_deleted();
-                match context.finish_hard(&st) {
-                    Ok(()) => context.release_parent(&st),
-                    Err(error) => {
-                        tracing::warn!(path = %st.path, error = %error, "expiry cleanup failed; DELETE may retry")
-                    }
-                }
-            }
+            context.expire(&st, Some(observed_at));
         });
+    }
+
+    /// Return false if the incarnation is still live. PUT can run this on its
+    /// own blocking worker, even when a lazy expiry task is still queued.
+    fn expire(self: &Arc<Self>, st: &Arc<StreamState>, clock: Option<SystemTime>) -> bool {
+        let _retirement = st.retirement_lock.lock().unwrap();
+        let _metadata = st.meta_lock.lock().unwrap();
+        if !self.streams.get(&st.path).is_some_and(|entry| Arc::ptr_eq(entry.value(), st)) {
+            return true;
+        }
+        let soft = {
+            let mut lifecycle = st.lifecycle.lock().unwrap();
+            let mut shared = st.shared.write().unwrap();
+            if shared.soft_deleted || st.hard_delete_pending() {
+                return true;
+            }
+            if !st.expired_at(shared.last_access, clock.unwrap_or_else(SystemTime::now)) {
+                return lifecycle.retiring;
+            }
+            if lifecycle.in_flight > 0 {
+                // An admitted append can still renew the stream. Leave the
+                // incarnation registered for a later access to check again.
+                return true;
+            }
+            lifecycle.retiring = true;
+            shared.soft_deleted = shared.ref_count > 0;
+            shared.soft_deleted
+        };
+        if soft {
+            #[cfg(test)]
+            let written = if st.delete_fault.load(Ordering::Relaxed) == 1 {
+                Err(std::io::Error::other("injected expiry metadata failure"))
+            } else {
+                write_meta_locked(st, true)
+            };
+            #[cfg(not(test))]
+            let written = write_meta_locked(st, true);
+            if let Err(error) = written {
+                let mut lifecycle = st.lifecycle.lock().unwrap();
+                st.shared.write().unwrap().soft_deleted = false;
+                lifecycle.retiring = false;
+                tracing::warn!(path = %st.path, error = %error, "expiry metadata failed; access may retry");
+            } else {
+                st.publish_deleted();
+            }
+        } else {
+            st.hard_delete.store(true, Ordering::Release);
+            st.publish_deleted();
+            match self.finish_hard(st) {
+                Ok(()) => self.release_parent(st),
+                Err(error) => {
+                    tracing::warn!(path = %st.path, error = %error, "expiry cleanup failed; DELETE may retry")
+                }
+            }
+        }
+        true
     }
 
     fn finish_hard(&self, st: &Arc<StreamState>) -> std::io::Result<()> {
@@ -1444,16 +1459,26 @@ impl Store {
     /// still reference them). Soft-deleted entries ARE returned — callers decide
     /// between 410 (direct ops) and 409 (PUT re-create / fork source).
     pub fn get(&self, path: &str) -> Option<Arc<StreamState>> {
-        self.get_impl(path, false, None)
+        self.get_impl(path, StreamLookup::Observe, None)
     }
 
     /// GET's expiry check and sliding-TTL renewal are one lifetime decision.
     /// HEAD, fork-source lookup, DELETE and failed writes do not renew a TTL.
     pub fn get_for_read(&self, path: &str) -> Option<Arc<StreamState>> {
-        self.get_impl(path, true, None)
+        self.get_impl(path, StreamLookup::Read, None)
     }
 
-    fn get_impl(&self, path: &str, touch: bool, clock: Option<SystemTime>) -> Option<Arc<StreamState>> {
+    /// Keep incomplete hard retirements addressable to DELETE, including
+    /// expired identities which ordinary requests already see as missing.
+    pub(crate) fn get_for_delete(&self, path: &str) -> Option<Arc<StreamState>> {
+        self.streams
+            .get(path)
+            .filter(|entry| entry.hard_delete_pending())
+            .map(|entry| entry.clone())
+            .or_else(|| self.get(path))
+    }
+
+    fn get_impl(&self, path: &str, lookup: StreamLookup, clock: Option<SystemTime>) -> Option<Arc<StreamState>> {
         loop {
             let st = self.streams.get(path)?.clone();
             if st.shared.read().unwrap().soft_deleted {
@@ -1465,12 +1490,17 @@ impl Store {
             {
                 let lifecycle = st.lifecycle.lock().unwrap();
                 let mut shared = st.shared.write().unwrap();
-                if lifecycle.retiring || shared.soft_deleted {
-                    return None;
+                if shared.soft_deleted {
+                    drop(shared);
+                    drop(lifecycle);
+                    return Some(st);
                 }
                 let now = clock.unwrap_or_else(SystemTime::now);
                 if !st.expired_at(shared.last_access, now) {
-                    let renewed = touch && st.config.ttl_seconds.is_some();
+                    if lifecycle.retiring {
+                        return None;
+                    }
+                    let renewed = matches!(lookup, StreamLookup::Read) && st.config.ttl_seconds.is_some();
                     if renewed {
                         shared.last_access = now;
                     }
@@ -1481,6 +1511,9 @@ impl Store {
                     }
                     return Some(st);
                 }
+                if lifecycle.retiring && !matches!(lookup, StreamLookup::Create) {
+                    return None;
+                }
             }
             #[cfg(test)]
             if let Some(hook) = self.expiry_observed_hook.lock().unwrap().take() {
@@ -1488,7 +1521,11 @@ impl Store {
             }
             // Re-check behind every deletion barrier: an admitted append may
             // have renewed the stream since the observation above.
-            match self.try_expire(&st, clock) {
+            let expired = match lookup {
+                StreamLookup::Create => Ok(self.retirement_context().expire(&st, clock)),
+                _ => self.try_expire(&st, clock),
+            };
+            match expired {
                 Ok(false) => continue,
                 Ok(true) | Err(_) => return None,
             }
@@ -1511,14 +1548,15 @@ impl Store {
         if lifecycle.retiring || shared.soft_deleted {
             return Ok(true);
         }
-        if !st.expired_at(shared.last_access, clock.unwrap_or_else(SystemTime::now)) {
+        let now = clock.unwrap_or_else(SystemTime::now);
+        if !st.expired_at(shared.last_access, now) {
             return Ok(false);
         }
         if lifecycle.in_flight > 0 {
             return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "stream operations still in flight"));
         }
         lifecycle.retiring = true;
-        self.retirement_context().schedule_expiry(st.clone());
+        self.retirement_context().schedule_expiry(st.clone(), now);
         Ok(true)
     }
 
@@ -1608,9 +1646,10 @@ impl Store {
             }
             st.publish_deleted();
         } else {
-            st.hard_delete.store(true, Ordering::Release);
-            st.shared.write().unwrap().soft_deleted = true;
-            st.publish_deleted();
+            if !st.hard_delete.swap(true, Ordering::AcqRel) {
+                st.shared.write().unwrap().soft_deleted = true;
+                st.publish_deleted();
+            }
             let context = self.retirement_context();
             // The map entry is dropped only once the removal has actually
             // happened, never before. Dropping it first meant a failed
@@ -1651,8 +1690,10 @@ impl Store {
                 "previous create rollback failed; repair storage and restart before retrying this path",
             ));
         }
-        // Reserve the fork source through the durable reference update. DELETE
-        // waits for this reservation before deciding hard vs soft removal.
+        // A PUT encountering expiry completes cleanup on this worker before
+        // deciding whether it can reuse the path. Take the fork reservation
+        // afterwards so waiting for retirement never holds an operation guard.
+        let existing = self.get_impl(path, StreamLookup::Create, None);
         let _parent_operation = match parent.as_ref() {
             Some(parent) => match parent.begin_operation() {
                 Some(operation) => Some(operation),
@@ -1660,8 +1701,7 @@ impl Store {
             },
             None => None,
         };
-        // Fast path: existing stream → config comparison.
-        if let Some(existing) = self.get(path) {
+        if let Some(existing) = existing {
             if existing.shared.read().unwrap().soft_deleted {
                 return Ok(CreateResult::Conflict);
             }
@@ -1671,8 +1711,7 @@ impl Store {
                 CreateResult::Conflict
             });
         }
-        // Lazy expiry can still own a fenced entry while its physical cleanup
-        // is queued. Do not replace that identity before cleanup removes it.
+        // Busy operations and failed cleanup can leave the path reserved.
         if self.streams.contains_key(path) {
             return Ok(CreateResult::Conflict);
         }
@@ -3778,7 +3817,7 @@ mod meta_sweep_tests {
         let before = deadline.checked_sub(Duration::from_nanos(1)).unwrap();
         assert!(st.expired_at(start, deadline), "expiry is inclusive at the deadline");
         assert!(!st.expired_at(start, before));
-        assert!(store.get_impl("s", true, Some(before)).is_some());
+        assert!(store.get_impl("s", StreamLookup::Read, Some(before)).is_some());
         assert_eq!(st.shared.read().unwrap().last_access, before);
         assert!(!st.expired_at(before, deadline), "an accepted read moves the old deadline");
         assert!(st.expired_at(before, before.checked_add(Duration::from_secs(60)).unwrap()));
@@ -3860,9 +3899,24 @@ mod meta_sweep_tests {
         assert!(store.streams.contains_key("s"));
         assert!(st.file_path.exists());
         assert!(st.begin_operation().is_none());
+        for method in [crate::api::Method::Head, crate::api::Method::Get, crate::api::Method::Post] {
+            let response = crate::handlers::handle(
+                store.clone(),
+                crate::api::Req { method, path: "s".into(), query: None, headers: vec![], body: bytes::Bytes::new() },
+            )
+            .await;
+            assert_eq!(response.status, 404, "hard expiry is visible as missing even while cleanup retains the path");
+        }
         assert!(matches!(store.create("s", cfg, None, 0).unwrap(), CreateResult::Conflict));
         std::fs::remove_dir(sidecar).unwrap();
-        store.delete_durable(&st).await.unwrap();
+        let delete = crate::api::Req {
+            method: crate::api::Method::Delete,
+            path: "s".into(),
+            query: None,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        };
+        assert_eq!(crate::handlers::handle(store.clone(), delete).await.status, 204);
         assert!(!store.streams.contains_key("s"));
         let replacement = create(&store, "s");
         assert!(store.try_expire(&st, None).unwrap(), "stale identity must not affect a replacement");

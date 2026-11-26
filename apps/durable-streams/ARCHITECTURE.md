@@ -165,7 +165,10 @@ unfenced incarnation and schedules its renewal for metadata persistence. Lazy ex
 deadline behind its barriers before fencing, so a completed admitted append or accepted renewal wins
 over an earlier observation. Its owned cleanup persists a pinned parent's soft deletion before
 publishing the terminal watch; metadata failure restores admission without that event, allowing the
-next access to retry. Hard-removal failure retains the fenced incarnation for explicit DELETE retry,
+next access to retry. Hard expiry makes the path return `404` to new reads and appends as soon as it
+is fenced. PUT completes eligible expiry on its own blocking worker and can reuse the path once
+durable removal succeeds. Forks keep their expired parent's data and reserve its path until the last
+reference is released. Hard-removal failure retains the fenced incarnation for explicit DELETE retry,
 and ancestor pins are released only after successful physical removal. There is no active TTL reaper.
 
 ### `memory` mode
