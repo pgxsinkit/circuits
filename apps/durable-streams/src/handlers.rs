@@ -836,8 +836,7 @@ async fn wait_durable_lsn(store: &Arc<Store>, st: &Arc<StreamState>, lsn: u64) {
 /// async/WAL-recoverable; the only durability barrier is the WAL `fdatasync`
 /// awaited in `wait_durable_lsn`.
 fn write_wire(st: &StreamState, ap: &mut Appender, wire: &Bytes) -> std::io::Result<u64> {
-    use std::io::Write;
-    if let Err(e) = (&*ap.file).write_all(wire) {
+    if let Err(e) = ap.file.write_all(wire) {
         // A partial write (ENOSPC mid-slice) leaves garbage bytes in the file
         // PAST `ap.written` while the logical offsets don't advance — every
         // later append would land after the garbage (O_APPEND) with a logical

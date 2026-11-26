@@ -432,6 +432,29 @@ impl<T: PendingRecord> SpillQueue<T> {
     pub fn is_failed(&self) -> bool {
         self.failure.is_some()
     }
+
+    /// Check every retained file frame without consuming the queue. A sequencer transaction uses
+    /// this before applying its first record, so truncated or malformed scratch cannot apply a
+    /// valid prefix before its failure is discovered.
+    pub fn validate(&mut self) -> Result<()> {
+        self.healthy()?;
+        let Some(spill) = &mut self.spill else { return Ok(()) };
+        let start = spill.read;
+        let result = (|| {
+            if spill.file.metadata()?.len() != spill.written {
+                bail!("pending spill length differs from its written queue");
+            }
+            for _ in 0..self.count {
+                spill.pop::<T>()?;
+            }
+            if spill.read != spill.written {
+                bail!("pending spill has extra records");
+            }
+            Ok(())
+        })();
+        spill.read = start;
+        self.poison(result)
+    }
     fn poison<R>(&mut self, result: Result<R>) -> Result<R> {
         if let Err(error) = &result {
             self.failure = Some(format!("{error:#}"));

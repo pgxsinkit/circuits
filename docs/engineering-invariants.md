@@ -195,8 +195,11 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
 - **The INGESTOR's memory is bounded, and transaction size never invalidates anything** (ADR-0003).
   Its per-transaction buffer holds `Envelope` structs (nothing is serialized on the way in) and spills
   to a temp file past `CIRCUITS_TXN_MEMORY_BYTES` (`txn_buffer.rs`), so its peak is that cap
-  plus one chunk. That bound is the ingestor's alone — the sequencer's read page, held run and
-  `txn_pending` are bounded by a transaction's size. There is no "transaction too large" branch: no
+  plus one chunk. The sequencer keeps incomplete input under the shared pending-memory budget and
+  spills overflow with the lossless queue codec. It only applies a complete run, replaying spilled
+  input in bounded chunks and flushing effects at the transaction boundary. Its read page and
+  transaction-wide output and arrangement staging are separate memory costs. There is no
+  "transaction too large" branch: no
   shape is retired, nothing is purged, nothing is refused for being big. If you add work between
   `Begin` and `Commit`, it must not accumulate unbounded state of its own.
 - **Schema drift, `TRUNCATE` and a replica-identity regression retire that table's dependents**
@@ -244,8 +247,10 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   the catalog, not the in-memory position) is past it and no shape pins it — a dormant shape pinning
   past `CIRCUITS_CHANGES_RETAIN_SECS` is evicted first, a reactivating one is never evicted
   mid-replay, and the plan is recomputed after the evictions so a skipped one cannot license a
-  delete. The current segment is never deleted, and a boot whose restored position names a missing
-  segment refuses to start.
+  delete. The current segment is never deleted by retention. Boot checks every segment from the
+  restored checkpoint through the current writer. The live reader verifies each successor and
+  confirms a terminal GET with HEAD. Confirmed loss parks replay and withdraws readiness, holding
+  the checkpoint at the last proved position until storage is restored and the engine restarts.
 - **Engine-initiated retirement closes the stream, then deletes it** (`ds.retire_stream`; ADR 0007):
   purge, eviction, drop-at-restore, schema drift, the degraded subquery reap. The close releases a tailing
   long-poll at once with `stream-closed`. Closing is terminal, so the non-retirement paths never
@@ -307,6 +312,10 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   _now_ else idempotent `delete`. Flip-driven query-backs run deferred on the flip-propagator task
   (out of commit order relative to the sequencer), so delta-based emission would miss move-outs.
   Symptom when wrong: op-by-op converges, _batched_ mutations diverge.
+- **A flip shares its candidate query.** Shape and parent-node dependents each share one PostgreSQL
+  read per target table and connecting column. A NULL flip reads the whole target table once per
+  tier for its NULL-sensitive dependents. Mark dependents before the read and evaluate each with its
+  own recency fence, so a concurrent live decision still wins over an older query-back.
 - **NULL flips re-derive any dependent whose `IN` leaf is negated OR under a `Not{…}`** (edge
   `null_sensitive`). Plain-`IN` dependents can't change (monotonicity over FALSE<UNKNOWN<TRUE).
 - **Shape creation is atomic.** On any failure, everything (record, share entries, registry
@@ -391,6 +400,9 @@ To exercise dormancy and eviction fast, boot with second-scale knobs
   timestamps ISO-`T`-style; pgoutput text-mode tuples use Postgres text output. Same cell, different string →
   broken retractions/routing/MIN-MAX. Backfill casts text-mapped columns with `::text`
   (`pg.rs::row_json_expr`). If you add a read path, match it.
+  Every query and replication connection starts with UTC and ISO date output. Temporal predicate
+  literals are canonicalized to the column's Postgres text form before indexing, circuit-key or
+  subquery-bind lookup and evaluation. Unsupported temporal literals are typed request refusals.
 - **Ingest is streaming pgoutput** (walsender protocol via `pgwire-replication` + our own
   `pgoutput.rs` decoder, text-mode tuples, never the `binary` option — binary values would break
   the byte-identity above). The slot is `pgoutput`-plugin; a publication `<slot>_pub` (FOR ALL

@@ -154,17 +154,17 @@ every further change of that transaction goes straight to the file. At the commi
 streamed back in order, stamped, and appended in chunks of at most
 `CIRCUITS_CHANGES_APPEND_BYTES` (64 MiB, ≤ the durable-streams body cap) — **acknowledging
 the slot, publishing `last_lsn` and releasing the drain barrier only after the LAST chunk lands**.
-Peak **ingestor** memory is the cap plus one chunk (the sequencer's own read page, held run and
-pending appends are bounded by the transaction's size, not by this knob), and transaction size never
-invalidates a shape.
+Peak **ingestor** memory is the cap plus one chunk. The sequencer has its own input pages and
+transaction-wide output staging. Transaction size never invalidates a shape.
 
 **Chunking is not visible as several transactions.** Durable-streams exposes each append atomically,
 so the sequencer's long-poll returns chunk 1 on its own; splitting a page by `(txid, lsn)` alone would
 fan that chunk out and flush it to the shape streams as a whole commit. The ingestor therefore stamps
 a **transaction-end marker** on the last envelope of every transaction (`headers.last`, on
 single-chunk commits too; library-mode writers stamp their one-envelope writes), and the sequencer
-**holds** a trailing run that no marker terminates: held envelopes are carried into the next read and
-the transaction is processed and flushed only when the marker arrives.
+**holds** a trailing run that no marker terminates. Held input shares the pending-memory budget and
+spills through the lossless queue codec. Once the marker arrives, the sequencer validates spill
+records and reads them in bounded input chunks. Effects still flush at the transaction boundary.
 
 A re-delivery has to fold into that hold. When the ingestor fails part-way it acknowledges nothing,
 so Postgres re-sends the interrupted transaction from its start — and, because acknowledgements are
@@ -322,6 +322,13 @@ with `::text` casts so a cell's value is Postgres's _text output_ — the same f
 text-mode tuples
 prints — rather than `to_jsonb`'s (which would make the same timestamp compare unequal between a
 backfilled row and its first live update).
+
+Every query and replication session requests UTC and ISO date output at startup. Temporal literals
+are canonicalized before predicate compilation, equality routing, circuit-key planning and
+subquery-bind lookup. Unsupported temporal literals return a typed request error. Finite range
+comparisons currently cover four-digit AD values, with PostgreSQL microsecond precision. The
+[deployment guide](deployment-postgres.md#configuration-reference) records the upgrade boundary
+for retained change-log bytes written under other session formats.
 
 **Snapshots must also include work already sequenced before registration.** A commit can have
 reached the sequencer before `BeginShape` or the subset feed's captured HEAD while still being

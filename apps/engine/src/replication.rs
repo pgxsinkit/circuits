@@ -126,6 +126,8 @@ pub enum Refused {
     /// The epoch is broken and `CIRCUITS_RESET_ON_SLOT_LOSS=false`: ingest stays stopped
     /// until an operator posts `/epoch/reset` (ADR-0004).
     EpochBroken(&'static str),
+    /// A confirmed gap in the durable replay chain requires storage recovery.
+    ChangeLogMissing,
     /// Another walsender holds the slot — Postgres allows exactly one, so this is a second engine
     /// on the same slot (or our own predecessor that Postgres has not yet reaped), not an epoch
     /// break.
@@ -140,6 +142,7 @@ impl std::fmt::Display for Refused {
             Refused::EpochBroken(reason) => {
                 write!(f, "epoch broken ({reason}); waiting for POST /epoch/reset")
             }
+            Refused::ChangeLogMissing => f.write_str("restore the missing change-log segment and restart"),
             Refused::SlotBusy(Some(pid)) => write!(f, "the slot is held by walsender pid {pid}"),
             Refused::SlotBusy(None) => f.write_str("the slot is held by another walsender"),
             Refused::CheckFailed => f.write_str("the slot could not be verified"),
@@ -379,8 +382,7 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
         s => percent_decode(s),
     };
     // `ReplicationConfig` is `#[non_exhaustive]`, so it is built from `new` and the `with_*` setters.
-    // Everything not set here keeps the library's default: no stop LSN, text (not binary) tuples,
-    // no startup `options`.
+    // Everything not set here keeps the library's default: no stop LSN and text tuples.
     Ok(ReplicationConfig::new(
         u.host_str().unwrap_or("127.0.0.1"),
         user,
@@ -398,7 +400,8 @@ fn replication_config(pg_url: &str, slot: &str, publication: &str) -> Result<Rep
     // after a reconnect (the tailer de-duplicates anyway).
     .with_status_interval(std::time::Duration::from_secs(1))
     .with_wakeup_interval(std::time::Duration::from_secs(10))
-    .with_buffer_size(8192))
+    .with_buffer_size(8192)
+    .with_options(crate::pg::SESSION_OPTIONS))
 }
 
 fn percent_decode(s: &str) -> String {
@@ -908,6 +911,17 @@ fn text_to_json(text: &str, ty: ColumnType) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_sessions_request_utc_and_iso_dates() {
+        let cfg = replication_config(
+            "postgres://u:p@127.0.0.1/db?options=-cTimeZone%3DAsia/Kolkata",
+            "circuits",
+            "circuits_pub",
+        )
+        .unwrap();
+        assert_eq!(cfg.options.as_deref(), Some(crate::pg::SESSION_OPTIONS));
+    }
     use crate::pgoutput::{Cell, Message, OldTuple};
     use crate::schema::{ColumnDef, FingerprintColumn, TableDef};
     use std::collections::BTreeMap;

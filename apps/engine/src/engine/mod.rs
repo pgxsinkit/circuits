@@ -29,6 +29,7 @@ mod drift;
 pub(crate) mod emission;
 pub(crate) mod epoch;
 mod executors;
+mod held;
 mod introspection;
 mod lifecycle;
 pub(crate) mod membership;
@@ -1474,12 +1475,7 @@ impl Engine {
         }
         let mut compiled = HashMap::new();
         for t in &tables {
-            // Identity FIRST, then introspect: the compiled schema carries a fingerprint that
-            // includes `relreplident`, and reading it before the ALTER would record the pre-boot
-            // identity — which the ingestor's first `Relation` message would then report as drift
-            // on every single boot (ADR-0005).
-            crate::pg::ensure_replica_identity_full(&client, t).await?;
-            let def = crate::pg::introspect(&client, t).await?;
+            let def = crate::pg::introspect_for_boot(&client, t).await?;
             let ts = TableSchema::from_def(t, &def)?;
             compiled.insert(t.clone(), ts);
         }
@@ -1585,11 +1581,8 @@ impl Engine {
     /// creation is recorded as `ChangesRotated { segment: 0, at }` so the age criterion has a start
     /// time to measure from.
     ///
-    /// It is also where the **sequencer's** start position is vouched for. A segment is deleted only
-    /// once the durable checkpoint is past it, so a checkpoint naming a segment storage no longer
-    /// has is an impossible state — and one the sequencer cannot recover from, since it would spin
-    /// on a 404 forever. It is fatal here, at boot, with a message that names the segment, rather
-    /// than a retry loop inside a spawned task nobody is watching.
+    /// Verify every segment the sequencer needs to replay, from its durable checkpoint through the
+    /// current write segment. A gap in that chain is fatal. Unavailable storage remains retryable.
     async fn init_change_log(
         &self,
         from_fold: u32,
@@ -1598,15 +1591,31 @@ impl Engine {
     ) -> Result<()> {
         // "Recorded" tells a first boot (nothing was ever written) from a segment the engine knows
         // existed having been deleted — see `resolve_current`.
-        let recorded = starts.contains_key(&from_fold);
+        let recorded = !starts.is_empty() || *seq_start != LogPosition::start_of(from_fold);
         let resolved = crate::changelog::resolve_current(&self.ds, from_fold, recorded)
             .await
             .context("resolving the change log's current segment")?;
+        if seq_start.segment > resolved {
+            bail!("change log: checkpoint {seq_start} is beyond the current segment {}", segment_path(resolved));
+        }
+        if !recorded && resolved == from_fold {
+            self.ds
+                .ensure_stream(&segment_path(resolved))
+                .await
+                .with_context(|| format!("creating {}", segment_path(resolved)))?;
+        }
+        // Do not create a replacement for any stream the checkpoint needs. An empty stream would
+        // hide the gap and make subsequent offsets look like a valid continuation.
+        let mut tail = None;
+        for segment in seq_start.segment..=resolved {
+            let path = segment_path(segment);
+            let head = self.ds.head(&path).await.with_context(|| format!("checking the change-log segment {path}"))?;
+            let Some(head) = head else {
+                bail!("change log: required segment {path} is missing (checkpoint {seq_start}); refusing to boot");
+            };
+            tail = head.next_offset;
+        }
         let mut starts = starts;
-        self.ds
-            .ensure_stream(&segment_path(resolved))
-            .await
-            .with_context(|| format!("creating {}", segment_path(resolved)))?;
         // Every segment from the fold's answer up to the resolved one began without its record
         // being written (or, for segment 0 on a first boot, has just been created here).
         for n in from_fold..=resolved {
@@ -1617,28 +1626,7 @@ impl Engine {
             starts.insert(n, at);
             self.catalog_tx.send(CatalogEvent::ChangesRotated { segment: n, at });
         }
-        // The sequencer resumes here; if that segment is gone it can never advance (see above).
-        let start_head =
-            self.ds.head(&segment_path(seq_start.segment)).await.with_context(|| {
-                format!("checking the sequencer's start segment {}", segment_path(seq_start.segment))
-            })?;
-        if start_head.is_none() {
-            bail!(
-                "durable catalog resumes the change log at {seq_start}, but {} does not exist. A segment is \
-                 deleted only once the durable checkpoint has passed it, so this cannot happen while the \
-                 engine is the only writer — refusing to boot rather than spin on a deleted stream. Reset \
-                 the durable-streams data directory.",
-                segment_path(seq_start.segment)
-            );
-        }
-        // Seed the writer's tail from storage, so the size budget and `force_rotate` are right from
-        // the first commit after a restart instead of from the first append this process makes
-        // (which would read the segment as empty and never rotate on size).
-        let tail = if seq_start.segment == resolved {
-            start_head.and_then(|h| h.next_offset)
-        } else {
-            self.ds.head(&segment_path(resolved)).await.ok().flatten().and_then(|h| h.next_offset)
-        };
+        // The last HEAD seeds the writer's tail, so the size budget is right from the first commit.
         self.changes.state().adopt(resolved, starts, tail);
         crate::metrics::metrics().changes_segments_retained.store(self.changes.state().retained(), Ordering::Relaxed);
         tracing::info!("change log: current segment is {}", segment_path(resolved));

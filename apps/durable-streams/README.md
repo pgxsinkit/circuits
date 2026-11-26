@@ -73,6 +73,18 @@ A second server pointed at the same directory refuses to start (exit 2) rather t
 interleave writes with the first. This applies in `memory` mode too — it opens no WAL,
 but it still writes the stream files and their meta sidecars under the data dir.
 
+Stream data files open on demand. The server closes idle files and evicts the least
+recently used descriptors when its budget is reached. Active readers, appends and
+compaction retain their inode until they finish. The budget is best effort while
+files are in use. Recovery opens each data file only long enough to verify and
+size it, then closes it.
+
+| Flag                      | Default                                        | Description                                                                                                                                                        |
+| ------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--max-open-stream-files` | half the process descriptor limit (minimum 64) | Descriptor budget for stream data files. Must be positive. Leave headroom for connections, WAL, chunks and metadata.                                               |
+| `--stream-file-idle-secs` | `60`                                           | Close stream data files unused for this many seconds. Must be positive.                                                                                            |
+| `--fd-stats-secs`         | `60`                                           | Emit `ds_fd_stats` with process open descriptors, descriptor limit and stream pool usage. `0` disables these lines. The telemetry feature exports the same gauges. |
+
 **Durability** — controls how appends are made durable. See [ARCHITECTURE.md › Durability modes](ARCHITECTURE.md#durability-modes).
 
 | Flag                  | Default   | Description                                                                                                                                                                                                                                                                                                               |

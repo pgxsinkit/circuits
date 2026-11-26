@@ -8,6 +8,7 @@ mod srvstats;
 #[cfg(target_os = "linux")]
 mod sse_reactor;
 mod store;
+mod stream_file;
 mod telemetry;
 mod tier;
 mod wal;
@@ -140,6 +141,9 @@ fn main() {
     // investigation, independent of the heavy `telemetry` OTLP feature.
     let mut wal_stats_secs: Option<u64> = None;
     let mut server_stats_secs: Option<u64> = None;
+    let mut max_open_stream_files: Option<usize> = None;
+    let mut stream_file_idle_secs: u64 = 60;
+    let mut fd_stats_secs: u64 = 60;
     // `--max-chunk-bytes N` (env fallback `DS_MAX_CHUNK_BYTES`): the server-defined
     // maximum chunk size a catch-up / long-poll read response may carry
     // (PROTOCOL.md §5.6). `None` ⇒ the 4 MiB default; `0` ⇒ unlimited (one response
@@ -241,6 +245,22 @@ fn main() {
                 }
                 wal_stats_secs = Some(n);
             }
+            "--max-open-stream-files" => {
+                let n: usize = parse_val(args.next(), "--max-open-stream-files");
+                if n == 0 {
+                    eprintln!("--max-open-stream-files must be at least 1");
+                    std::process::exit(2);
+                }
+                max_open_stream_files = Some(n);
+            }
+            "--stream-file-idle-secs" => {
+                stream_file_idle_secs = parse_val(args.next(), "--stream-file-idle-secs");
+                if stream_file_idle_secs == 0 {
+                    eprintln!("--stream-file-idle-secs must be at least 1");
+                    std::process::exit(2);
+                }
+            }
+            "--fd-stats-secs" => fd_stats_secs = parse_val(args.next(), "--fd-stats-secs"),
             "--durability" => {
                 let v = val(args.next(), "--durability");
                 match handlers::parse_durability(&v) {
@@ -318,6 +338,9 @@ fn main() {
     if let Some(bytes) = max_chunk_bytes {
         handlers::set_max_chunk_bytes(bytes);
     }
+    stream_file::Pool::global().set_max_open(
+        max_open_stream_files.unwrap_or_else(|| stream_file::default_max_open(stream_file::process_fds().1)),
+    );
 
     // Apply --durability memory AFTER the arg loop. Memory mode is the buffered
     // append path with the WAL stage/wait skipped (no splice intercept, no forced
@@ -415,6 +438,10 @@ fn main() {
         // Spawned in BOTH durability modes — wal mode still queues TTL read
         // touches here (its append path flushes via the checkpoint instead).
         spawn_meta_sweeper(Arc::clone(&store));
+        stream_file::spawn_maintenance(
+            std::time::Duration::from_secs(stream_file_idle_secs),
+            (fd_stats_secs > 0).then(|| std::time::Duration::from_secs(fd_stats_secs)),
+        );
 
         // Server load telemetry (both modes) for bottleneck analysis.
         if let Some(secs) = server_stats_secs {

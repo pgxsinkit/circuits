@@ -109,6 +109,8 @@ pub enum EpochBreakReason {
     /// encoded under IS the one the engine holds — so it is an engine bug or storage corruption, not
     /// drift (ADR-0010). Ingest into shapes stops at that envelope rather than stepping over it.
     ChangeLogUnprocessable,
+    /// Storage confirmed a required change-log segment is missing.
+    ChangeLogMissing,
 }
 
 impl EpochBreakReason {
@@ -118,30 +120,28 @@ impl EpochBreakReason {
             EpochBreakReason::SlotWalLost => "slot_wal_lost",
             EpochBreakReason::SystemIdentifierMismatch => "system_identifier_mismatch",
             EpochBreakReason::ChangeLogUnprocessable => "change_log_unprocessable",
+            EpochBreakReason::ChangeLogMissing => "change_log_missing",
         }
     }
 
     /// Must an OPERATOR clear this break? The auto-reset policy (ADR-0004) does not apply to it, at
     /// boot or on a reconnect.
     ///
-    /// True only for [`Self::ChangeLogUnprocessable`]. The slot reasons describe something that
-    /// happened to Postgres and that a fresh slot + a resync genuinely repairs, so an unattended
-    /// deployment may heal itself. This one describes the engine failing to process a change it
-    /// wrote itself: auto-resetting would destroy every shape in reply to a bug, on a loop, and throw
-    /// away the evidence. Pathological states are refused, not healed.
+    /// A change-log failure requires intervention. Auto-reset would destroy retained streams in
+    /// response to a processing or storage failure.
     pub fn needs_operator(self) -> bool {
-        matches!(self, EpochBreakReason::ChangeLogUnprocessable)
+        matches!(self, Self::ChangeLogUnprocessable | Self::ChangeLogMissing)
     }
 
     /// Is the SLOT what this break is about — i.e. must a reset replace it?
     ///
-    /// False only for [`Self::ChangeLogUnprocessable`] (ADR-0010): there the slot is healthy, the
+    /// False for change-log faults: there the slot is healthy, the
     /// engine is bound to exactly the slot Postgres has, and the ingestor is streaming from it. A new
     /// slot would buy nothing (the epoch's shapes are all retired and a new one backfills from
     /// Postgres), and Postgres would refuse to drop one its own walsender holds. The new epoch rebinds
     /// the same slot instead.
     pub fn slot_is_suspect(self) -> bool {
-        !matches!(self, EpochBreakReason::ChangeLogUnprocessable)
+        !self.needs_operator()
     }
 }
 
@@ -171,6 +171,10 @@ pub struct EpochBroken {
 
 impl std::fmt::Display for EpochBroken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.reason == EpochBreakReason::ChangeLogMissing {
+            return f
+                .write_str("epoch broken (change_log_missing): restore the missing change-log segment and restart");
+        }
         // The recovery is the same either way; what is broken is not, and a message naming the slot
         // for a change-log failure would send an operator to look at a slot that is perfectly healthy.
         let what = match self.reason {
@@ -286,12 +290,24 @@ impl EpochState {
     pub(crate) fn latch(&self, reason: EpochBreakReason) -> bool {
         let mut broken = self.broken.lock().unwrap();
         if broken.is_some() {
+            // A reset can release the sequencer before the replacement slot binding lands. If
+            // replay discovers a storage gap in that window, keep the stronger refusal.
+            if reason == EpochBreakReason::ChangeLogMissing {
+                *broken = Some(reason);
+            }
             return false;
         }
         *broken = Some(reason);
         drop(broken);
         crate::metrics::metrics().epoch_breaks.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    fn clear_rebound_break(&self) {
+        let mut broken = self.broken.lock().unwrap();
+        if *broken != Some(EpochBreakReason::ChangeLogMissing) {
+            *broken = None;
+        }
     }
 
     pub(crate) fn new() -> Arc<Self> {
@@ -409,7 +425,7 @@ impl Engine {
         };
         self.catalog_tx.send(CatalogEvent::SlotBound(binding.clone()));
         *self.epoch.binding.lock().unwrap() = Some(binding.clone());
-        *self.epoch.broken.lock().unwrap() = None;
+        self.epoch.clear_rebound_break();
         self.epoch.generation.fetch_add(1, Ordering::SeqCst);
         tracing::info!(
             "epoch bound: slot '{slot}' on cluster {} (timeline {}) at {}",
@@ -538,6 +554,11 @@ impl Engine {
         if self.epoch.generation.load(Ordering::SeqCst) != seen {
             tracing::info!("epoch reset: another caller already bound the new epoch; nothing to do");
             return Ok(());
+        }
+        if reason == EpochBreakReason::ChangeLogMissing
+            || self.epoch_broken() == Some(EpochBreakReason::ChangeLogMissing)
+        {
+            return Err(EpochBroken { reason: EpochBreakReason::ChangeLogMissing }.into());
         }
         let url = self.pg_url.clone().context("epoch reset requires postgres mode")?;
         let slot = self.epoch_slot().context("epoch reset before the engine knows its slot")?;
@@ -693,6 +714,9 @@ impl Engine {
         reason: EpochBreakReason,
         slot: &str,
     ) -> std::result::Result<(), Refused> {
+        if reason == EpochBreakReason::ChangeLogMissing {
+            return Err(Refused::ChangeLogMissing);
+        }
         let first = self.latch_epoch_break(reason, slot);
         if !auto_reset_applies(reason, self.epoch_auto_reset()) {
             if first {
@@ -943,6 +967,7 @@ mod tests {
         assert_eq!(EpochBreakReason::SlotWalLost.as_str(), "slot_wal_lost");
         assert_eq!(EpochBreakReason::SystemIdentifierMismatch.as_str(), "system_identifier_mismatch");
         assert_eq!(EpochBreakReason::ChangeLogUnprocessable.as_str(), "change_log_unprocessable");
+        assert_eq!(EpochBreakReason::ChangeLogMissing.as_str(), "change_log_missing");
     }
 
     /// A change the engine cannot process is never auto-reset — under EITHER policy (ADR-0010).
@@ -950,7 +975,7 @@ mod tests {
     /// and throw the evidence away. The slot reasons are the opposite case: a new slot and a resync
     /// genuinely repair them, so the default policy may.
     #[test]
-    fn only_an_unprocessable_change_log_refuses_under_both_policies() {
+    fn change_log_faults_refuse_under_both_policies() {
         assert!(EpochBreakReason::ChangeLogUnprocessable.needs_operator());
         for reason in
             [EpochBreakReason::SlotLost, EpochBreakReason::SlotWalLost, EpochBreakReason::SystemIdentifierMismatch]
@@ -960,11 +985,21 @@ mod tests {
             assert!(!auto_reset_applies(reason, false), "{reason} refuses under RESET_ON_SLOT_LOSS=false");
         }
         for auto_reset in [true, false] {
+            assert!(!auto_reset_applies(EpochBreakReason::ChangeLogMissing, auto_reset));
             assert!(
                 !auto_reset_applies(EpochBreakReason::ChangeLogUnprocessable, auto_reset),
                 "auto_reset={auto_reset} must not reset an unprocessable change log"
             );
         }
+    }
+
+    #[test]
+    fn a_gap_found_during_a_reset_stays_latched_after_rebind() {
+        let epoch = EpochState::new();
+        assert!(epoch.latch(EpochBreakReason::SlotLost));
+        assert!(!epoch.latch(EpochBreakReason::ChangeLogMissing));
+        epoch.clear_rebound_break();
+        assert_eq!(*epoch.broken.lock().unwrap(), Some(EpochBreakReason::ChangeLogMissing));
     }
 
     /// The ingestor's pre-connect gate re-derives the latch on every reconnect attempt. For a break

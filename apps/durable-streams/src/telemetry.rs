@@ -21,7 +21,7 @@
 mod imp {
     use std::sync::OnceLock;
 
-    use opentelemetry::metrics::{Counter, Histogram, Meter};
+    use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
     use opentelemetry::{global, KeyValue};
     use opentelemetry_otlp::{MetricExporter, SpanExporter};
     use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream, Temporality};
@@ -39,6 +39,10 @@ mod imp {
     /// Pre-resolved instrument handles. Resolving an instrument is cheap but not
     /// free, so we do it once at startup and store the handles here.
     pub struct Metrics {
+        process_open_fds: Gauge<u64>,
+        process_fd_limit: Gauge<u64>,
+        stream_files_open: Gauge<u64>,
+        stream_files_max_open: Gauge<u64>,
         http_requests: Counter<u64>,
         append_fsync_duration: Histogram<f64>,
         append_fsync_batch_size: Histogram<u64>,
@@ -55,6 +59,22 @@ mod imp {
     impl Metrics {
         fn new(meter: &Meter) -> Self {
             Metrics {
+                process_open_fds: meter
+                    .u64_gauge("ds.process.open_fds")
+                    .with_description("File descriptors the process holds open.")
+                    .build(),
+                process_fd_limit: meter
+                    .u64_gauge("ds.process.fd_limit")
+                    .with_description("The process RLIMIT_NOFILE soft limit.")
+                    .build(),
+                stream_files_open: meter
+                    .u64_gauge("ds.stream_files.open")
+                    .with_description("Stream data files currently held open.")
+                    .build(),
+                stream_files_max_open: meter
+                    .u64_gauge("ds.stream_files.max_open")
+                    .with_description("Open stream data file eviction budget.")
+                    .build(),
                 http_requests: meter
                     .u64_counter("ds.http.requests")
                     .with_description("HTTP requests handled, by method and status class.")
@@ -104,6 +124,24 @@ mod imp {
 
     fn metrics() -> Option<&'static Metrics> {
         METRICS.get()
+    }
+
+    pub fn record_fd_stats(
+        open_fds: Option<u64>,
+        fd_limit: Option<u64>,
+        stream_files_open: u64,
+        stream_files_max_open: u64,
+    ) {
+        if let Some(m) = metrics() {
+            if let Some(value) = open_fds {
+                m.process_open_fds.record(value, &[]);
+            }
+            if let Some(value) = fd_limit {
+                m.process_fd_limit.record(value, &[]);
+            }
+            m.stream_files_open.record(stream_files_open, &[]);
+            m.stream_files_max_open.record(stream_files_max_open, &[]);
+        }
     }
 
     /// Held for the lifetime of the process; its `Drop`/`shutdown` flushes the
@@ -362,6 +400,14 @@ mod imp {
     pub fn record_chunk_capped(_live: &'static str) {}
     #[inline(always)]
     pub fn record_offload_wait(_secs: f64) {}
+    #[inline(always)]
+    pub fn record_fd_stats(
+        _open_fds: Option<u64>,
+        _fd_limit: Option<u64>,
+        _stream_files_open: u64,
+        _stream_files_max_open: u64,
+    ) {
+    }
 
     /// Zero-sized no-op timer: `start`/`elapsed_secs` compile to nothing, so a
     /// default build reads no clock on hot paths.
@@ -383,6 +429,6 @@ mod imp {
 // but are part of the stable public surface — keep the re-export complete.
 #[allow(unused_imports)]
 pub use imp::{
-    init, record_append, record_append_lock_wait, record_chunk_capped, record_fsync, record_offload_wait, record_read,
-    record_request, record_tail_cache, Guard, Timer,
+    init, record_append, record_append_lock_wait, record_chunk_capped, record_fd_stats, record_fsync,
+    record_offload_wait, record_read, record_request, record_tail_cache, Guard, Timer,
 };

@@ -464,8 +464,7 @@ impl ChangeLogWriter {
     }
 }
 
-/// The successor a **reader** moves to when the segment it is on turns out to be closed and it
-/// never saw the rotation pointer (its checkpoint was already past it, or storage lost it).
+/// The successor a **reader** moves to when the segment it is on turns out to be closed and drained.
 ///
 /// Always EXACTLY `closed + 1`, verified to exist — never a walk. A reader must visit every segment
 /// in order: jumping to the first OPEN segment would silently skip every closed segment in between,
@@ -475,12 +474,11 @@ impl ChangeLogWriter {
 /// The successor is derived and verified with a `HEAD` rather than read out of the closed segment's
 /// final control envelope: a segment is up to a gigabyte and durable-streams has no bounded tail
 /// read (a byte offset into a JSON stream is not item-aligned), so reading it back would mean
-/// streaming the whole thing. The pointer's *content* is `closed + 1` by construction, and a reader
-/// that is streaming the segment normally follows the real envelope.
-/// A missing successor remains a typed `StreamGone`: the live sequencer backs off, startup
+/// streaming the whole thing. The pointer's *content* is `closed + 1` by construction.
+/// A missing successor remains a typed `StreamGone`: the live sequencer parks, startup
 /// refuses the broken chain, and a dormant replay can confirm the loss and retire its shape.
 pub async fn next_segment_for_reader(ds: &DsClient, closed: u32) -> Result<u32> {
-    let next = closed + 1;
+    let next = closed.checked_add(1).context("change-log segment number overflow")?;
     let next_path = segment_path(next);
     if ds.head(&next_path).await?.is_none() {
         return Err(anyhow::Error::new(crate::ds::StreamGone { path: next_path.clone(), status: 404 }).context(

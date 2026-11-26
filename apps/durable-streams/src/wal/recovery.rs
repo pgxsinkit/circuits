@@ -263,7 +263,7 @@ fn recover_shard(
         let actual_end = match replayed_end.get(&stream_id) {
             Some(end) => *end,
             None => {
-                let len = match st.shared.read().unwrap().file.metadata() {
+                let len = match st.shared.read().unwrap().file.get().and_then(|file| file.metadata()) {
                     Ok(meta) => meta.len(),
                     Err(error) => {
                         replay_err = Some(error);
@@ -1053,7 +1053,7 @@ mod tests {
         // Write X's two durable records into ITS per-stream file (page cache) and
         // stage them in the WAL; register X dirty so checkpoint fsyncs + records it.
         {
-            let f = std::sync::Arc::clone(&x.shared.read().unwrap().file);
+            let f = x.shared.read().unwrap().file.get().unwrap();
             use std::io::Write;
             (&*f).write_all(r1).unwrap();
             (&*f).write_all(r2).unwrap();
@@ -1193,7 +1193,7 @@ mod tests {
 
         // r1, r2 durable + checkpointed (records persisted tail = end(r2)).
         {
-            let f = std::sync::Arc::clone(&x.shared.read().unwrap().file);
+            let f = x.shared.read().unwrap().file.get().unwrap();
             use std::io::Write;
             (&*f).write_all(r1).unwrap();
             (&*f).write_all(r2).unwrap();
@@ -1209,7 +1209,7 @@ mod tests {
         // r3 appended AFTER the checkpoint: durable in the WAL (RETAINED — its
         // segment is the active one, not recycled) and written to the file.
         {
-            let f = std::sync::Arc::clone(&x.shared.read().unwrap().file);
+            let f = x.shared.read().unwrap().file.get().unwrap();
             use std::io::Write;
             (&*f).write_all(r3).unwrap();
             x.shared.write().unwrap().tail = after_r3;

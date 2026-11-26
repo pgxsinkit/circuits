@@ -18,6 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
 
+use crate::stream_file::StreamFile;
+
 pub const MAX_SAFE_INT: u64 = (1u64 << 53) - 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,8 +83,9 @@ pub struct Shared {
     /// Shared handle to the live data file for lock-free positioned reads. Held
     /// here (not on `StreamState`) so compaction can swap it together with
     /// `file_base` under one `shared.write()`, giving concurrent readers a
-    /// consistent (file, file_base) pair.
-    pub file: Arc<File>,
+    /// consistent (file, file_base) pair. The pool opens it on demand and closes
+    /// idle descriptors. Appender holds the same handle until compaction swaps it.
+    pub file: Arc<StreamFile>,
     /// Writer-facing close intent: set under the appender lock the instant a
     /// close is accepted (so subsequent appends are rejected). General sidecar
     /// writers capture only `closed_durable`; the close worker persists intent.
@@ -131,7 +134,7 @@ impl Shared {
 }
 
 pub struct Appender {
-    pub file: Arc<File>,
+    pub file: Arc<StreamFile>,
     pub written: u64,
 }
 
@@ -1185,9 +1188,11 @@ impl Store {
             }
         }
         // Drop orphan data files (no usable sidecar) — but NEVER a data file
-        // whose sidecar was quarantined above.
+        // whose sidecar was quarantined above. Build the retained-path index once
+        // so recovery stays linear in the stream count.
+        let kept: HashSet<&PathBuf> = metas.values().map(|(_, path)| path).chain(quarantined.iter()).collect();
         for p in data_files {
-            if !metas.values().any(|(_, dp)| *dp == p) && !quarantined.contains(&p) {
+            if !kept.contains(&p) {
                 let _ = std::fs::remove_file(&p);
             }
         }
@@ -1284,18 +1289,20 @@ impl Store {
         // then destroyed by reset_after_recovery: acked-data loss with no log
         // line. Boot must fail loudly instead; the operator fixes the resource
         // limit and the data is still intact.
-        let file = Arc::new(OpenOptions::new().read(true).append(true).open(data_path).unwrap_or_else(|e| {
+        let opened = OpenOptions::new().read(true).append(true).open(data_path).unwrap_or_else(|e| {
             panic!(
                 "recovery: cannot open stream data file {} ({e}); refusing \
                          to boot without it — skipping would let WAL reset destroy \
                          its acked records",
                 data_path.display()
             )
-        }));
-        let written = file
+        });
+        let written = opened
             .metadata()
             .unwrap_or_else(|e| panic!("recovery: cannot stat stream data file {} ({e})", data_path.display()))
             .len();
+        drop(opened);
+        let file = StreamFile::lazy(data_path.to_path_buf());
         // `file_base` is the live file's logical start. With a `pending_compaction`
         // intent and the durable temp promoted above, the live file IS the full
         // residual `[new_file_base, tail)` — so `file_base = new_file_base`, derived
@@ -1672,7 +1679,10 @@ impl Store {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let fname = format!("{}~{}", encode_path(path), id);
         let file_path = lane_dir(&self.data_dir, lane_of(&fname)).join(fname);
-        let file = Arc::new(OpenOptions::new().create_new(true).read(true).append(true).open(&file_path)?);
+        let file = StreamFile::from_open(
+            file_path.clone(),
+            OpenOptions::new().create_new(true).read(true).append(true).open(&file_path)?,
+        );
         let is_json = is_json_content_type(&config.content_type);
         let closed = config.create_closed;
         let (tail_tx, _) = watch::channel(Tail { bytes: base_offset, closed });
@@ -2380,9 +2390,8 @@ mod tier_tests {
     /// the appender file, bump `written` + `tail`. (Test-only shortcut around the
     /// HTTP handler.)
     async fn append_wire(st: &Arc<StreamState>, wire: &[u8]) {
-        use std::io::Write;
         let mut ap = st.appender.lock().await;
-        (&*ap.file).write_all(wire).unwrap();
+        ap.file.write_all(wire).unwrap();
         ap.written += wire.len() as u64;
         let mut s = st.shared.write().unwrap();
         let tail = s.file_base + ap.written;
@@ -3111,9 +3120,8 @@ mod tier_tests {
         // advances, but durability has NOT been published (WAL fsync pending).
         let wire = b"hello world";
         {
-            use std::io::Write;
             let mut ap = st.appender.lock().await;
-            (&*ap.file).write_all(wire).unwrap();
+            ap.file.write_all(wire).unwrap();
             ap.written += wire.len() as u64;
             let mut s = st.shared.write().unwrap();
             s.tail = s.file_base + ap.written;
@@ -4195,5 +4203,99 @@ mod meta_sweep_tests {
         hard.delete_fault.store(0, Ordering::Relaxed);
         store.delete_or_soft_delete_durable(&hard).unwrap();
         assert!(!store.streams.contains_key("hard"), "a durable hard delete removes the stream");
+    }
+}
+
+#[cfg(test)]
+mod recovery_scale_tests {
+    use super::*;
+    use crate::tier::TierConfig;
+
+    /// Streams in the scale test. Prod held ~245k in one flat `streams/` dir
+    /// when the quadratic orphan scan kept boot from finishing.
+    const STREAMS: u64 = 40_000;
+    /// Linear recovery of `STREAMS` takes a few seconds; the quadratic scan
+    /// took minutes at this size.
+    const RECOVER_BOUND: Duration = Duration::from_secs(30);
+
+    fn sidecar(id: u64, path: &str) -> Meta {
+        Meta {
+            id,
+            path: path.to_string(),
+            content_type: "application/octet-stream".into(),
+            ttl_seconds: None,
+            expires_at_unix: None,
+            expires_at_raw: None,
+            create_closed: false,
+            forked_from: None,
+            fork_offset_raw: None,
+            fork_sub_offset: None,
+            base_offset: 0,
+            closed: false,
+            closed_by: None,
+            producers: HashMap::new(),
+            last_seq_header: None,
+            last_access_unix: 0,
+            ref_count: 0,
+            soft_deleted: false,
+            segments: Vec::new(),
+            sealed_offset: 0,
+            file_base: None,
+            pending_compaction: None,
+            durable_tail: None,
+        }
+    }
+
+    #[test]
+    fn recovery_of_many_streams_is_linear_and_keeps_orphan_semantics() {
+        // The stream-lane count is process-global; the WAL lane tests change it
+        // under this guard, and a lane flip mid-test would misplace files.
+        let _durability = crate::handlers::test_support::DurabilityGuard::wal();
+        // A TempDir is removed on unwind too, so a failed run leaves no ~80k files.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        drop(Store::new_with_tier(dir.clone(), TierConfig::default()).unwrap());
+        let streams_dir = lane_dir(&dir, 0);
+
+        for id in 1..=STREAMS {
+            let path = format!("scale/stream-{id}");
+            let data = streams_dir.join(format!("{}~{id}", encode_path(&path)));
+            std::fs::write(&data, b"x").unwrap();
+            std::fs::write(meta_path(&data), serde_json::to_vec(&sidecar(id, &path)).unwrap()).unwrap();
+        }
+        // Orphan data files (no sidecar) are deleted; a quarantined sidecar's
+        // data file is kept.
+        let orphans: Vec<PathBuf> =
+            (0..8).map(|i| streams_dir.join(format!("orphan-{i}~{}", STREAMS + 100 + i))).collect();
+        for orphan in &orphans {
+            std::fs::write(orphan, b"orphan").unwrap();
+        }
+        let parked_id = STREAMS + 1_000;
+        let parked = streams_dir.join(format!("parked~{parked_id}"));
+        std::fs::write(&parked, b"parked").unwrap();
+        std::fs::write(meta_path(&parked).with_extension("meta.corrupt"), b"torn").unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let recover_dir = dir.clone();
+        // Recover on a worker so a superlinear scan fails at the bound instead
+        // of hanging the test run.
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let store = Store::new_with_tier(recover_dir, TierConfig::default());
+            let _ = tx.send((store, started.elapsed()));
+        });
+        let (store, elapsed) = rx
+            .recv_timeout(RECOVER_BOUND)
+            .unwrap_or_else(|_| panic!("recovering {STREAMS} streams did not finish within {RECOVER_BOUND:?}"));
+        let store = store.unwrap();
+        eprintln!("recovered {STREAMS} streams in {elapsed:?}");
+
+        assert_eq!(store.streams.len() as u64, STREAMS);
+        assert_eq!(store.streams.get("scale/stream-1").unwrap().tail().bytes, 1);
+        for orphan in &orphans {
+            assert!(!orphan.exists(), "orphan data file {} kept", orphan.display());
+        }
+        assert!(parked.exists(), "quarantined data file was deleted");
+        assert_eq!(store.quarantined_stream_ids().unwrap(), HashSet::from([parked_id]));
     }
 }

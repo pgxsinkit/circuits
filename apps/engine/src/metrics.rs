@@ -249,16 +249,19 @@ pub enum RestoreRetireReason {
     StreamClosed,
     /// A modern plain Created record never reached its durable Seeded/create ACK boundary.
     IncompleteCreate,
+    /// A persisted predicate uses a temporal literal the current compiler cannot evaluate.
+    UnreadableLiteral,
 }
 
 impl RestoreRetireReason {
-    pub const ALL: [RestoreRetireReason; 6] = [
+    pub const ALL: [RestoreRetireReason; 7] = [
         RestoreRetireReason::Schema,
         RestoreRetireReason::Subquery,
         RestoreRetireReason::TableGone,
         RestoreRetireReason::StreamMissing,
         RestoreRetireReason::StreamClosed,
         RestoreRetireReason::IncompleteCreate,
+        RestoreRetireReason::UnreadableLiteral,
     ];
 
     /// The label an operator sees: the `reason` attribute on Prometheus, the key suffix in JSON.
@@ -270,6 +273,7 @@ impl RestoreRetireReason {
             RestoreRetireReason::StreamMissing => "stream_missing",
             RestoreRetireReason::StreamClosed => "stream_closed",
             RestoreRetireReason::IncompleteCreate => "incomplete_create",
+            RestoreRetireReason::UnreadableLiteral => "unreadable_literal",
         }
     }
 }

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio_postgres::{Client, NoTls};
@@ -27,6 +28,38 @@ use crate::value::Row;
 /// A `connect_timeout` in the URL wins — an operator who set one meant it.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Query and replication sessions must print temporal cells identically, independent of role,
+/// database and server defaults. Later startup options override earlier URL options.
+pub(crate) const SESSION_OPTIONS: &str = "-c TimeZone=UTC -c DateStyle=ISO";
+
+fn query_config(url: &str) -> Result<tokio_postgres::Config> {
+    let mut cfg = parse_pg_url(url)?;
+    if cfg.get_connect_timeout().is_none() {
+        cfg.connect_timeout(CONNECT_TIMEOUT);
+    }
+    let options = match cfg.get_options() {
+        Some(own) if !own.trim().is_empty() => format!("{own} {SESSION_OPTIONS}"),
+        _ => SESSION_OPTIONS.to_string(),
+    };
+    cfg.options(options);
+    Ok(cfg)
+}
+
+fn check_query_session(time_zone: Option<&str>, date_style: Option<&str>) -> Result<()> {
+    let iso = date_style
+        .is_some_and(|style| style.split(',').next().is_some_and(|output| output.trim().eq_ignore_ascii_case("ISO")));
+    if time_zone.is_some_and(|zone| zone.eq_ignore_ascii_case("UTC")) && iso {
+        return Ok(());
+    }
+    bail!(
+        "Postgres did not accept the engine's startup options ({SESSION_OPTIONS}): TimeZone={} and \
+         DateStyle={}. Every query and replication session must print UTC in ISO style. Connect to \
+         Postgres directly or configure the pooler to pass the options startup parameter through.",
+        time_zone.unwrap_or("(not reported)"),
+        date_style.unwrap_or("(not reported)"),
+    )
+}
+
 /// Connect and drive the connection on a background task. Returns the query `Client`.
 /// For per-request work (backfills, query-backs, subset queries) prefer [`pool_for`] — a fresh
 /// TCP+auth handshake per shape creation is the fleet benchmark's p99 driver, and thousands of
@@ -35,11 +68,9 @@ pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// The pool dials through here too, so the boot connection and every pooled one share one config
 /// path — including the connect timeout.
 pub async fn connect(url: &str) -> Result<Client> {
-    let mut cfg = parse_pg_url(url)?;
-    if cfg.get_connect_timeout().is_none() {
-        cfg.connect_timeout(CONNECT_TIMEOUT);
-    }
+    let cfg = query_config(url)?;
     let (client, conn) = cfg.connect(NoTls).await.context("connect postgres")?;
+    check_query_session(conn.parameter("TimeZone"), conn.parameter("DateStyle"))?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             tracing::error!("postgres connection error: {e}");
@@ -134,6 +165,7 @@ pub fn failure_name(f: PgFailure<'_>) -> &'static str {
         Some("28000") | Some("28P01") => "authentication failed",
         Some("42501") => "insufficient privilege",
         Some("3D000") => "unknown database",
+        Some("55P03") => "a Postgres lock wait timed out",
         Some("57P03") => "the database system is starting up",
         Some(_) => "Postgres refused a boot statement",
         None if f.io => "Postgres is unreachable",
@@ -167,6 +199,9 @@ pub fn failure_of(e: &tokio_postgres::Error) -> PgFailure<'_> {
 /// could not read — is fatal: those are the strictness refusals the engine already refused to boot
 /// past, and none of them changes by waiting.
 pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
+    if e.downcast_ref::<IdentityChangedDuringBoot>().is_some() {
+        return BootFailure::Retryable;
+    }
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return classify(failure_of(pg));
     }
@@ -200,6 +235,9 @@ pub fn boot_disposition(e: &anyhow::Error) -> BootFailure {
 /// publication with a column list, a `wal_level` that is not `logical`, an unreadable durable
 /// catalog — and none of them is transient.
 pub fn boot_failure_name(e: &anyhow::Error) -> &'static str {
+    if e.downcast_ref::<IdentityChangedDuringBoot>().is_some() {
+        return "a migration changed a table's replica identity during boot";
+    }
     if let Some(pg) = e.chain().find_map(|c| c.downcast_ref::<tokio_postgres::Error>()) {
         return failure_name(failure_of(pg));
     }
@@ -622,16 +660,46 @@ pub async fn introspect_opt(client: &Client, table: &TableRef) -> Result<Option<
     Ok(Some(TableDef { columns, primary_key, fingerprint: Some(fingerprint) }))
 }
 
-/// `ALTER TABLE … REPLICA IDENTITY FULL` so logical decoding carries the full old row. Used at
-/// boot, where waiting for the lock is the right thing to do.
-pub async fn ensure_replica_identity_full(client: &Client, table: &TableRef) -> Result<()> {
-    client
-        .batch_execute(&format!("ALTER TABLE {} REPLICA IDENTITY FULL", table.quote_qualified()))
+#[derive(Debug, thiserror::Error)]
+#[error("table '{0}' lost REPLICA IDENTITY FULL while the engine was starting")]
+struct IdentityChangedDuringBoot(TableRef);
+
+const BOOT_IDENTITY_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Introspect the definition that boot will serve. An unnecessary ALTER queues an exclusive lock
+/// behind existing readers, blocking later readers even while the ALTER waits.
+pub(crate) async fn introspect_for_boot(client: &Client, table: &TableRef) -> Result<TableDef> {
+    let has_full_identity =
+        |def: &TableDef| def.fingerprint.as_ref().is_some_and(|f| f.replident == crate::schema::REPLICA_IDENTITY_FULL);
+    let def = introspect(client, table).await?;
+    if has_full_identity(&def) {
+        return Ok(def);
+    }
+
+    let result = client
+        .batch_execute(&replica_identity_sql(table, BOOT_IDENTITY_LOCK_TIMEOUT))
         .await
-        .with_context(|| format!("set REPLICA IDENTITY FULL on {table}"))
+        .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {BOOT_IDENTITY_LOCK_TIMEOUT:?})"));
+    if result.is_err() {
+        let _ = client.batch_execute("ROLLBACK").await;
+    }
+    result?;
+    let def = introspect(client, table).await?;
+    if !has_full_identity(&def) {
+        return Err(IdentityChangedDuringBoot(table.clone()).into());
+    }
+    Ok(def)
 }
 
-/// [`ensure_replica_identity_full`] with a bounded wait for the `ACCESS EXCLUSIVE` lock.
+fn replica_identity_sql(table: &TableRef, lock_timeout: Duration) -> String {
+    format!(
+        "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
+        lock_timeout.as_millis().max(1),
+        table.quote_qualified()
+    )
+}
+
+/// Set FULL identity with a bounded wait for the `ACCESS EXCLUSIVE` lock.
 ///
 /// The drift handler runs INLINE in the ingestor: an unbounded lock wait there would stall the
 /// whole replication stream — every table's — behind one long-running reader of this one. With
@@ -644,11 +712,7 @@ pub async fn ensure_replica_identity_full_bounded(
 ) -> Result<()> {
     client.transaction_started();
     let result = client
-        .batch_execute(&format!(
-            "BEGIN; SET LOCAL lock_timeout = '{}ms'; ALTER TABLE {} REPLICA IDENTITY FULL; COMMIT;",
-            lock_timeout.as_millis().max(1),
-            table.quote_qualified()
-        ))
+        .batch_execute(&replica_identity_sql(table, lock_timeout))
         .await
         .with_context(|| format!("set REPLICA IDENTITY FULL on {table} (lock_timeout {lock_timeout:?})"));
     if result.is_ok() {
@@ -1455,6 +1519,31 @@ pub fn lsn_to_u64(lsn: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_sessions_override_url_zone_and_style_at_startup() {
+        let cfg = query_config("postgres://u:p@127.0.0.1/db?options=-cTimeZone%3DAsia/Kolkata").unwrap();
+        assert_eq!(cfg.get_options(), Some("-cTimeZone=Asia/Kolkata -c TimeZone=UTC -c DateStyle=ISO"));
+        assert_eq!(cfg.get_connect_timeout(), Some(&CONNECT_TIMEOUT));
+    }
+
+    #[test]
+    fn query_sessions_refuse_stripped_temporal_startup_options() {
+        for style in ["ISO, MDY", "ISO, DMY", "ISO, YMD", "ISO"] {
+            assert!(check_query_session(Some("UTC"), Some(style)).is_ok());
+        }
+        for (zone, style) in [
+            (Some("America/Los_Angeles"), Some("ISO, MDY")),
+            (Some("Etc/UTC"), Some("ISO, MDY")),
+            (Some("UTC"), Some("German, DMY")),
+            (None, Some("ISO, MDY")),
+            (Some("UTC"), None),
+        ] {
+            let error = check_query_session(zone, style).unwrap_err();
+            assert_eq!(boot_disposition(&error), BootFailure::Fatal);
+            assert!(error.to_string().contains("startup options"));
+        }
+    }
 
     /// The snapshot gate must skip exactly the transactions the backfill snapshot could see:
     /// committed-before (`xid < xmin`) → skip; in-progress at snapshot (`xip`) → process; started

@@ -426,6 +426,53 @@ fn circuit_agg_planner() {
     );
 }
 
+/// A counts-pipeline key is matched against cells as text, like every other literal, so a key on
+/// a timestamp column is held in the cells' own spelling: Postgres's output for that instant. A
+/// literal the engine cannot read is not a key at all — the aggregate is not served from counts,
+/// and its predicate's own compile refuses it.
+#[test]
+fn circuit_agg_planner_spells_timestamp_keys_as_postgres_prints_them() {
+    let mut def: TableDef = serde_json::from_value(serde_json::json!({
+        "columns": { "id": {"type":"int"}, "starts": {"type":"text"} }, "primaryKey": "id"
+    }))
+    .unwrap();
+    def.columns.get_mut("starts").unwrap().pg_type = Some("timestamptz".into());
+    let ts = TableSchema::from_def(&"events".into(), &def).unwrap();
+    let group_cols = vec![ts.column_index("starts").unwrap()];
+    let p = |j: serde_json::Value| -> PredicateJson { serde_json::from_value(j).unwrap() };
+    let keys = |literals: &[&str]| -> Option<std::collections::HashSet<Value>> {
+        Some(literals.iter().map(|literal| Value::Text((*literal).into())).collect())
+    };
+
+    let one = plan_circuit_agg(
+        Some(&p(serde_json::json!({"col":"starts","op":"eq","value":"2026-10-19T07:00:00Z"}))),
+        &ts,
+        &group_cols,
+    )
+    .unwrap();
+    assert_eq!(one, vec![keys(&["2026-10-19 07:00:00+00"])]);
+
+    let several = plan_circuit_agg(
+        Some(&p(serde_json::json!({"or":[
+            {"col":"starts","op":"eq","value":"2026-10-19T00:00:00-07:00"},
+            {"col":"starts","op":"eq","value":"2026-10-20T07:00:00.500Z"}
+        ]}))),
+        &ts,
+        &group_cols,
+    )
+    .unwrap();
+    assert_eq!(several, vec![keys(&["2026-10-19 07:00:00+00", "2026-10-20 07:00:00.5+00"])]);
+
+    assert!(
+        plan_circuit_agg(
+            Some(&p(serde_json::json!({"col":"starts","op":"eq","value":"2026-10-19 07:00:00 PST"}))),
+            &ts,
+            &group_cols,
+        )
+        .is_none()
+    );
+}
+
 fn users() -> TableSchema {
     let def: TableDef = serde_json::from_value(serde_json::json!({
         "columns": { "id": {"type":"int"}, "name": {"type":"text"}, "active": {"type":"bool"} },

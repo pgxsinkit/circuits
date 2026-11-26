@@ -1279,7 +1279,6 @@ async fn e2e_forked_stream_full_http_path_recovers_correctly() {
 #[tokio::test]
 async fn strict_created_dir_reopens_wal_only_without_data_loss() {
     let _guard = DurabilityGuard::wal();
-    use std::io::Write;
     let dir = temp_dir("strict-compat");
 
     // --- Phase 1: write data directly to per-stream files (no WAL), simulating
@@ -1319,7 +1318,7 @@ async fn strict_created_dir_reopens_wal_only_without_data_loss() {
         // Append bytes directly to the per-stream file (no WAL).
         {
             let mut ap = st.appender.lock().await;
-            (&*ap.file).write_all(b"hello-world").unwrap();
+            ap.file.write_all(b"hello-world").unwrap();
             ap.written += 11;
             let mut s = st.shared.write().unwrap();
             s.tail = s.file_base + ap.written;

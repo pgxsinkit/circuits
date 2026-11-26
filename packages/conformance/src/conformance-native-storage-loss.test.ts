@@ -7,7 +7,7 @@ import type { Schema } from "@circuits/protocol";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createShape, foldStream, pgQuery } from "./engine-native.js";
-import { bootHarness, drainEngine, type Harness } from "./harness.js";
+import { bootHarness, drainEngine, type Harness, spawnRawEngine } from "./harness.js";
 
 const schema: Schema = {
   tables: {
@@ -33,6 +33,8 @@ interface AppendFault {
   headHits?: number;
   /** Answer this many further `HEAD`s on `/shape/*` with `headStatus`, one after another. */
   headFailures?: number;
+  missingReadPath?: string;
+  missingReadHits?: number;
 }
 
 function oneShotShapeAppendProxy(fault: AppendFault) {
@@ -40,6 +42,13 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
     const upstream = new URL(upstreamUrl);
     const server = createServer((incoming, outgoing) => {
       const target = new URL(incoming.url ?? "/", upstream);
+      if (incoming.method === "GET" && target.pathname === fault.missingReadPath) {
+        fault.missingReadPath = undefined;
+        fault.missingReadHits = (fault.missingReadHits ?? 0) + 1;
+        outgoing.writeHead(404);
+        outgoing.end();
+        return;
+      }
       const failHead = fault.headArmed || (fault.headFailures ?? 0) > 0;
       if (failHead && incoming.method === "HEAD" && target.pathname.startsWith("/shape/")) {
         if (fault.headArmed) fault.headArmed = false;
@@ -86,6 +95,88 @@ function oneShotShapeAppendProxy(fault: AppendFault) {
 }
 
 describe("native shape storage loss", () => {
+  it("keeps replaying after a false 404 on a change-log GET", async () => {
+    const fault: AppendFault = { armed: false, status: 404, hits: 0 };
+    h = await bootHarness(schema, { wrapEngineDs: oneShotShapeAppendProxy(fault) });
+    const shape = await createShape(h, { table: "items" });
+    fault.missingReadPath = "/changes/0";
+    // Wake the in-flight poll, then have the proxy reject the next read of the same segment.
+    await pgQuery(h, "INSERT INTO items (id, payload) VALUES (1, 'wake')");
+    await expect.poll(() => fault.missingReadHits, { timeout: 10000 }).toBe(1);
+    await pgQuery(h, "INSERT INTO items (id, payload) VALUES (2, 'after')");
+    await drainEngine(h);
+    expect((await fetch(`${h.engineUrl}/ready`)).status).toBe(200);
+    expect((await foldStream(shape.streamUrl)).has("2")).toBe(true);
+  });
+
+  it("parks replay and refuses new shapes when storage confirms loss of the live change-log segment", async () => {
+    const harness = await bootHarness(schema);
+    h = harness;
+    const segment = `${harness.dsUrl}/changes/0`;
+    expect((await fetch(segment, { method: "DELETE" })).ok).toBe(true);
+    await expect.poll(async () => (await fetch(`${harness.engineUrl}/ready`)).status, { timeout: 10000 }).toBe(503);
+    expect((await fetch(`${harness.engineUrl}/health`)).status).toBe(200);
+    const replication = await fetch(`${harness.engineUrl}/replication/lsn`);
+    expect(await replication.json()).toMatchObject({ epoch: { state: "broken", reason: "change_log_missing" } });
+    const create = await fetch(`${harness.engineUrl}/shapes`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ table: "items" }),
+    });
+    expect(create.status).toBe(503);
+    expect(await create.text()).toContain("restore the missing change-log segment");
+    expect((await fetch(`${harness.engineUrl}/epoch/reset`, { method: "POST" })).status).toBe(503);
+    expect((await fetch(segment, { method: "HEAD" })).status).toBe(404);
+  });
+
+  it("does not advance past a closed segment whose successor is missing", async () => {
+    const harness = await bootHarness(schema);
+    h = harness;
+    const segment = `${harness.dsUrl}/changes/0`;
+    expect((await fetch(segment, { method: "POST", headers: { "stream-closed": "true" } })).ok).toBe(true);
+    await expect.poll(async () => (await fetch(`${harness.engineUrl}/ready`)).status, { timeout: 10000 }).toBe(503);
+    expect((await fetch(`${harness.dsUrl}/changes/1`, { method: "HEAD" })).status).toBe(404);
+    expect(harness.engineStderr()).toContain("changes/0 is closed but its successor changes/1 does not exist");
+  });
+
+  it("refuses boot when an intermediate segment in the required replay chain is absent", async () => {
+    const harness = await bootHarness(schema);
+    h = harness;
+    harness.signalEngine();
+    expect((await harness.waitForEngineExit()).code).toBe(0);
+
+    // Model storage losing segment 1 after the writer advanced to 2 while the checkpoint still
+    // names 0. The catalog retains both rotation records and both end segments are present.
+    const headers = { "content-type": "application/json" };
+    expect((await fetch(`${harness.dsUrl}/changes/2`, { method: "PUT", headers })).ok).toBe(true);
+    const at = Math.floor(Date.now() / 1000);
+    const rotationRecords = [1, 2].map((segment) => ({ t: "changesRotated", eid: crypto.randomUUID(), segment, at }));
+    expect(
+      (
+        await fetch(`${harness.dsUrl}/meta/catalog`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(rotationRecords),
+        })
+      ).ok,
+    ).toBe(true);
+
+    const candidate = spawnRawEngine({
+      CIRCUITS_PG_URL: harness.pgUrl,
+      CIRCUITS_PG_TABLES: "items",
+      CIRCUITS_PG_SLOT: harness.slot,
+      CIRCUITS_DS_URL: harness.dsUrl,
+      CIRCUITS_BIND: "127.0.0.1:0",
+    });
+    try {
+      expect((await candidate.waitForExit(10000)).code).toBe(78);
+      expect(candidate.stderr()).toContain("required segment changes/1 is missing");
+      expect((await fetch(`${harness.dsUrl}/changes/1`, { method: "HEAD" })).status).toBe(404);
+    } finally {
+      candidate.signal("SIGKILL");
+    }
+  });
+
   it("does not silently lose a PostgreSQL change after one false 404 from the shape-stream service", async () => {
     const fault: AppendFault = { armed: false, status: 404, hits: 0 };
     h = await bootHarness(schema, {

@@ -28,6 +28,7 @@ pub mod mem;
 pub mod metrics;
 pub mod pending_buffer;
 pub mod pg;
+mod pg_temporal;
 pub mod pgoutput;
 pub mod pk_dict;
 pub mod predicate;

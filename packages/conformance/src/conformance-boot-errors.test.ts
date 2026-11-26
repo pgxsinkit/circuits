@@ -162,6 +162,42 @@ async function waitForStderr(e: RawEngine, text: string, timeoutMs = 20000): Pro
 }
 
 describe("boot-time error taxonomy", () => {
+  it("boots past a reader holding a lock on a table whose replica identity is already FULL", async () => {
+    const pgUrl = await scratchDbUrl();
+    const reader = new pgpkg.Client({ connectionString: pgUrl });
+    await reader.connect();
+    try {
+      await reader.query("BEGIN; LOCK TABLE items IN ACCESS SHARE MODE");
+      const e = await spawnAgainst(pgUrl);
+      const url = await e.waitForListening(10000);
+      expect((await fetch(`${url}/ready`)).status).toBe(200);
+    } finally {
+      await reader.end();
+    }
+  });
+
+  it("times out a queued replica identity ALTER and retries once the conflicting lock is released", async () => {
+    const pgUrl = await scratchDbUrl();
+    const reader = new pgpkg.Client({ connectionString: pgUrl });
+    await reader.connect();
+    try {
+      await reader.query("ALTER TABLE items REPLICA IDENTITY DEFAULT");
+      await reader.query("BEGIN; LOCK TABLE items IN ACCESS SHARE MODE");
+      const e = await spawnAgainst(pgUrl);
+      const url = await e.waitForBinding();
+      await waitForStderr(e, "a Postgres lock wait timed out", 10000);
+      expect(e.stderr()).toContain("set REPLICA IDENTITY FULL on public.items");
+      expect((await fetch(`${url}/ready`)).status).toBe(503);
+      await reader.query("COMMIT");
+      await e.waitForListening(10000);
+      expect(
+        (await reader.query("SELECT relreplident::text FROM pg_class WHERE oid = 'items'::regclass")).rows,
+      ).toEqual([{ relreplident: "f" }]);
+    } finally {
+      await reader.end();
+    }
+  });
+
   it("exits 78 quickly with a named message when authentication is refused", async () => {
     const e = await spawnAgainst(badRoleUrl());
     const exit = await e.waitForExit(20000);

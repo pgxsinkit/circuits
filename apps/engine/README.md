@@ -602,8 +602,10 @@ catalog's segment closed and walks forward to the open one, writing the record t
 the **writer** walks: a reader that finds its segment closed steps to exactly the next one, because
 everything in between is changes it has not read. A closed segment with **no** successor cannot be
 produced by the engine (rotation creates the successor first), so that state is refused loudly rather
-than skipped past — as is a boot whose restored position, or whose recorded current segment, names a
-stream storage no longer has.
+than skipped past. Boot verifies all segments from the restored checkpoint through the current
+writer. A live GET that reports a missing segment is confirmed with HEAD. Confirmed loss parks
+replay, reports `change_log_missing` on `/replication/lsn`, and withdraws readiness. Restore the
+missing storage before restarting the engine.
 
 ### Large transactions
 
@@ -616,9 +618,9 @@ did), measures them as held memory, and once that reaches `CIRCUITS_TXN_MEMORY_B
 serializes the whole buffer out to one temporary file under `CIRCUITS_TXN_SPILL_DIR`
 (newline-delimited JSON, mode 0600 in a 0700 directory), releases the memory, and writes every
 further change of that transaction straight to the file. Peak **ingestor** memory is then the cap
-plus one chunk, for a transaction of any size — a bound on the ingestor, not on the engine: the
-sequencer's read page, the run it holds, and its per-transaction pending appends are still bounded by
-the transaction's size. **Transaction size never invalidates anything** — there is no fail-loud
+plus one chunk. The sequencer holds incomplete input under `CIRCUITS_PENDING_MEMORY_BYTES` and uses
+`CIRCUITS_PENDING_SPILL_DIR` on overflow. Read pages and staged transaction output have separate
+memory costs. **Transaction size never invalidates anything** — there is no fail-loud
 branch, no shape is retired and nothing is purged for being big. The spill directory is probed at
 boot; an unwritable one refuses the boot rather than failing every large commit.
 

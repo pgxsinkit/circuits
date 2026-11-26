@@ -104,6 +104,15 @@ impl Value {
         Value::from_json(j, ty)
     }
 
+    /// Type a predicate literal and normalize temporal values to the column's Postgres text form.
+    /// Unsupported temporal forms are refused so SQL snapshots and live evaluation agree.
+    pub fn literal_for_column(j: &serde_json::Value, ty: ColumnType, pg_type: Option<&str>) -> Result<Value> {
+        Ok(match (Self::literal_from_json(j, ty)?, pg_type) {
+            (Value::Text(s), Some(pg_type)) => Value::Text(crate::pg_temporal::literal_for(&s, pg_type)?.unwrap_or(s)),
+            (v, _) => v,
+        })
+    }
+
     /// Parse a stringified primary-key (the durable-stream event `key`) into a typed `Value`.
     pub fn from_key_string(s: &str, ty: ColumnType) -> Result<Value> {
         Ok(match ty {

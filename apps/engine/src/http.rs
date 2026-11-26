@@ -985,7 +985,9 @@ impl From<anyhow::Error> for AppError {
             StatusCode::CONFLICT
         } else if e.downcast_ref::<crate::retention::ShapeReplayRetired>().is_some() {
             StatusCode::NOT_FOUND
-        } else if e.downcast_ref::<crate::schema::RequestError>().is_some() {
+        } else if e.downcast_ref::<crate::schema::RequestError>().is_some()
+            || e.downcast_ref::<crate::pg_temporal::UnreadableLiteral>().is_some()
+        {
             StatusCode::BAD_REQUEST
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -1060,6 +1062,20 @@ mod tests {
             AppError::from(anyhow::anyhow!("unknown column 'missing' from a database failure")).status,
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    #[test]
+    fn unsupported_temporal_literals_are_client_errors() {
+        let response = AppError::from(
+            anyhow::Error::new(crate::pg_temporal::UnreadableLiteral {
+                literal: "tomorrow".into(),
+                pg_type: "timestamptz".into(),
+            })
+            .context("predicate on column 'starts'"),
+        );
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert!(response.msg.contains("'starts'") && response.msg.contains("tomorrow"));
+        assert_eq!(response.retry_after, None);
     }
 
     #[test]

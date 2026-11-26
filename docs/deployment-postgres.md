@@ -66,11 +66,35 @@ export CIRCUITS_BIND="0.0.0.0:9000"
 
 On startup the engine waits while another backend owns its replication slot, keeping `/ready` and
 shape admission at `503`. Once the slot is idle, it reads the current durable catalog, resolves table
-selectors, sets `REPLICA IDENTITY FULL`, introspects the tables, restores shapes, and starts the
-ingestor. It prints `ENGINE_LISTENING <addr>` once ready. The slot check is a startup guard; keep one
-replica per catalog and use `Recreate` as below.
+selectors, introspects the tables, restores shapes, and starts the ingestor. A table already using
+`REPLICA IDENTITY FULL` needs no ALTER. For other tables, the engine bounds the exclusive lock
+wait to two seconds and retries startup after a timeout. It reads the table definition again after
+the ALTER. It prints `ENGINE_LISTENING <addr>` once ready. Keep one replica per catalog and use
+`Recreate` as below.
 
 ### Configuration reference
+
+Every query and logical replication connection requests `TimeZone=UTC` and `DateStyle=ISO` at
+startup. These settings override database and role defaults, including options in the query URL.
+Query connections verify the server accepted them. Connect directly to Postgres or configure a
+pooler to pass the startup `options` parameter through on both connection types.
+
+Timestamp and date predicate literals accept years 0001–9999 AD in ISO dates or ISO date-times,
+UTC names and numeric offsets, plus infinities. Finite timestamp/date range predicates currently
+require stored values in that same four-digit AD range because their indexes and evaluator compare
+canonical text. BC and expanded-year cells can be transmitted but their range ordering is outside
+this predicate contract. Timestamp fractions are rounded to PostgreSQL's microsecond precision;
+the stored column's precision modifier still controls the cell's own precision.
+Values are normalized to Postgres text form before live evaluation. Unsupported literals, including
+named regional time zones, and comparisons against timestamp/date arrays or ranges return `400`.
+Text columns retain their ordinary string semantics.
+
+When prior query or replication sessions printed temporal cells outside UTC ISO form, prepare fresh
+engine catalog, change-log and derived state and rehydrate clients from Postgres. Retained input
+change-log records also contain the earlier bytes, so recreating only shape streams cannot make
+their replay safe against fresh UTC state. When previous input already used UTC ISO form but raw
+temporal predicates selected the wrong membership, recreate the affected shapes and client
+snapshots. Restore retires predicates with unsupported literals so the rest of the catalog can resume.
 
 | Variable                                 | Required | Default                               | Meaning                                                                                                                                                                                                                                     |
 | ---------------------------------------- | :------: | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

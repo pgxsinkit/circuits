@@ -719,6 +719,12 @@ fn unrestorable(
     if rec.is_subquery {
         return Some((Reason::Subquery, "subquery inner-node state is not persisted".to_string()));
     }
+    if let Some(ts) = compiled.get(&rec.table)
+        && let Err(error) = CompiledPredicate::compile_opt(rec.where_json.as_ref(), ts)
+        && error.downcast_ref::<crate::pg_temporal::UnreadableLiteral>().is_some()
+    {
+        return Some((Reason::UnreadableLiteral, format!("its temporal predicate cannot be evaluated ({error:#})")));
+    }
     None
 }
 
@@ -2532,6 +2538,31 @@ mod tests {
     fn catalog(mut events: Vec<CatalogEvent>) -> CatalogFold {
         events.push(CatalogEvent::Offset { pos: pos(0, "10"), highwater: None });
         fold_of(events)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restore_retires_unreadable_temporal_predicates_and_keeps_supported_ones() {
+        let mut def: crate::schema::TableDef = serde_json::from_value(serde_json::json!({
+            "columns": { "id": {"type":"int"}, "starts": {"type":"text"} }, "primaryKey": "id"
+        }))
+        .unwrap();
+        def.columns.get_mut("starts").unwrap().pg_type = Some("timestamptz".into());
+        let ts = TableSchema::from_def(&users(), &def).unwrap();
+        let compiled = [(users(), ts)].into_iter().collect();
+        let mut events = Vec::new();
+        for (id, bound) in [("s1", "2026-10-19T07:00:00Z"), ("s2", "2026-10-19 07:00:00 PST")] {
+            let mut created = serde_json::to_value(shape(id, "public.users")).unwrap();
+            created["rec"]["where_json"] = serde_json::json!({"col":"starts", "op":"gte", "value":bound});
+            events.push(serde_json::from_value(created).unwrap());
+            events.push(dormant(id));
+        }
+        let server = FakeDs::start().await;
+        let engine = Engine::new(DsClient::new(server.url()));
+        engine.apply_catalog(catalog(events), &compiled, RestoreMode::Resume).await.unwrap();
+        assert_eq!(shape_ids(&*engine.state.lock().await), ["s1"]);
+        assert!(engine.catalog_tx.drain(std::time::Duration::from_secs(20)).await);
+        assert_eq!(kinds_for(&server, "s2"), ["dropped", "retired"]);
+        assert!(kinds_for(&server, "s1").is_empty());
     }
 
     #[test]

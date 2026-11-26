@@ -363,7 +363,11 @@ impl Reactor {
                 // delivered as several data/control pairs (with `up_to_date`
                 // false until the last one), and `backlog(sub) > PENDING_CAP`
                 // still governs a subscriber that cannot keep up.
-                let Some((end, data)) = read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding) else {
+                let Some((end, data)) = file
+                    .get()
+                    .ok()
+                    .and_then(|file| read_capped_frame(&file, file_base, sub.write_off, tail, sub.encoding))
+                else {
                     sub.done = true;
                     frame_terminator(&mut sub.pending);
                     return;

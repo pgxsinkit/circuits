@@ -155,7 +155,7 @@ struct CheckpointStream {
     stream: Arc<StreamState>,
     tail: u64,
     sequence: Option<String>,
-    file: Arc<std::fs::File>,
+    file: Arc<crate::stream_file::StreamFile>,
 }
 
 /// A durable accepted prefix and the greatest Stream-Seq inside that prefix.
@@ -975,10 +975,30 @@ impl Shard {
             //    records that were the only durable copy (acked-data loss).
             //    Nothing acked is at risk at abort time: acks never gate on the
             //    checkpoint, and the WAL still holds every record.
+            // Reopening can fail before any barrier runs. That leaves the WAL
+            // intact and lets the caller re-register this checkpoint's dirty set.
+            // Only an actual sync failure consumes writeback errors and is fatal.
             let barrier = if cfg!(target_os = "linux") && n_touched > 0 {
-                crate::store::syncfs_stream_lanes(&touched[0].file)
+                match touched.iter().find(|entry| !entry.stream.wal_retired()) {
+                    Some(entry) => {
+                        let file = entry.file.get()?;
+                        crate::store::syncfs_stream_lanes(&file)
+                    }
+                    None => Ok(()),
+                }
             } else {
-                touched.iter().try_for_each(|entry| crate::store::barrier_fsync(&entry.file))
+                let mut result = Ok(());
+                for entry in &touched {
+                    if entry.stream.wal_retired() {
+                        continue;
+                    }
+                    let file = entry.file.get()?;
+                    if let Err(error) = crate::store::barrier_fsync(&file) {
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
             };
             if let Err(e) = barrier {
                 eprintln!(
@@ -2089,7 +2109,7 @@ mod tests {
         let l1 = sh.reserve_and_stage(RecordKind::Append, sid, 0, b"hello").unwrap();
         let l2 = sh.reserve_and_stage(RecordKind::Append, sid, 5, b"world").unwrap();
         {
-            let f = Arc::clone(&st.shared.read().unwrap().file);
+            let f = st.shared.read().unwrap().file.get().unwrap();
             use std::io::Write;
             (&*f).write_all(b"helloworld").unwrap();
             // Reflect the written bytes in the logical tail so checkpoint records it.
@@ -2159,6 +2179,47 @@ mod tests {
         assert!(seg_path(dir.path(), 1).exists(), "WAL segment retained (not recycled)");
 
         h.stop();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_retries_a_closed_file_reopen_without_recycling_its_wal() {
+        let dir = temp_dir("checkpoint-reopen");
+        let wal = super::super::walset::WalSet::open_with_segment_size(dir.path(), Some(1), 1, 4096).unwrap();
+        let sh = &wal.shards()[0];
+        let committer = sh.spawn_committer();
+        let store = Arc::new(
+            crate::store::Store::new_with_tier(dir.path().to_path_buf(), crate::tier::TierConfig::default()).unwrap(),
+        );
+        store.wal.set(wal.clone()).unwrap_or_else(|_| panic!("WAL already attached"));
+        let st = match store.create("reopen", ckpt_test_cfg(), None, 0).unwrap() {
+            crate::store::CreateResult::Created(st) => st,
+            _ => panic!("create failed"),
+        };
+        write_checkpoint_test_record(sh, &st, b"retained-wal").await;
+
+        // Model an idle-evicted handle without touching other tests' pool entries.
+        // The accepted-byte capture still sees the same file and logical tail.
+        {
+            let mut appender = st.appender.lock().await;
+            let lazy = crate::stream_file::StreamFile::lazy(st.file_path.clone());
+            st.shared.write().unwrap().file = lazy.clone();
+            appender.file = lazy;
+        }
+        let parked = st.file_path.with_extension("temporarily-unavailable");
+        std::fs::rename(&st.file_path, &parked).unwrap();
+        let wal_size = sh.wal_size_bytes();
+
+        assert!(sh.checkpoint().await.is_err(), "an unavailable data file must fail the checkpoint");
+        assert!(sh.is_dirty(st.id), "failed reopening retains the dirty stream for retry");
+        assert_eq!(sh.wal_size_bytes(), wal_size, "no WAL was recycled before a durability barrier");
+        assert!(!sh.dir().join(CHECKPOINT_FILE).exists());
+
+        std::fs::rename(&parked, &st.file_path).unwrap();
+        sh.checkpoint().await.unwrap();
+        assert!(!sh.is_dirty(st.id));
+        assert_eq!(sh.read_durable_tails().unwrap(), HashMap::from([(st.id, 12)]));
+        assert_eq!(std::fs::read(&st.file_path).unwrap(), b"retained-wal");
+        committer.stop();
     }
 
     #[tokio::test]
@@ -2296,7 +2357,7 @@ mod tests {
         use std::io::Write;
         let (file, offset) = {
             let s = st.shared.read().unwrap();
-            (Arc::clone(&s.file), s.tail)
+            (s.file.get().unwrap(), s.tail)
         };
         (&*file).write_all(bytes).unwrap();
         st.shared.write().unwrap().tail = offset + bytes.len() as u64;

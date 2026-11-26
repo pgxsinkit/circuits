@@ -281,9 +281,21 @@ impl CompiledPredicate {
         Ok(match p {
             PredicateJson::Leaf { col, op, value } => {
                 let idx = ts.column_index(col)?;
-                // A string leaf literal coerces to the column type — Postgres unknown-literal
-                // semantics.
-                let v = Value::literal_from_json(value, ts.column_type(idx))?;
+                // Leaf literals (incl. substituted `$N` param values, always strings) coerce to the
+                // column type — Postgres unknown-literal semantics. A timestamp/date
+                // literal is also respelled as a cell of that column is, and one the engine cannot
+                // read is refused here rather than compared as text (see `pg_temporal`); a `LIKE`
+                // pattern is text whatever the column, and is never rewritten.
+                let v = if *op == LeafOp::Like {
+                    Value::literal_from_json(value, ts.column_type(idx))?
+                } else {
+                    Value::literal_for_column(value, ts.column_type(idx), ts.pg_type_of(col)).map_err(|e| {
+                        match ts.pg_type_of(col) {
+                            Some(declared) => e.context(format!("predicate on column '{col}' ({declared})")),
+                            None => e.context(format!("predicate on column '{col}'")),
+                        }
+                    })?
+                };
                 CompiledPredicate::Cmp { col: idx, op: *op, value: v }
             }
             PredicateJson::IsNull { col, is_null } => {
@@ -1033,5 +1045,299 @@ mod tests {
         assert!(like_match("abc", "%"));
         assert!(like_match("abc", "abc"));
         assert!(!like_match("abcd", "abc"));
+    }
+    // --- timestamp literals --------------------------------------------------------------------
+    //
+    // A `timestamptz` column is coarse `Text` here: its cells are Postgres's own text output
+    // (`2026-10-19 16:00:00+00`), and the engine compares text in code-point order. Postgres
+    // compares the same predicate as instants (the backfill and every subset page run it in SQL),
+    // so a literal in any other spelling of the same instant makes the live path disagree with the
+    // snapshot the client was just handed. The app sends ISO 8601 (`2026-10-19T07:00:00Z`): 'T'
+    // sorts after ' ', so every cell on the literal's own UTC date compares below it, whatever its
+    // time. Observed against the gateway on 2026-11-16: 17 of 40 edits to events inside a week's
+    // window never reached the feed — exactly the 17 on the window's first UTC date.
+
+    /// `events(id, starts timestamptz, local timestamp, day date)` as introspection builds it:
+    /// coarse `Text` columns that carry their Postgres type name.
+    fn events_ts() -> TableSchema {
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": {
+                "id": {"type":"int"}, "starts": {"type":"text"}, "local": {"type":"text"}, "day": {"type":"text"},
+                "title": {"type":"text"}
+            },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        for (col, pg) in [("starts", "timestamptz"), ("local", "timestamp"), ("day", "date"), ("title", "text")] {
+            def.columns.get_mut(col).unwrap().pg_type = Some(pg.into());
+        }
+        TableSchema::from_def(&"events".into(), &def).unwrap()
+    }
+
+    /// One event whose cells are spelled the way Postgres prints them (session `TimeZone` UTC).
+    fn event_at(ts: &TableSchema, starts: &str) -> Row {
+        let local = starts.trim_end_matches("+00");
+        let day = &starts[..10];
+        row(ts, serde_json::json!({"id":1,"starts":starts,"local":local,"day":day,"title":"t"}))
+    }
+
+    fn compile_on(ts: &TableSchema, j: serde_json::Value) -> CompiledPredicate {
+        CompiledPredicate::compile(&serde_json::from_value::<PredicateJson>(j).unwrap(), ts).unwrap()
+    }
+
+    /// The reproduction: a week window whose lower bound is `2026-10-19T07:00:00Z` (midnight
+    /// Pacific, as the app writes it) and an event at 16:00 UTC that same day. Postgres says the
+    /// event is inside the window; the live path must say the same.
+    #[test]
+    fn a_timestamptz_bound_in_iso_8601_admits_a_row_later_the_same_utc_day() {
+        let ts = events_ts();
+        let event = event_at(&ts, "2026-10-19 16:00:00+00");
+        let window = compile_on(
+            &ts,
+            serde_json::json!({"and":[
+                {"col":"starts","op":"gte","value":"2026-10-19T07:00:00Z"},
+                {"col":"starts","op":"lt","value":"2026-10-26T07:00:00Z"}
+            ]}),
+        );
+        assert!(window.matches(&event), "16:00Z on the bound's date is after a 07:00Z lower bound");
+
+        // The mirror image on the upper bound: the same instant must be outside a window that
+        // ends at 07:00Z that day.
+        let earlier_window = compile_on(
+            &ts,
+            serde_json::json!({"and":[
+                {"col":"starts","op":"gte","value":"2026-10-12T07:00:00Z"},
+                {"col":"starts","op":"lt","value":"2026-10-19T07:00:00Z"}
+            ]}),
+        );
+        assert!(!earlier_window.matches(&event), "16:00Z is not before a 07:00Z upper bound on the same date");
+    }
+
+    /// Every spelling of one instant compares the same: `Z`, a numeric offset, fractional seconds,
+    /// a space separator, and Postgres's own output.
+    #[test]
+    fn timestamptz_literals_compare_by_instant_whatever_their_spelling() {
+        let ts = events_ts();
+        let event = event_at(&ts, "2026-10-19 16:00:00+00");
+        for same_instant in [
+            "2026-10-19T16:00:00Z",
+            "2026-10-19t16:00:00z",
+            "2026-10-19T16:00:00.000Z",
+            "2026-10-19T16:00:00+00:00",
+            "2026-10-19T09:00:00-07:00",
+            "2026-10-20T01:30:00+09:30",
+            "2026-10-19 16:00:00+00",
+            "2026-10-19 16:00:00",
+            "2026-10-19T16:00Z",
+        ] {
+            let eq = compile_on(&ts, serde_json::json!({"col":"starts","op":"eq","value":same_instant}));
+            assert!(eq.matches(&event), "{same_instant} is the event's instant");
+            let lte = compile_on(&ts, serde_json::json!({"col":"starts","op":"lte","value":same_instant}));
+            let gte = compile_on(&ts, serde_json::json!({"col":"starts","op":"gte","value":same_instant}));
+            assert!(lte.matches(&event) && gte.matches(&event), "{same_instant}: <= and >= both hold at equality");
+            let neq = compile_on(&ts, serde_json::json!({"col":"starts","op":"neq","value":same_instant}));
+            assert!(!neq.matches(&event), "{same_instant} is not a different instant");
+        }
+        for (earlier, later) in [
+            ("2026-10-19T15:59:59.999Z", "2026-10-19T16:00:00.001Z"),
+            ("2026-10-19T08:59:59-07:00", "2026-10-19T09:00:01-07:00"),
+        ] {
+            let after = compile_on(&ts, serde_json::json!({"col":"starts","op":"gt","value":earlier}));
+            let before = compile_on(&ts, serde_json::json!({"col":"starts","op":"lt","value":later}));
+            assert!(after.matches(&event), "the event is after {earlier}");
+            assert!(before.matches(&event), "the event is before {later}");
+        }
+        // Fractional seconds: Postgres prints them with trailing zeros trimmed.
+        let fractional = event_at(&ts, "2026-10-19 16:00:00.5+00");
+        let eq = compile_on(&ts, serde_json::json!({"col":"starts","op":"eq","value":"2026-10-19T16:00:00.500Z"}));
+        assert!(eq.matches(&fractional));
+    }
+
+    /// `timestamp` and `date` columns follow Postgres's cast of the literal to the column type: a
+    /// zone on a `timestamp` literal is ignored, and a `date` keeps only the literal's date fields.
+    #[test]
+    fn timestamp_and_date_literals_take_the_column_types_spelling() {
+        let ts = events_ts();
+        let event = event_at(&ts, "2026-10-19 16:00:00+00");
+        let local = compile_on(&ts, serde_json::json!({"col":"local","op":"gte","value":"2026-10-19T07:00:00"}));
+        assert!(local.matches(&event), "a timestamp cell at 16:00 is after 07:00 the same day");
+        let local_eq = compile_on(&ts, serde_json::json!({"col":"local","op":"eq","value":"2026-10-19T16:00:00Z"}));
+        assert!(local_eq.matches(&event), "Postgres ignores a zone when casting to timestamp");
+        let day = compile_on(&ts, serde_json::json!({"col":"day","op":"eq","value":"2026-10-19T07:00:00Z"}));
+        assert!(day.matches(&event), "a date column keeps the literal's date");
+    }
+
+    /// The index tiers compare the access leaf's value against cells as text, so the literal has
+    /// to be stored in the cells' own spelling — Postgres's output form.
+    #[test]
+    fn a_timestamptz_access_leaf_is_stored_in_postgres_output_form() {
+        let ts = events_ts();
+        let starts = ts.column_index("starts").unwrap();
+        assert_eq!(
+            compile_on(&ts, serde_json::json!({"col":"starts","op":"gte","value":"2026-10-19T07:00:00Z"}))
+                .access_leaf(),
+            Some(AccessLeaf::Lower { col: starts, value: Value::Text("2026-10-19 07:00:00+00".into()), strict: false })
+        );
+        assert_eq!(
+            compile_on(&ts, serde_json::json!({"col":"starts","op":"eq","value":"2026-10-19T00:00:00.250-07:00"}))
+                .access_leaf(),
+            Some(AccessLeaf::Eq { col: starts, value: Value::Text("2026-10-19 07:00:00.25+00".into()) })
+        );
+    }
+
+    /// What must NOT change: a plain text column keeps its literal byte for byte, whatever it looks
+    /// like; a `LIKE` pattern is never rewritten; and the infinities stay as Postgres prints them.
+    #[test]
+    fn text_columns_like_patterns_and_the_infinities_are_left_as_they_are() {
+        let ts = events_ts();
+        let title = ts.column_index("title").unwrap();
+        let starts = ts.column_index("starts").unwrap();
+        for text in ["2026-10-19T07:00:00Z", "next tuesday", ""] {
+            assert_eq!(
+                compile_on(&ts, serde_json::json!({"col":"title","op":"eq","value":text})).access_leaf(),
+                Some(AccessLeaf::Eq { col: title, value: Value::Text(text.into()) })
+            );
+        }
+        for untouched in ["infinity", "-infinity"] {
+            assert_eq!(
+                compile_on(&ts, serde_json::json!({"col":"starts","op":"eq","value":untouched})).access_leaf(),
+                Some(AccessLeaf::Eq { col: starts, value: Value::Text(untouched.into()) }),
+                "{untouched:?} is not rewritten"
+            );
+        }
+        let like = compile_on(&ts, serde_json::json!({"col":"starts","op":"like","value":"2026-10-19T%"}));
+        assert!(matches!(like, CompiledPredicate::Cmp { value: Value::Text(ref v), .. } if v == "2026-10-19T%"));
+    }
+
+    /// Postgres reads one instant in more spellings than ISO 8601 with `Z`: a name for UTC, an
+    /// offset with a one-digit hour or no colon, a zone straight after the date. The snapshot query
+    /// is handed the literal as written, so the live path has to read each of these as SQL does.
+    #[test]
+    fn timestamptz_literals_in_the_other_spellings_postgres_reads_compare_by_instant() {
+        let ts = events_ts();
+        let starts = ts.column_index("starts").unwrap();
+        let event = event_at(&ts, "2026-10-19 16:00:00+00");
+        for same_instant in [
+            "2026-10-19 16:00:00 UTC",
+            "2026-10-19T16:00:00 gmt",
+            "2026-10-19 16:00:00.0 zulu",
+            "2026-10-19 21:00:00+5",
+            "2026-10-19 21:00:00 +5",
+            "2026-10-19 11:00:00-5",
+            "2026-10-19 21:30:00+530",
+            "2026-10-19 21:30:00+5:30",
+        ] {
+            let eq = compile_on(&ts, serde_json::json!({"col":"starts","op":"eq","value":same_instant}));
+            assert!(eq.matches(&event), "{same_instant} is the event's instant");
+            let neq = compile_on(&ts, serde_json::json!({"col":"starts","op":"neq","value":same_instant}));
+            assert!(!neq.matches(&event), "{same_instant} is not a different instant");
+        }
+        // A zone after the date alone is midnight in that zone: `2026-10-19+02` is 22:00Z the day
+        // before, and `2026-10-20 UTC` is the next midnight.
+        let window = compile_on(
+            &ts,
+            serde_json::json!({"and":[
+                {"col":"starts","op":"gte","value":"2026-10-19+02"},
+                {"col":"starts","op":"lt","value":"2026-10-20 UTC"}
+            ]}),
+        );
+        assert!(window.matches(&event));
+        assert!(!window.matches(&event_at(&ts, "2026-10-18 21:59:59+00")));
+        assert_eq!(
+            compile_on(&ts, serde_json::json!({"col":"starts","op":"gte","value":"2026-10-19 07:00:00 UTC"}))
+                .access_leaf(),
+            Some(AccessLeaf::Lower { col: starts, value: Value::Text("2026-10-19 07:00:00+00".into()), strict: false })
+        );
+    }
+
+    /// A literal for a timestamp or date column that the engine cannot read is REFUSED when the
+    /// predicate is compiled. Kept as raw text it would be compared in code-point order against
+    /// cells in Postgres's spelling, while the snapshot's SQL reads it as an instant: the two
+    /// halves of one subset would disagree and nothing would say so.
+    #[test]
+    fn a_timestamp_literal_the_engine_cannot_read_is_refused_not_compared_as_text() {
+        let ts = events_ts();
+        for (col, pg_type) in [("starts", "timestamptz"), ("local", "timestamp"), ("day", "date")] {
+            for literal in [
+                // Postgres reads these, from zone tables and settings the engine does not have.
+                "2026-10-19 07:00:00 PST",
+                "2026-10-19 07:00:00 America/Los_Angeles",
+                "Oct 19 2026",
+                "tomorrow",
+                // Postgres rejects these too.
+                "next tuesday",
+                "2026-13-40T07:00:00Z",
+                "",
+            ] {
+                for wrapped in [
+                    serde_json::json!({"col": col, "op": "gte", "value": literal}),
+                    serde_json::json!({"not": {"or": [{"col": "id", "op": "eq", "value": 1},
+                        {"col": col, "op": "eq", "value": literal}]}}),
+                ] {
+                    let pred: PredicateJson = serde_json::from_value(wrapped).unwrap();
+                    let refused = match CompiledPredicate::compile(&pred, &ts) {
+                        Err(refused) => format!("{refused:#}"),
+                        Ok(_) => panic!("{literal:?} on a {pg_type} column must be refused"),
+                    };
+                    assert!(
+                        refused.contains(&format!("'{col}'")) && refused.contains(pg_type) && refused.contains(literal),
+                        "the refusal names the column, its type and the literal: {refused}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A literal for an ARRAY, RANGE or MULTIRANGE of timestamps or dates is refused whatever it
+    /// says. Postgres reads the literal's elements as instants (`{"2026-10-19 01:00:00-07"}` equals
+    /// a row printed `{"2026-10-19 08:00:00+00"}`), so comparing the literal's text would split the
+    /// snapshot from the live path. Reading one would mean Postgres's array and range input syntax,
+    /// quoting and range canonicalisation included; the engine does not.
+    #[test]
+    fn a_literal_for_an_array_or_range_of_timestamps_is_refused() {
+        let mut def: TableDef = serde_json::from_value(serde_json::json!({
+            "columns": {
+                "id": {"type":"int"}, "marks": {"type":"text"}, "span": {"type":"text"}, "days": {"type":"text"},
+                "spans": {"type":"text"}, "tags": {"type":"text"}
+            },
+            "primaryKey": "id"
+        }))
+        .unwrap();
+        for (col, pg) in [
+            ("marks", "_timestamptz"),
+            ("span", "tstzrange"),
+            ("days", "_date"),
+            ("spans", "tsmultirange"),
+            ("tags", "_text"),
+        ] {
+            def.columns.get_mut(col).unwrap().pg_type = Some(pg.into());
+        }
+        let ts = TableSchema::from_def(&"events".into(), &def).unwrap();
+        for (col, pg_type, literal) in [
+            ("marks", "_timestamptz", r#"{"2026-10-19 01:00:00-07"}"#),
+            ("marks", "_timestamptz", r#"{"2026-10-19 08:00:00+00"}"#),
+            ("span", "tstzrange", r#"["2026-10-19 08:00:00+00","2026-10-20 08:00:00+00")"#),
+            ("days", "_date", "{2026-10-19}"),
+            ("spans", "tsmultirange", "{}"),
+        ] {
+            for op in ["eq", "neq", "gte"] {
+                let pred: PredicateJson =
+                    serde_json::from_value(serde_json::json!({"col": col, "op": op, "value": literal})).unwrap();
+                let refused = match CompiledPredicate::compile(&pred, &ts) {
+                    Err(refused) => format!("{refused:#}"),
+                    Ok(_) => panic!("{literal:?} on a {pg_type} column must be refused"),
+                };
+                assert!(
+                    refused.contains(&format!("'{col}'"))
+                        && refused.contains(pg_type)
+                        && refused.contains("array, range"),
+                    "the refusal names the column and its type, and says what is not read: {refused}"
+                );
+            }
+        }
+        // An array of anything else is the application's text, as before.
+        let pred: PredicateJson =
+            serde_json::from_value(serde_json::json!({"col": "tags", "op": "eq", "value": "{a,b}"})).unwrap();
+        assert!(CompiledPredicate::compile(&pred, &ts).is_ok());
     }
 }

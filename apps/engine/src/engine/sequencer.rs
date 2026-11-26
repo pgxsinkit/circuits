@@ -198,6 +198,31 @@ pub(crate) struct FailClosed {
     pub(crate) epoch: Arc<EpochState>,
 }
 
+impl FailClosed {
+    fn report_missing_segment(&self, error: &anyhow::Error) {
+        self.epoch.latch(EpochBreakReason::ChangeLogMissing);
+        tracing::error!(
+            "change log: required segment is missing ({error:#}); replay parked. Restore the missing segment and restart."
+        );
+    }
+}
+
+/// Confirm a terminal GET with HEAD before marking the replay chain as broken. A proxy can return
+/// a stray 404, and a transport error on the follow-up cannot establish that the segment was lost.
+async fn read_change_log_page(ds: &DsClient, path: &str, offset: &str) -> Result<Option<crate::ds::ReadResult>> {
+    match ds.read(path, offset, true).await {
+        Ok(page) => Ok(Some(page)),
+        Err(error) if crate::ds::is_stream_gone(&error) => {
+            if ds.head(path).await?.is_none() {
+                Err(error)
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// What kind of shape a pending creation becomes at activation.
 #[derive(Clone)]
 pub(crate) enum CreateKind {
@@ -504,7 +529,7 @@ pub(crate) async fn sequencer_loop(
     // fraction of a commit, which per-transaction atomic emission forbids. So an unterminated
     // trailing run is HELD here and carried into the next read, and the transaction is processed
     // (and flushed) only once the marker arrives.
-    let mut held: Vec<Envelope> = Vec::new();
+    let mut held: Option<super::held::Transaction> = None;
     // Where a restart must resume while a run is held: the read position from BEFORE the page the
     // held run started in. `processed` (and therefore the checkpoint, and therefore the segment
     // deletion floor) never moves past it, so a crash re-reads the whole held transaction. The read
@@ -687,7 +712,7 @@ pub(crate) async fn sequencer_loop(
                     execs.clear();
                     emitted.clear();
                     pos = to;
-                    held.clear();
+                    held = None;
                     held_from = None;
                     held_since = None;
                     held_warnings = 0;
@@ -742,8 +767,8 @@ pub(crate) async fn sequencer_loop(
                 tracing::info!("sequencer: shutdown requested; checkpointing at {}", published(&pos, &held_from));
                 break;
             }
-            res = ds.read(&read_path, &read_off, true), if reading => match res {
-                Ok(rr) => {
+            res = read_change_log_page(&ds, &read_path, &read_off), if reading => match res {
+                Ok(Some(rr)) => {
                     let next = rr.next_offset.clone();
                     // How much this read delivered, BEFORE control envelopes are filtered out: a
                     // closed segment is only left once a read comes back empty, which is the proof
@@ -772,105 +797,47 @@ pub(crate) async fn sequencer_loop(
                     // one. Deliberately conservative: the fragment was never emitted, so re-reading it
                     // costs a page and cannot double-apply (the highwater fences what was applied).
                     let held_replay_from = held_from.clone();
-                    // Re-attach the run held from an earlier page (ADR-0003).
-                    //
-                    // A re-delivery complicates this: when the ingestor fails part-way through a
-                    // chunked commit it acknowledges nothing, so Postgres re-sends that whole
-                    // transaction — and, because acknowledgements are flushed on an interval, it
-                    // can re-send earlier COMPLETE commits ahead of it too. So the "already held,
-                    // skip it" filter applies to the LEADING run of this page and only while that
-                    // run is the held transaction: `seq` is the running index over one transaction,
-                    // so it is meaningless against any other one, and applying it page-wide would
-                    // silently drop whole transactions whose seqs happen to be lower.
-                    let held_key = held.last().map(run_key_owned);
-                    let mut merged_from = None;
-                    if let Some(key) = held_key {
-                        let lead = envs.iter().take_while(|e| run_key(e) == key_ref(&key)).count();
-                        if lead == 0 && !envs.is_empty() {
-                            // The held transaction is not what came next. Two things produce that,
-                            // and neither can ever complete this fragment: a reconnect re-delivering
-                            // earlier complete commits first (the held transaction's own
-                            // re-delivery follows in full, and the complete ones are skipped by the
-                            // `(lsn, seq)` highwater if already applied), and an epoch reset, which
-                            // abandons the fragment outright. Discarding it is the only correct
-                            // move — emitting a fragment of a transaction is what the marker exists
-                            // to prevent.
-                            tracing::warn!(
-                                "sequencer: the held (incomplete) transaction {:?} was followed by a different one \
-                                 {:?}; discarding the fragment — it will arrive again in full (a reconnect \
-                                 re-delivers earlier complete commits first) or has been abandoned (epoch reset)",
-                                key,
-                                run_key_owned(&envs[0]),
-                            );
-                            metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
-                            held.clear();
-                            held_from = None;
-                            held_since = None;
-                            held_warnings = 0;
-                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
-                        } else {
-                            // Only the leading run is filtered; everything after the first envelope
-                            // of a different transaction passes through untouched.
-                            let last_seq = held.last().and_then(|e| e.headers.seq);
-                            let mut rest = envs.split_off(lead);
-                            envs.retain(|e| match (e.headers.seq, last_seq) {
-                                (Some(seq), Some(hs)) => seq > hs,
-                                _ => true,
-                            });
-                            envs.append(&mut rest);
-                            let mut merged = std::mem::take(&mut held);
-                            merged.append(&mut envs);
-                            envs = merged;
-                            merged_from = Some(key);
+                    let page = tokio::select! {
+                        biased;
+                        result = prepare_transactions(envs, held.take(), pending_budget.clone()) => result,
+                        _ = shutdown.wait() => {
+                            pos = held_replay_from.clone().unwrap_or_else(|| LogPosition { segment: pos.segment, offset: read_off.clone() });
+                            held_from = held_replay_from;
+                            break;
                         }
-                    }
-                    // Hold back a TRAILING run that is not terminated by the transaction-end marker
-                    // (ADR-0003): it is a commit whose remaining chunks have not been appended yet.
-                    // Everything before it is complete and processed now.
-                    match unterminated_tail(&envs) {
-                        Some(cut) => {
-                            // Is this the SAME transaction that was already held, or a new one that
-                            // starts after the held one completed on this page? A new hold must
-                            // re-pin to THIS page, or a catch-up over consecutive chunked commits
-                            // would keep the pin (and the checkpoint) frozen at the first page for
-                            // the whole run.
-                            let continuation = merged_from.as_ref().is_some_and(|k| run_key(&envs[cut]) == key_ref(k));
-                            if !continuation {
-                                held_from = Some(LogPosition { segment: pos.segment, offset: read_off.clone() });
-                                held_since = Some(std::time::Instant::now());
+                    };
+                    let mut failure = None;
+                    let ready = match page {
+                        Ok(page) => {
+                            held = page.held;
+                            if let Some(run) = &held {
+                                if page.new_hold {
+                                    held_from = Some(LogPosition { segment: pos.segment, offset: read_off.clone() });
+                                    held_since = Some(std::time::Instant::now());
+                                    held_warnings = 0;
+                                }
+                                metrics().sequencer_held_run.store(1, Ordering::Relaxed);
+                                let since = *held_since.get_or_insert_with(std::time::Instant::now);
+                                if since.elapsed() >= HELD_RUN_WARN_AFTER * (held_warnings + 1) {
+                                    held_warnings += 1;
+                                    tracing::warn!(txid = ?run.key.0, lsn = ?run.key.1, envelopes = run.count,
+                                        elapsed = ?since.elapsed(), position = %published(&pos, &held_from),
+                                        "sequencer transaction remains incomplete; replay position is pinned");
+                                }
+                            } else {
+                                // Completed input is processed and flushed before this pin is published.
+                                held_from = None;
+                                held_since = None;
                                 held_warnings = 0;
+                                metrics().sequencer_held_run.store(0, Ordering::Relaxed);
                             }
-                            held = envs.split_off(cut);
-                            metrics().sequencer_held_run.store(1, Ordering::Relaxed);
-                            let since = *held_since.get_or_insert_with(std::time::Instant::now);
-                            // A hold longer than a minute is no longer "the next chunk is coming":
-                            // ingest has stalled mid-transaction, and everything downstream of
-                            // `processed` is frozen with it. Say so, then once a minute after that.
-                            if since.elapsed() >= HELD_RUN_WARN_AFTER * (held_warnings + 1) {
-                                held_warnings += 1;
-                                tracing::warn!(
-                                    "sequencer: transaction {:?} at lsn {:?} has been incomplete on the change \
-                                     log for {:?} ({} envelope(s) held); the change-log position is pinned at \
-                                     {} until its final chunk arrives",
-                                    held.first().and_then(|e| e.headers.txid.clone()),
-                                    held.first().and_then(|e| e.headers.lsn.clone()),
-                                    since.elapsed(),
-                                    held.len(),
-                                    published(&pos, &held_from),
-                                );
-                            }
+                            page.ready
                         }
-                        // Nothing is held any more (the marker arrived, or never was one): release
-                        // the pin so `processed`, the checkpoint and the deletion floor move again.
-                        // Safe here — the run it was pinning is processed and flushed below, before
-                        // anything is published.
-                        None => {
-                            held_from = None;
-                            held_since = None;
-                            held_warnings = 0;
-                            metrics().sequencer_held_run.store(0, Ordering::Relaxed);
+                        Err(error) => {
+                            failure = Some(held_input_failure((None, None), &error));
+                            Vec::new()
                         }
-                    }
+                    };
                     // Split the read batch into transactions (runs of equal (txid, lsn) — the
                     // ingestor appends whole commits contiguously, in commit order) and flush each
                     // transaction's appends before processing the next: atomic per-transaction
@@ -881,24 +848,31 @@ pub(crate) async fn sequencer_loop(
                     // The envelope this page could not process, if any (ADR-0010): set once, and
                     // everything after it — the count fold, the flush, the publication, the
                     // checkpoint — is skipped rather than done with a hole in it.
-                    let mut failure: Option<ChangeLogFailure> = None;
-                    let mut i = 0;
-                    while i < envs.len() {
+                    let mut input_interrupted = false;
+                    let mut page_envelope_offset = 0;
+                    for mut transaction in ready {
                         // The de-duplication highwater moves only once the WHOLE transaction is
                         // through: a failure part-way restores it, so the replay re-applies the
                         // transaction from its first envelope rather than from after the prefix that
                         // did work.
                         let txn_highwater = highwater;
-                        let txid = envs[i].headers.txid.clone();
-                        let lsn = envs[i].headers.lsn.clone();
-                        let mut j = i + 1;
-                        while j < envs.len() && envs[j].headers.txid == txid && envs[j].headers.lsn == lsn {
-                            j += 1;
+                        let (txid, lsn) = transaction.key.clone();
+                        let validated = tokio::select! {
+                            biased;
+                            result = transaction.validate() => result,
+                            _ = shutdown.wait() => {
+                                input_interrupted = true;
+                                break;
+                            }
+                        };
+                        if let Err(error) = validated {
+                            failure = Some(held_input_failure(transaction.key.clone(), &error));
+                            break;
                         }
                         // Note BEFORE fan-out: any snapshot paired with an already-produced feed
                         // offset must include this transaction, even while its backend is invisible.
                         if let (Some(seen), Some(xid)) = (&sequenced, txid.as_deref().and_then(|t| t.parse::<u64>().ok())) {
-                            seen.note(xid, envs[i..j].iter().map(|e| e.type_.as_str()));
+                            seen.note(xid, transaction.table_names());
                         }
                         // Stage this transaction's counts deltas for the dbsp pipelines, to be applied
                         // once every envelope has fanned out — the circuit must never absorb a prefix
@@ -906,25 +880,39 @@ pub(crate) async fn sequencer_loop(
                         // there is no way back). The counts layer re-checks its own (lsn, seq)
                         // highwater, so staging pre-dedup envelopes is safe.
                         let mut txn_arr_deltas = Vec::new();
-                        if let Some(arr) = &arr {
-                            for (k, env) in envs.iter().enumerate().take(j).skip(i) {
+                        let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
+                        let mut envelope_offset = page_envelope_offset;
+                        loop {
+                            // Once processing starts, graceful shutdown finishes this transaction:
+                            // its earlier envelopes may already have enqueued membership flips.
+                            let mut chunk = match transaction.next_chunk().await {
+                                Ok(Some(chunk)) => chunk,
+                                Ok(None) => break,
+                                Err(error) => {
+                                    failure = Some(held_input_failure(transaction.key.clone(), &error));
+                                    break;
+                                }
+                            };
+                            // Validate the arrangement input for this chunk before mutating any
+                            // executor. All arrangement changes remain staged until the final chunk.
+                            if let Some(arr) = &arr {
+                            for (k, env) in chunk.iter().enumerate() {
                                 match stamped_delta_for_arrangements(&tables, arr, &arr_gates, env) {
                                     Ok(Some(d)) => txn_arr_deltas.push(d),
                                     // Not a counted table, an empty delta, fenced out by the seed
                                     // gate, or an envelope from before a drift (ADR-0010).
                                     Ok(None) => {}
                                     Err(e) => {
-                                        failure = Some(ChangeLogFailure::of(env, k, &e));
+                                        failure = Some(ChangeLogFailure::of(env, envelope_offset + k, &e));
                                         break;
                                     }
                                 }
                             }
-                        }
-                        if failure.is_some() {
-                            break;
-                        }
-                        let mut txn_pending: HashMap<String, Vec<Envelope>> = HashMap::new();
-                        for (k, env) in envs.iter_mut().enumerate().take(j).skip(i) {
+                            }
+                            if failure.is_some() {
+                                break;
+                            }
+                        for (k, env) in chunk.iter_mut().enumerate() {
                             // Skip redelivered changes (see `highwater` above).
                             let pos = match (env.headers.lsn.as_deref(), env.headers.seq) {
                                 (Some(l), Some(seq)) => Some((crate::pg::lsn_to_u64(l), seq)),
@@ -979,7 +967,7 @@ pub(crate) async fn sequencer_loop(
                                     continue;
                                 }
                                 Resolve::Fatal(e) => {
-                                    failure = Some(ChangeLogFailure::of(env, k, &e));
+                                    failure = Some(ChangeLogFailure::of(env, envelope_offset + k, &e));
                                     break;
                                 }
                             }
@@ -1021,7 +1009,7 @@ pub(crate) async fn sequencer_loop(
                                 // The schema fence says this envelope IS ours, so failing to process
                                 // it is an engine bug or corrupt storage — never something to step
                                 // over, which would leave a shape silently short of a change. Stop.
-                                failure = Some(ChangeLogFailure::of(env, k, &e));
+                                failure = Some(ChangeLogFailure::of(env, envelope_offset + k, &e));
                                 break;
                             }
                             exec.envelopes_total += 1;
@@ -1030,7 +1018,12 @@ pub(crate) async fn sequencer_loop(
                                 highwater = Some(p);
                             }
                         }
-                        if failure.is_some() {
+                            envelope_offset += chunk.len();
+                            if failure.is_some() {
+                                break;
+                            }
+                        }
+                        if failure.is_some() || input_interrupted {
                             // Nothing of this transaction is applied further: no count fold (the
                             // deltas were only staged), no flush of the partial `txn_pending` (a
                             // subscriber must never see a fraction of a commit), no highwater.
@@ -1053,7 +1046,12 @@ pub(crate) async fn sequencer_loop(
                         // Transaction boundary: every append of this commit lands before the next
                         // commit is processed.
                         flush_pending(&ds, txn_pending).await;
-                        i = j;
+                        page_envelope_offset = envelope_offset;
+                    }
+                    if input_interrupted {
+                        pos = held_replay_from.clone().unwrap_or_else(|| LogPosition { segment: pos.segment, offset: read_off.clone() });
+                        held_from = held_replay_from;
+                        break;
                     }
                     if let Some(mut failure) = failure {
                         // PARK (ADR-0010). Rewind the read cursor to where a replay must start: the
@@ -1081,9 +1079,8 @@ pub(crate) async fn sequencer_loop(
                         fail_closed.epoch.latch(EpochBreakReason::ChangeLogUnprocessable);
                         tracing::error!(
                             "CHANGE LOG UNPROCESSABLE at {} (table '{}', key '{}', txid {:?}, lsn {:?}, envelope {} of \
-                             the page): {}. The schema this change was decoded under is the one the engine holds, so \
-                             this is an engine bug or corrupt storage, not schema drift — and stepping over it would \
-                             leave every shape on that table silently short of a change. The sequencer is PARKED: it \
+                             transaction): {}. Processing or reading this input failed, and stepping over it would \
+                             leave shapes silently short of a change. The sequencer is PARKED: it \
                              is not retried, no shape is maintained past this point, nothing further is published or \
                              checkpointed, and the engine reports `degraded`. Recovery is an operator's: \
                              POST /epoch/reset retires every shape and restarts the replay on a fresh change-log \
@@ -1114,40 +1111,33 @@ pub(crate) async fn sequencer_loop(
                     // re-derive it.
                     let mut crossed = false;
                     if rr.closed && (delivered == 0 || !advanced) {
-                        match rotate_to.take() {
-                            Some(n) => {
+                        // The writer creates the successor before closing this segment. Check for
+                        // it even when we saw a pointer so no checkpoint can advance onto a gap.
+                        let successor = tokio::select! {
+                            _ = shutdown.wait() => break,
+                            result = crate::changelog::next_segment_for_reader(&ds, pos.segment) => result,
+                        };
+                        match successor {
+                            Ok(n) => {
+                                if rotate_to.take() != Some(n) {
+                                    tracing::warn!(
+                                        "sequencer: {} has no matching rotation pointer; verified {}",
+                                        pos.path(), segment_path(n)
+                                    );
+                                }
                                 tracing::info!("sequencer: {} closed; continuing on {}", pos.path(), segment_path(n));
                                 pos = LogPosition::start_of(n);
                                 *processed.lock().unwrap() = published(&pos, &held_from);
                                 crossed = true;
                             }
-                            None => {
-                                // No pointer in this run: the checkpoint this process resumed from
-                                // was already past it, or storage lost it. Step to EXACTLY the next
-                                // segment, verified to exist — never a walk to the first OPEN one,
-                                // which would skip every closed segment in between and with it a
-                                // whole span of unread changes.
-                                match crate::changelog::next_segment_for_reader(&ds, pos.segment).await {
-                                    Ok(n) => {
-                                        tracing::warn!(
-                                            "sequencer: {} is closed and carried no rotation pointer in this run; \
-                                             stepping to {}",
-                                            pos.path(),
-                                            segment_path(n)
-                                        );
-                                        pos = LogPosition::start_of(n);
-                                        *processed.lock().unwrap() = published(&pos, &held_from);
-                                        crossed = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "sequencer: cannot leave the closed segment {}: {e:#}. Backing off; \
-                                             nothing is skipped.",
-                                            pos.path()
-                                        );
-                                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                                    }
-                                }
+                            Err(e) if crate::ds::is_stream_gone(&e) => {
+                                fail_closed.report_missing_segment(&e);
+                                reading = false;
+                                parked = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("sequencer: cannot verify the successor of {}: {e:#}; retrying", pos.path());
+                                back_off(&shutdown, std::time::Duration::from_millis(500)).await;
                             }
                         }
                     }
@@ -1169,19 +1159,14 @@ pub(crate) async fn sequencer_loop(
                         publish_all(&execs, &pos.to_string(), &emitted, &stats, &node_states, &subq.registry, &trace_tx).await;
                     }
                 }
+                Ok(None) => {
+                    tracing::warn!("sequencer: GET {read_path} reported a missing segment that HEAD found; retrying");
+                    back_off(&shutdown, std::time::Duration::from_millis(200)).await;
+                }
                 Err(e) if crate::ds::is_stream_gone(&e) => {
-                    // The segment the sequencer is reading has been DELETED under it. The sweeper
-                    // deletes only below the durable checkpoint, and the boot refuses to start on a
-                    // missing segment, so this is unreachable by design — say so at ERROR and back
-                    // off rather than spin quietly at 5 Hz on a 404.
-                    tracing::error!(
-                        "sequencer: the change-log segment it is reading is GONE ({e:#}). Nothing may delete a \
-                         segment the durable checkpoint has not passed, so storage has lost data or something \
-                         outside the engine deleted it; the sequencer cannot advance. Backing off.",
-                    );
-                    // Cut short by a shutdown: this backoff is dead time, and spending 5 s of a
-                    // 25 s grace on it would be for nothing (the loop re-selects and breaks anyway).
-                    back_off(&shutdown, std::time::Duration::from_secs(5)).await;
+                    fail_closed.report_missing_segment(&e);
+                    reading = false;
+                    parked = true;
                 }
                 Err(e) => {
                     tracing::warn!("sequencer read error on {read_path}: {e:#}; backing off");
@@ -1190,6 +1175,8 @@ pub(crate) async fn sequencer_loop(
             },
         }
     }
+    drop(held);
+    metrics().sequencer_held_run.store(0, Ordering::Relaxed);
     // The loop is only left on shutdown (or on the command channel closing, i.e. the engine going
     // away). Either way the batch it was in the middle of is fully fanned out and flushed — the
     // select only chooses at the TOP of the loop — so one last `Offset` makes the position (and the
@@ -1421,6 +1408,82 @@ fn unterminated_tail(envs: &[Envelope]) -> Option<usize> {
         i -= 1;
     }
     Some(i)
+}
+
+struct TransactionPage {
+    ready: Vec<super::held::Transaction>,
+    held: Option<super::held::Transaction>,
+    new_hold: bool,
+}
+
+/// Preserve the leading-run redelivery filter without joining a previously spilled transaction
+/// into the new page. Only input with its end marker becomes ready for processing.
+async fn prepare_transactions(
+    mut envelopes: Vec<Envelope>,
+    mut held: Option<super::held::Transaction>,
+    budget: Arc<PendingBudget>,
+) -> Result<TransactionPage> {
+    let mut ready = Vec::new();
+    if let Some(mut run) = held.take() {
+        let lead = envelopes.iter().take_while(|env| run_key(env) == key_ref(&run.key)).count();
+        if lead == 0 && !envelopes.is_empty() {
+            tracing::warn!(held = ?run.key, next = ?run_key_owned(&envelopes[0]),
+                "sequencer: discarding orphan held transaction fragment");
+            metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
+        } else {
+            let rest = envelopes.split_off(lead);
+            envelopes.retain(|env| match (env.headers.seq, run.last_seq) {
+                (Some(seq), Some(last)) => seq > last,
+                _ => true,
+            });
+            run = run.append(envelopes).await?;
+            envelopes = rest;
+            if run.complete {
+                ready.push(run);
+            } else if envelopes.is_empty() {
+                held = Some(run);
+            } else {
+                // A reconnect can append an unfinished prefix before earlier complete commits.
+                // The full redelivery still follows. Never flush that prefix as a transaction.
+                tracing::warn!(held = ?run.key, "sequencer: discarding unterminated transaction before another run");
+                metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let mut new_hold = false;
+    if let Some(cut) = unterminated_tail(&envelopes) {
+        let tail = envelopes.split_off(cut);
+        held = Some(super::held::Transaction::held(tail, budget).await?);
+        new_hold = true;
+    }
+    let mut iter = envelopes.into_iter().peekable();
+    while let Some(first) = iter.next() {
+        let key = run_key_owned(&first);
+        let mut run = vec![first];
+        while iter.peek().is_some_and(|env| run_key(env) == key_ref(&key)) {
+            run.push(iter.next().unwrap());
+        }
+        let last = run.last().unwrap();
+        if last.headers.seq.is_some() && last.headers.last != Some(true) {
+            tracing::warn!(?key, "sequencer: discarding unterminated transaction before another run");
+            metrics().sequencer_orphan_fragments.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        ready.push(super::held::Transaction::page(run));
+    }
+    Ok(TransactionPage { ready, held, new_hold })
+}
+
+fn held_input_failure(key: (Option<String>, Option<String>), error: &anyhow::Error) -> ChangeLogFailure {
+    ChangeLogFailure {
+        position: LogPosition::start(),
+        table: "__circuits.held".into(),
+        key: String::new(),
+        txid: key.0,
+        lsn: key.1,
+        envelope_offset: 0,
+        error: format!("held transaction scratch failed: {error:#}"),
+    }
 }
 
 /// Decode one envelope buffered for a pending shape (ADR-0010): `Ok(None)` when it predates a drift
@@ -2272,6 +2335,95 @@ mod txn_boundary_tests {
 
         let held_from = LogPosition { segment: 2, offset: "40".into() };
         assert_eq!(published(&cursor, &Some(held_from.clone())), held_from);
+    }
+
+    async fn drained(mut transaction: super::super::held::Transaction) -> Vec<Envelope> {
+        transaction.validate().await.unwrap();
+        let mut envelopes = Vec::new();
+        while let Some(mut chunk) = transaction.next_chunk().await.unwrap() {
+            envelopes.append(&mut chunk);
+        }
+        envelopes
+    }
+
+    #[tokio::test]
+    async fn held_spill_filters_only_leading_redelivery_before_the_next_complete_transaction() {
+        let scratch = crate::pending_buffer::tests::Scratch::new();
+        let budget = PendingBudget::new(crate::pending_buffer::PendingBufferConfig {
+            memory_bytes: 0,
+            spill_dir: scratch.path().join("spill"),
+        });
+        let first = prepare_transactions(vec![env("0/20", "2", 0, false)], None, budget.clone()).await.unwrap();
+        assert!(first.ready.is_empty());
+        assert!(first.new_hold);
+        assert!(budget.stats().spill_bytes > 0);
+        let final_page = prepare_transactions(
+            vec![env("0/20", "2", 0, false), env("0/20", "2", 1, true), env("0/30", "3", 0, true)],
+            first.held,
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(final_page.held.is_none());
+        assert_eq!(final_page.ready.len(), 2);
+        let mut ready = final_page.ready.into_iter();
+        let continued = drained(ready.next().unwrap()).await;
+        assert_eq!(continued.iter().map(|env| env.headers.seq).collect::<Vec<_>>(), [Some(0), Some(1)]);
+        let following = drained(ready.next().unwrap()).await;
+        assert_eq!(following.len(), 1, "the lower sequence of another transaction is not filtered");
+        assert_eq!(following[0].headers.txid.as_deref(), Some("3"));
+        assert_eq!(budget.stats().items, 0);
+        assert_eq!(budget.stats().spill_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn consecutive_held_transactions_start_a_fresh_publication_pin() {
+        let scratch = crate::pending_buffer::tests::Scratch::new();
+        let budget = PendingBudget::new(crate::pending_buffer::PendingBufferConfig {
+            memory_bytes: 0,
+            spill_dir: scratch.path().join("spill"),
+        });
+        let first = prepare_transactions(vec![env("0/10", "1", 0, false)], None, budget.clone()).await.unwrap();
+        let continued = prepare_transactions(Vec::new(), first.held, budget.clone()).await.unwrap();
+        assert!(!continued.new_hold, "an empty poll keeps the original transaction's pin");
+        let next = prepare_transactions(
+            vec![env("0/10", "1", 1, true), env("0/20", "2", 0, false)],
+            continued.held,
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(next.new_hold, "a different trailing transaction pins its own first page");
+        assert_eq!(next.ready.len(), 1);
+        let transaction = next.ready.into_iter().next().unwrap();
+        assert_eq!(drained(transaction).await.len(), 2);
+        assert_eq!(next.held.as_ref().unwrap().key.0.as_deref(), Some("2"));
+        drop(next.held);
+        assert_eq!(budget.stats().items, 0);
+        assert_eq!(budget.stats().spill_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn orphan_held_spill_is_deleted_without_emitting_its_unterminated_prefix() {
+        let scratch = crate::pending_buffer::tests::Scratch::new();
+        let budget = PendingBudget::new(crate::pending_buffer::PendingBufferConfig {
+            memory_bytes: 0,
+            spill_dir: scratch.path().join("spill"),
+        });
+        let first = prepare_transactions(vec![env("0/20", "2", 0, false)], None, budget.clone()).await.unwrap();
+        let next = prepare_transactions(
+            vec![env("0/20", "2", 1, false), env("0/10", "1", 0, true)],
+            first.held,
+            budget.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(next.held.is_none());
+        assert_eq!(next.ready.len(), 1);
+        let output = drained(next.ready.into_iter().next().unwrap()).await;
+        assert_eq!(output[0].headers.txid.as_deref(), Some("1"));
+        assert_eq!(budget.stats().items, 0);
+        assert_eq!(budget.stats().spill_bytes, 0);
     }
 }
 

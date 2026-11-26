@@ -167,6 +167,12 @@ async fn ds_handler(State(log): State<FakeLog>, req: Request) -> Response {
 
 /// A library-mode engine with one match-all shape on `public.t`, reading the scripted log.
 async fn boot() -> (Engine, FakeLog, String, TableRef) {
+    boot_with_pending(Default::default()).await
+}
+
+async fn boot_with_pending(
+    pending: circuits_engine::pending_buffer::PendingBufferConfig,
+) -> (Engine, FakeLog, String, TableRef) {
     let state = FakeLog::default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ds_url = format!("http://{}", listener.local_addr().unwrap());
@@ -175,7 +181,7 @@ async fn boot() -> (Engine, FakeLog, String, TableRef) {
         let _ = axum::serve(listener, app).await;
     });
 
-    let engine = Engine::new(DsClient::new(&ds_url));
+    let engine = Engine::new_with_resources(DsClient::new(&ds_url), pending, Default::default());
     let schema: Schema = serde_json::from_value(serde_json::json!({
         "tables": { "t": { "columns": { "id": { "type": "text" } }, "primaryKey": "id" } }
     }))
@@ -184,6 +190,35 @@ async fn boot() -> (Engine, FakeLog, String, TableRef) {
     let t = TableRef::parse("t").unwrap();
     let shape = engine.create_shape(&t, None, None, false, false).await.unwrap();
     (engine, state, shape.stream_path, t)
+}
+
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(std::env::temp_dir().join(format!(
+            "circuits-held-sequencer-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )))
+    }
+
+    fn files(&self) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(&self.0)
+            .map(|entries| entries.map(|entry| entry.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn config(&self) -> circuits_engine::pending_buffer::PendingBufferConfig {
+        circuits_engine::pending_buffer::PendingBufferConfig { memory_bytes: 0, spill_dir: self.0.clone() }
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn wait_for(mut cond: impl FnMut() -> bool, what: &str) {
@@ -217,6 +252,54 @@ async fn wait_parked(engine: &Engine) -> serde_json::Value {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("the sequencer did not park on the unprocessable envelope");
+}
+
+#[tokio::test]
+async fn a_corrupt_held_spill_parks_before_processing_its_valid_prefix() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let scratch = Scratch::new();
+    let (engine, log, stream, table) = boot_with_pending(scratch.config()).await;
+    log.serve("-1", "01", &[env_json(100, "0/10", "1", 0, false), env_json(100, "0/10", "2", 1, false)]);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while engine.mem_cardinalities().await.pending.items != 2 {
+        assert!(std::time::Instant::now() < deadline, "the held transaction did not spill");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(log.shape_flushes(&stream).is_empty());
+    assert_eq!(engine.table_offset(&table).await.unwrap().offset, "-1");
+    let file = scratch.files().pop().unwrap();
+    let mut handle = std::fs::OpenOptions::new().read(true).write(true).open(file).unwrap();
+    let mut first_length = [0; 8];
+    handle.read_exact(&mut first_length).unwrap();
+    handle.seek(SeekFrom::Start(8 + u64::from_le_bytes(first_length))).unwrap();
+    handle.write_all(&u64::MAX.to_le_bytes()).unwrap();
+    drop(handle);
+    log.serve("01", "02", &[env_json(100, "0/10", "3", 2, true)]);
+    let failure = wait_parked(&engine).await;
+    assert_eq!(failure["table"], "__circuits.held");
+    assert_eq!(failure["position"]["offset"], "-1");
+    assert!(log.shape_flushes(&stream).is_empty(), "scratch failure must not flush a valid prefix");
+    assert_eq!(engine.table_offset(&table).await.unwrap().offset, "-1");
+    assert_eq!(engine.readiness_status(), "degraded");
+    assert!(log.checkpoints().iter().all(|(_, highwater)| highwater.is_none()));
+    engine.shutdown_token().begin();
+    wait_for(|| scratch.files().is_empty(), "failed scratch cleanup").await;
+}
+
+#[tokio::test]
+async fn shutdown_drops_incomplete_spill_and_checkpoints_before_its_first_page() {
+    let scratch = Scratch::new();
+    let (engine, log, stream, table) = boot_with_pending(scratch.config()).await;
+    log.serve("-1", "01", &[env_json(100, "0/10", "1", 0, false)]);
+    wait_for(|| !scratch.files().is_empty(), "the held transaction to spill").await;
+    engine.shutdown_token().begin();
+    wait_for(|| scratch.files().is_empty(), "shutdown to clean incomplete scratch").await;
+    assert!(engine.drain_catalog(Duration::from_secs(5)).await);
+    assert!(log.shape_flushes(&stream).is_empty());
+    assert_eq!(engine.table_offset(&table).await.unwrap().offset, "-1");
+    assert!(log.checkpoint_positions().iter().all(|(_, offset)| offset == "-1"));
+    assert!(log.checkpoints().iter().all(|(_, highwater)| highwater.is_none()));
 }
 
 /// Chunk 1 alone flushes nothing and pins publication; a re-delivered prefix does not double-apply;
