@@ -40,12 +40,12 @@
     "validate:rust": "bun scripts/validate.ts rust"
   },
   "devDependencies": {
-    "@types/node": "26.6.5",
-    "oxlint": "1.89.0",
-    "oxlint-tsgolint": "7.0.2005",
+    "@types/node": "26.6.11",
+    "oxlint": "1.95.0",
+    "oxlint-tsgolint": "7.0.2009",
     "tsx": "4.23.15",
     "typescript": "7.0.2",
-    "vitest": "5.0.5"
+    "vitest": "5.1.2"
   },
   "overrides": {
     "@durable-streams/server-conformance-tests@0.3.7": {

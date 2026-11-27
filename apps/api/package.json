@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@circuits/protocol": "workspace:*",
-    "@trpc/server": "11.19.0",
+    "@trpc/server": "11.31.6",
     "zod": "4.6.7"
   }
 }

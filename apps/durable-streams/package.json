@@ -15,6 +15,6 @@
   },
   "devDependencies": {
     "@durable-streams/server-conformance-tests": "0.3.7",
-    "vitest": "5.0.5"
+    "vitest": "5.1.2"
   }
 }

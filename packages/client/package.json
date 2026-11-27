@@ -16,7 +16,7 @@
     "@durable-streams/client": "0.2.7",
     "@durable-streams/state": "0.3.2",
     "@tanstack/db": "0.15.2",
-    "@trpc/client": "11.19.0",
+    "@trpc/client": "11.31.6",
     "zod": "4.6.7"
   }
 }
